@@ -2,10 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace epoch_si_poc {
+
+struct DeltaDiagnostics;
 
 class FileWal {
 public:
@@ -38,6 +41,9 @@ public:
         max_write_chunk_ = bytes == 0 ? 1 : bytes;
     }
     void CloseForTest();
+    void SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics) {
+        diagnostics_ = std::move(diagnostics);
+    }
 
 private:
     int fd_ = -1;
@@ -45,6 +51,7 @@ private:
     size_t max_write_chunk_ = SIZE_MAX;
     size_t write_calls_ = 0;
     size_t sync_calls_ = 0;
+    std::shared_ptr<DeltaDiagnostics> diagnostics_;
 };
 
 } // namespace epoch_si_poc

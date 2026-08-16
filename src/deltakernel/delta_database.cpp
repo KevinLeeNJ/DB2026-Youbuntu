@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +14,9 @@
 #include <set>
 #include <sstream>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "common/csv.h"
@@ -29,25 +33,59 @@ constexpr uintmax_t kMaxCatalogBytes = 16U << 20;
 constexpr size_t kMaxJoinMaterializedBytes = 64U << 20;
 constexpr size_t kMaxJoinMaterializedRows = 1U << 20;
 constexpr uint64_t kSidecarMagic = 0x58444941544c4544ULL; // DELTAIDX
+constexpr uint32_t kSidecarFormatVersion = 3;
 constexpr uint64_t kMaxSidecarBytes = 1ULL << 34;
+constexpr uint32_t kSidecarHeaderBytes = 96;
+constexpr uint32_t kSidecarEntryBytes = 16;
+constexpr uint32_t kSidecarRowOrderEntryBytes = 4;
+constexpr uint32_t kSidecarHeaderCrcOffset = 92;
 constexpr size_t kCommitBatchSize = 32;
 constexpr size_t kCommitQueueLimit = 128;
 
+enum class DiagnosticOperation : size_t { TxnControl, PointDml, ScanJoinAggregate, Other, Count };
+
+DiagnosticOperation ClassifyDiagnosticOperation(ast::AstType type) {
+    switch (type) {
+    case ast::AstType::TxnBegin:
+    case ast::AstType::TxnCommit:
+    case ast::AstType::TxnAbort:
+    case ast::AstType::TxnRollback:
+    case ast::AstType::SetTransaction:
+        return DiagnosticOperation::TxnControl;
+    case ast::AstType::InsertStmt:
+    case ast::AstType::UpdateStmt:
+    case ast::AstType::DeleteStmt:
+        return DiagnosticOperation::PointDml;
+    case ast::AstType::SelectStmt:
+        return DiagnosticOperation::ScanJoinAggregate;
+    default:
+        return DiagnosticOperation::Other;
+    }
+}
+
+uint64_t NsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
 struct SidecarHeader {
     uint64_t magic;
+    uint32_t format_version;
     uint32_t header_bytes;
     uint32_t entry_bytes;
     uint32_t table_id;
     uint32_t constraint_id;
     uint64_t generation;
+    uint64_t snapshot_epoch;
     uint64_t count;
     uint64_t total_bytes;
     uint64_t key_bytes;
+    uint64_t row_order_offset;
     uint32_t entries_crc;
     uint32_t keys_crc;
+    uint32_t row_order_crc;
     uint32_t header_crc;
 };
-static_assert(sizeof(SidecarHeader) == 72);
 
 constexpr std::array<uint32_t, 256> MakeCrc32Table() {
     std::array<uint32_t, 256> table{};
@@ -80,6 +118,75 @@ template <typename T> void PutLe(std::vector<uint8_t>& out, T value) {
     U bits = static_cast<U>(value);
     for (size_t i = 0; i < sizeof(T); ++i)
         out.push_back(static_cast<uint8_t>(bits >> (i * 8)));
+}
+
+template <typename T> T GetLeAt(const uint8_t* bytes) {
+    using U = typename std::make_unsigned<T>::type;
+    U value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i)
+        value |= static_cast<U>(bytes[i]) << (i * 8);
+    return static_cast<T>(value);
+}
+
+template <typename T> void PutLeAt(std::array<uint8_t, kSidecarHeaderBytes>& bytes, size_t offset, T value) {
+    using U = typename std::make_unsigned<T>::type;
+    const U bits = static_cast<U>(value);
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bytes[offset + i] = static_cast<uint8_t>(bits >> (i * 8));
+}
+
+uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+    const uint64_t remainder = value % alignment;
+    if (remainder == 0)
+        return value;
+    if (value > std::numeric_limits<uint64_t>::max() - (alignment - remainder))
+        throw std::overflow_error("sidecar offset overflow");
+    return value + alignment - remainder;
+}
+
+bool CheckedAdd(uint64_t left, uint64_t right, uint64_t* result) {
+    if (left > std::numeric_limits<uint64_t>::max() - right)
+        return false;
+    *result = left + right;
+    return true;
+}
+
+bool CheckedMultiply(uint64_t left, uint64_t right, uint64_t* result) {
+    if (right != 0 && left > std::numeric_limits<uint64_t>::max() / right)
+        return false;
+    *result = left * right;
+    return true;
+}
+
+std::array<uint8_t, kSidecarHeaderBytes> EncodeSidecarHeader(const SidecarHeader& header) {
+    std::array<uint8_t, kSidecarHeaderBytes> bytes{};
+    PutLeAt<uint64_t>(bytes, 0, header.magic);
+    PutLeAt<uint32_t>(bytes, 8, header.format_version);
+    PutLeAt<uint32_t>(bytes, 12, header.header_bytes);
+    PutLeAt<uint32_t>(bytes, 16, header.entry_bytes);
+    PutLeAt<uint32_t>(bytes, 20, header.table_id);
+    PutLeAt<uint32_t>(bytes, 24, header.constraint_id);
+    PutLeAt<uint32_t>(bytes, 28, 0);
+    PutLeAt<uint64_t>(bytes, 32, header.generation);
+    PutLeAt<uint64_t>(bytes, 40, header.snapshot_epoch);
+    PutLeAt<uint64_t>(bytes, 48, header.count);
+    PutLeAt<uint64_t>(bytes, 56, header.total_bytes);
+    PutLeAt<uint64_t>(bytes, 64, header.key_bytes);
+    PutLeAt<uint64_t>(bytes, 72, header.row_order_offset);
+    PutLeAt<uint32_t>(bytes, 80, header.entries_crc);
+    PutLeAt<uint32_t>(bytes, 84, header.keys_crc);
+    PutLeAt<uint32_t>(bytes, 88, header.row_order_crc);
+    PutLeAt<uint32_t>(bytes, 92, header.header_crc);
+    return bytes;
+}
+
+SidecarHeader DecodeSidecarHeader(const uint8_t* bytes) {
+    return {GetLeAt<uint64_t>(bytes),      GetLeAt<uint32_t>(bytes + 8),  GetLeAt<uint32_t>(bytes + 12),
+            GetLeAt<uint32_t>(bytes + 16), GetLeAt<uint32_t>(bytes + 20), GetLeAt<uint32_t>(bytes + 24),
+            GetLeAt<uint64_t>(bytes + 32), GetLeAt<uint64_t>(bytes + 40), GetLeAt<uint64_t>(bytes + 48),
+            GetLeAt<uint64_t>(bytes + 56), GetLeAt<uint64_t>(bytes + 64), GetLeAt<uint64_t>(bytes + 72),
+            GetLeAt<uint32_t>(bytes + 80), GetLeAt<uint32_t>(bytes + 84), GetLeAt<uint32_t>(bytes + 88),
+            GetLeAt<uint32_t>(bytes + 92)};
 }
 
 template <typename T> void PutBe(std::vector<uint8_t>& out, T value) {
@@ -136,20 +243,512 @@ bool CompareResult(int comparison, ast::SvCompOp op) {
 }
 
 void AppendOverlay(DeltaOverlay& overlay, DeltaOverlayKey key, uint64_t local_id) {
-    overlay[std::move(key)].push_back(local_id);
+    auto& ids = overlay[std::move(key)];
+    const auto position = std::lower_bound(ids.begin(), ids.end(), local_id);
+    if (position == ids.end() || *position != local_id)
+        ids.insert(position, local_id);
 }
 
 void AppendOverlay(CommittedOverlay& overlay, DeltaOverlayKey key, uint64_t local_id) {
     overlay.emplace(std::move(key), std::vector<uint64_t>{local_id});
 }
 
+// Per-node RowId lists are sorted and unique. The common one-node case advances in O(1); multiple committed tickets
+// with the same key are merged without query-time allocation by probing one sorted position per node.
+template <typename Overlay> class OverlayRangeCursor {
+public:
+    OverlayRangeCursor(const Overlay& overlay, epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id,
+                       const EncodedKey& first, const EncodedKey& last, bool reverse, size_t& nodes, size_t& refs,
+                       size_t& refs_examined)
+        : table_id_(table_id), reverse_(reverse), begin_(overlay.lower_bound({table_id, constraint_id, first})),
+          end_(last.empty() ? ScopeEnd(overlay, table_id, constraint_id)
+                            : overlay.lower_bound({table_id, constraint_id, last})),
+          current_(reverse ? end_ : begin_), nodes_(nodes), refs_(refs), refs_examined_(refs_examined) {
+        if (!last.empty() && !(first < last)) {
+            begin_ = end_;
+            current_ = end_;
+            return;
+        }
+        if (reverse)
+            LoadReverseKey();
+        else
+            LoadForwardKey();
+    }
+
+    bool valid() const {
+        return valid_;
+    }
+    const EncodedKey& key() const {
+        return *key_;
+    }
+    epoch_si_poc::RowId id() const {
+        return {table_id_, id_};
+    }
+    void Advance() {
+        if (!valid_)
+            return;
+        if (!SelectId(false)) {
+            if (!reverse_)
+                LoadForwardKey();
+            else
+                LoadReverseKey();
+        }
+    }
+
+private:
+    using Iterator = typename Overlay::const_iterator;
+
+    static Iterator ScopeEnd(const Overlay& overlay, epoch_si_poc::TableId table_id,
+                             epoch_si_poc::ConstraintId constraint_id) {
+        if (constraint_id != std::numeric_limits<epoch_si_poc::ConstraintId>::max())
+            return overlay.lower_bound({table_id, constraint_id + 1, {}});
+        if (table_id != std::numeric_limits<epoch_si_poc::TableId>::max())
+            return overlay.lower_bound({table_id + 1, 0, {}});
+        return overlay.end();
+    }
+    size_t UpperBound(const std::vector<uint64_t>& ids, uint64_t value) {
+        size_t first = 0, last = ids.size();
+        while (first < last) {
+            const size_t middle = first + (last - first) / 2;
+            ++refs_examined_;
+            if (ids[middle] <= value)
+                first = middle + 1;
+            else
+                last = middle;
+        }
+        return first;
+    }
+    size_t LowerBound(const std::vector<uint64_t>& ids, uint64_t value) {
+        size_t first = 0, last = ids.size();
+        while (first < last) {
+            const size_t middle = first + (last - first) / 2;
+            ++refs_examined_;
+            if (ids[middle] < value)
+                first = middle + 1;
+            else
+                last = middle;
+        }
+        return first;
+    }
+    bool SelectId(bool first) {
+        Iterator after_first = group_begin_;
+        if (after_first != group_end_ && ++after_first == group_end_) {
+            const auto& ids = group_begin_->second;
+            if (ids.empty()) {
+                valid_ = false;
+                return false;
+            }
+            if (first)
+                single_position_ = reverse_ ? ids.size() - 1 : 0;
+            else if (!reverse_) {
+                if (++single_position_ == ids.size()) {
+                    valid_ = false;
+                    return false;
+                }
+            } else {
+                if (single_position_ == 0) {
+                    valid_ = false;
+                    return false;
+                }
+                --single_position_;
+            }
+            ++refs_examined_;
+            id_ = ids[single_position_];
+            ++refs_;
+            valid_ = true;
+            return true;
+        }
+        bool found = false;
+        uint64_t selected = 0;
+        for (Iterator node = group_begin_; node != group_end_; ++node) {
+            const auto& ids = node->second;
+            if (ids.empty())
+                continue;
+            size_t position = 0;
+            if (first) {
+                position = reverse_ ? ids.size() - 1 : 0;
+            } else if (!reverse_) {
+                position = UpperBound(ids, id_);
+                if (position == ids.size())
+                    continue;
+            } else {
+                position = LowerBound(ids, id_);
+                if (position == 0)
+                    continue;
+                --position;
+            }
+            ++refs_examined_;
+            const uint64_t candidate = ids[position];
+            if (!found || (reverse_ ? candidate > selected : candidate < selected)) {
+                selected = candidate;
+                found = true;
+            }
+        }
+        valid_ = found;
+        if (found) {
+            id_ = selected;
+            ++refs_;
+        }
+        return found;
+    }
+    void LoadForwardKey() {
+        if (current_ == end_) {
+            valid_ = false;
+            return;
+        }
+        group_begin_ = current_;
+        key_ = &std::get<2>(current_->first);
+        do {
+            ++nodes_;
+            ++current_;
+        } while (current_ != end_ && std::get<2>(current_->first) == *key_);
+        group_end_ = current_;
+        if (!SelectId(true))
+            LoadForwardKey();
+    }
+    void LoadReverseKey() {
+        if (current_ == begin_) {
+            valid_ = false;
+            return;
+        }
+        Iterator node = current_;
+        --node;
+        group_end_ = current_;
+        key_ = &std::get<2>(node->first);
+        for (;;) {
+            ++nodes_;
+            current_ = node;
+            if (node == begin_)
+                break;
+            Iterator previous = node;
+            --previous;
+            if (std::get<2>(previous->first) != *key_)
+                break;
+            node = previous;
+        }
+        group_begin_ = current_;
+        if (!SelectId(true))
+            LoadReverseKey();
+    }
+
+    epoch_si_poc::TableId table_id_;
+    bool reverse_;
+    Iterator begin_;
+    Iterator end_;
+    Iterator current_;
+    Iterator group_begin_;
+    Iterator group_end_;
+    const EncodedKey* key_ = nullptr;
+    size_t& nodes_;
+    size_t& refs_;
+    size_t& refs_examined_;
+    uint64_t id_ = 0;
+    size_t single_position_ = 0;
+    bool valid_ = false;
+};
+
 } // namespace
 
-DeltaDatabase::DeltaDatabase(epoch_si_poc::CheckpointDb db) : db_(std::move(db)) {}
+DeltaDatabase::SidecarDescriptor::SidecarDescriptor(epoch_si_poc::TableId table_id,
+                                                    epoch_si_poc::ConstraintId constraint_id, uint64_t generation,
+                                                    epoch_si_poc::Epoch snapshot_epoch, uint64_t count,
+                                                    uint64_t key_bytes, uint64_t row_order_bytes, size_t mapped_bytes,
+                                                    void* mapping)
+    : table_id(table_id), constraint_id(constraint_id), generation(generation), snapshot_epoch(snapshot_epoch),
+      count(count), key_bytes(key_bytes), row_order_bytes(row_order_bytes), mapped_bytes(mapped_bytes),
+      mapping(mapping), live_bitmap(static_cast<size_t>((count + 63) / 64), ~uint64_t{0}) {
+    if (!live_bitmap.empty() && count % 64 != 0)
+        live_bitmap.back() = (uint64_t{1} << (count % 64)) - 1;
+}
+
+DeltaDatabase::SidecarDescriptor::~SidecarDescriptor() {
+    if (mapping)
+        munmap(mapping, mapped_bytes);
+}
+
+DeltaDatabase::SidecarDescriptor::SidecarDescriptor(SidecarDescriptor&& other) noexcept
+    : table_id(other.table_id), constraint_id(other.constraint_id), generation(other.generation),
+      snapshot_epoch(other.snapshot_epoch), count(other.count), key_bytes(other.key_bytes),
+      row_order_bytes(other.row_order_bytes), mapped_bytes(other.mapped_bytes), mapping(other.mapping),
+      live_bitmap(std::move(other.live_bitmap)) {
+    other.mapping = nullptr;
+    other.mapped_bytes = 0;
+}
+
+DeltaDatabase::SidecarDescriptor& DeltaDatabase::SidecarDescriptor::operator=(SidecarDescriptor&& other) noexcept {
+    if (this == &other)
+        return *this;
+    if (mapping)
+        munmap(mapping, mapped_bytes);
+    table_id = other.table_id;
+    constraint_id = other.constraint_id;
+    generation = other.generation;
+    snapshot_epoch = other.snapshot_epoch;
+    count = other.count;
+    key_bytes = other.key_bytes;
+    row_order_bytes = other.row_order_bytes;
+    mapped_bytes = other.mapped_bytes;
+    mapping = other.mapping;
+    live_bitmap = std::move(other.live_bitmap);
+    other.mapping = nullptr;
+    other.mapped_bytes = 0;
+    return *this;
+}
+
+DeltaDatabase::DeltaDatabase(epoch_si_poc::CheckpointDb db) : db_(std::move(db)) {
+    const char* enabled = std::getenv("RMDB_DELTA_DIAGNOSTICS");
+    if (enabled != nullptr && *enabled != '\0' && std::strcmp(enabled, "0") != 0) {
+        diagnostics_ = std::make_shared<epoch_si_poc::DeltaDiagnostics>();
+        report_diagnostics_ = true;
+        db_.engine().SetDiagnostics(diagnostics_);
+    }
+}
+
+DeltaDatabase::~DeltaDatabase() {
+    ReportDiagnostics();
+}
+
+std::shared_lock<std::shared_mutex> DeltaDatabase::LockExecutionShared() {
+    std::unique_lock<std::mutex> turnstile(execution_turnstile_);
+    std::shared_lock<std::shared_mutex> lock(execution_gate_);
+    return lock;
+}
+
+std::unique_lock<std::shared_mutex> DeltaDatabase::LockExecutionUnique() {
+    std::unique_lock<std::mutex> turnstile(execution_turnstile_);
+    std::unique_lock<std::shared_mutex> lock(execution_gate_, std::defer_lock);
+    if (!lock.try_lock()) {
+        if (execution_writer_wait_hook_for_test_)
+            execution_writer_wait_hook_for_test_();
+        lock.lock();
+    }
+    return lock;
+}
+
+std::shared_lock<std::shared_mutex> DeltaDatabase::LockStateShared(bool report_blocked) const {
+    std::unique_lock<std::mutex> turnstile(state_turnstile_, std::defer_lock);
+    bool reported = false;
+    if (!turnstile.try_lock()) {
+        if (report_blocked && execute_blocked_hook_for_test_) {
+            execute_blocked_hook_for_test_();
+            reported = true;
+        }
+        turnstile.lock();
+    }
+    std::shared_lock<std::shared_mutex> lock(state_mutex_, std::defer_lock);
+    if (!lock.try_lock()) {
+        if (report_blocked && !reported && execute_blocked_hook_for_test_)
+            execute_blocked_hook_for_test_();
+        lock.lock();
+    }
+    return lock;
+}
+
+std::unique_lock<std::shared_mutex> DeltaDatabase::LockStateUnique() const {
+    const auto started = diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::unique_lock<std::mutex> turnstile(state_turnstile_);
+    if (diagnostics_)
+        writer_turnstile_wait_ns_.fetch_add(NsSince(started), std::memory_order_relaxed);
+    std::unique_lock<std::shared_mutex> lock(state_mutex_, std::defer_lock);
+    if (!lock.try_lock()) {
+        if (state_writer_wait_hook_for_test_)
+            state_writer_wait_hook_for_test_();
+        lock.lock();
+    }
+    return lock;
+}
+
+void DeltaDatabase::RecordPreparedClone(uint64_t elapsed_ns) noexcept {
+    if (!diagnostics_)
+        return;
+    prepared_clone_count_.fetch_add(1, std::memory_order_relaxed);
+    prepared_clone_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void DeltaDatabase::EnableDiagnosticsForTest() {
+    auto state_lock = LockStateUnique();
+    if (!diagnostics_) {
+        diagnostics_ = std::make_shared<epoch_si_poc::DeltaDiagnostics>();
+        db_.engine().SetDiagnostics(diagnostics_);
+    }
+}
+
+std::array<uint64_t, 6> DeltaDatabase::QueryDiagnosticsForTest() const {
+    return {sidecar_base_entries_.load(std::memory_order_relaxed),
+            join_parameterized_probes_.load(std::memory_order_relaxed),
+            join_parameterized_.load(std::memory_order_relaxed), join_fallback_.load(std::memory_order_relaxed),
+            ordered_stream_.load(std::memory_order_relaxed), ordered_materialize_.load(std::memory_order_relaxed)};
+}
+
+void DeltaDatabase::ReportDiagnostics() const noexcept {
+    if (!report_diagnostics_)
+        return;
+    struct rusage usage {};
+    getrusage(RUSAGE_SELF, &usage);
+    char histogram[512]{};
+    size_t used = 0;
+    for (size_t n = 0; n < diagnostics_->commit_batch_hist.size(); ++n) {
+        const uint64_t count = diagnostics_->commit_batch_hist[n].load(std::memory_order_relaxed);
+        if (count == 0)
+            continue;
+        const int written = std::snprintf(histogram + used, sizeof(histogram) - used, "%s%zu:%llu",
+                                          used == 0 ? "" : ",", n, static_cast<unsigned long long>(count));
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(histogram) - used)
+            break;
+        used += static_cast<size_t>(written);
+    }
+    const auto load = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    std::fprintf(stderr,
+                 "DELTA_DIAGNOSTICS prepared_clone_count=%llu prepared_clone_ns=%llu "
+                 "execute_txn_calls=%llu execute_point_dml_calls=%llu execute_scan_join_aggregate_calls=%llu "
+                 "execute_other_calls=%llu execute_txn_wall_ns=%llu execute_point_dml_wall_ns=%llu "
+                 "execute_scan_join_aggregate_wall_ns=%llu execute_other_wall_ns=%llu execute_shared_wait_ns=%llu "
+                 "execute_shared_calls=%llu state_unique_commit_wait_ns=%llu state_unique_commit_batches=%llu "
+                 "peak_inflight_execute=%llu writer_turnstile_wait_ns=%llu "
+                 "immutable_reads=%llu immutable_bytes=%llu immutable_pread_ns=%llu immutable_decode_ns=%llu "
+                 "private_hits=%llu version_hits=%llu base_hits=%llu sidecar_base_entries=%llu sidecar_overlay_refs=%llu "
+                 "join_parameterized_queries=%llu join_fallback_queries=%llu ordered_early_stop=%llu "
+                 "join_outer_indexed_queries=%llu join_outer_candidates=%llu join_outer_full_scan_rows=%llu "
+                 "join_inferred_literal_components=%llu join_inferred_literal_probes=%llu "
+                 "ordered_stream_queries=%llu ordered_materialize_queries=%llu "
+                 "commit_queue_wait_ns=%llu commit_ready_wait_ns=%llu commit_leader_reacquire_wait_ns=%llu "
+                 "prepare_unique_ns=%llu sync_unlocked_ns=%llu reacquire_ns=%llu publish_unique_ns=%llu "
+                 "commit_frames=%llu commit_tickets=%llu commit_batch_hist=%s commit_encode_ns=%llu "
+                 "commit_prepare_ns=%llu wal_pwrite_calls=%llu wal_pwrite_bytes=%llu wal_pwrite_ns=%llu "
+                 "wal_fdatasync_calls=%llu wal_fdatasync_ns=%llu commit_install_ns=%llu commit_publish_ns=%llu "
+                 "minor_faults=%ld major_faults=%ld max_rss_kb=%ld\n",
+                 static_cast<unsigned long long>(load(prepared_clone_count_)),
+                 static_cast<unsigned long long>(load(prepared_clone_ns_)),
+                 static_cast<unsigned long long>(load(execute_calls_[0])),
+                 static_cast<unsigned long long>(load(execute_calls_[1])),
+                 static_cast<unsigned long long>(load(execute_calls_[2])),
+                 static_cast<unsigned long long>(load(execute_calls_[3])),
+                 static_cast<unsigned long long>(load(execute_ns_[0])),
+                 static_cast<unsigned long long>(load(execute_ns_[1])),
+                 static_cast<unsigned long long>(load(execute_ns_[2])),
+                 static_cast<unsigned long long>(load(execute_ns_[3])),
+                 static_cast<unsigned long long>(load(execute_shared_wait_ns_)),
+                 static_cast<unsigned long long>(load(execute_shared_calls_)),
+                 static_cast<unsigned long long>(load(state_unique_commit_wait_ns_)),
+                 static_cast<unsigned long long>(load(state_unique_commit_batches_)),
+                 static_cast<unsigned long long>(load(peak_inflight_execute_)),
+                 static_cast<unsigned long long>(load(writer_turnstile_wait_ns_)),
+                 static_cast<unsigned long long>(load(diagnostics_->immutable_reads)),
+                 static_cast<unsigned long long>(load(diagnostics_->immutable_bytes)),
+                 static_cast<unsigned long long>(load(diagnostics_->immutable_pread_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->immutable_decode_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->private_hits)),
+                 static_cast<unsigned long long>(load(diagnostics_->version_hits)),
+                 static_cast<unsigned long long>(load(diagnostics_->base_hits)),
+                 static_cast<unsigned long long>(load(sidecar_base_entries_)),
+                 static_cast<unsigned long long>(load(sidecar_overlay_refs_)),
+                 static_cast<unsigned long long>(load(join_parameterized_)),
+                 static_cast<unsigned long long>(load(join_fallback_)),
+                 static_cast<unsigned long long>(load(ordered_early_stop_)),
+                 static_cast<unsigned long long>(load(join_outer_indexed_)),
+                 static_cast<unsigned long long>(load(join_outer_candidates_)),
+                 static_cast<unsigned long long>(load(join_outer_full_scan_rows_)),
+                 static_cast<unsigned long long>(load(join_inferred_literal_components_)),
+                 static_cast<unsigned long long>(load(join_inferred_literal_probes_)),
+                 static_cast<unsigned long long>(load(ordered_stream_)),
+                 static_cast<unsigned long long>(load(ordered_materialize_)),
+                 static_cast<unsigned long long>(load(commit_queue_wait_ns_)),
+                 static_cast<unsigned long long>(load(commit_ready_wait_ns_)),
+                 static_cast<unsigned long long>(load(commit_leader_reacquire_wait_ns_)),
+                 static_cast<unsigned long long>(load(commit_prepare_unique_ns_)),
+                 static_cast<unsigned long long>(load(commit_sync_unlocked_ns_)),
+                 static_cast<unsigned long long>(load(commit_reacquire_ns_)),
+                 static_cast<unsigned long long>(load(commit_publish_unique_ns_)),
+                 static_cast<unsigned long long>(load(diagnostics_->commit_frames)),
+                 static_cast<unsigned long long>(load(diagnostics_->commit_tickets)), histogram,
+                 static_cast<unsigned long long>(load(diagnostics_->commit_encode_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->commit_prepare_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_calls)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_bytes)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_calls)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->commit_install_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->commit_publish_ns)), usage.ru_minflt, usage.ru_majflt,
+                 usage.ru_maxrss);
+}
+
+std::array<size_t, 3> DeltaDatabase::IndexProbeCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    return {session.census.last_overlay_nodes_probed, session.census.last_row_ids_probed,
+            session.census.last_row_reads_probed};
+}
+
+std::array<uint64_t, 6> DeltaDatabase::ConcurrencyDiagnosticsForTest() const {
+    return {execute_shared_calls_.load(std::memory_order_relaxed),
+            execute_shared_wait_ns_.load(std::memory_order_relaxed),
+            state_unique_commit_batches_.load(std::memory_order_relaxed),
+            state_unique_commit_wait_ns_.load(std::memory_order_relaxed),
+            peak_inflight_execute_.load(std::memory_order_relaxed),
+            writer_turnstile_wait_ns_.load(std::memory_order_relaxed)};
+}
+
+std::array<size_t, 8> DeltaDatabase::JoinProbeCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    return {session.census.last_parameterized_join_probes,     session.census.last_join_inner_rows_resolved,
+            session.census.last_join_pairs_rechecked,          session.census.last_join_full_scan_rows,
+            session.census.last_join_right_rows_visited,       session.census.last_join_base_entries_examined,
+            session.census.last_join_overlay_entries_examined, session.census.last_join_overlay_refs_examined};
+}
+
+std::array<size_t, 5> DeltaDatabase::JoinOuterProbeCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    return {session.census.last_join_outer_indexed_queries, session.census.last_join_outer_candidates,
+            session.census.last_join_outer_full_scan_rows, session.census.last_join_inferred_literal_components,
+            session.census.last_join_inferred_literal_probes};
+}
+
+std::array<uint64_t, 5> DeltaDatabase::JoinOuterDiagnosticsForTest() const {
+    return {join_outer_indexed_.load(std::memory_order_relaxed), join_outer_candidates_.load(std::memory_order_relaxed),
+            join_outer_full_scan_rows_.load(std::memory_order_relaxed),
+            join_inferred_literal_components_.load(std::memory_order_relaxed),
+            join_inferred_literal_probes_.load(std::memory_order_relaxed)};
+}
+
+std::array<size_t, 8> DeltaDatabase::OrderedProbeCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    return {session.census.last_ordered_candidates_examined, session.census.last_ordered_rows_decoded,
+            session.census.last_ordered_sort_input_rows,     session.census.last_ordered_early_stops,
+            session.census.last_overlay_nodes_probed,        session.census.last_overlay_refs_examined,
+            session.census.last_overlay_refs_copied,         session.census.last_overlay_order_ops};
+}
+
+std::array<size_t, 4> DeltaDatabase::SidecarIoCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    auto state_lock = LockStateShared();
+    size_t mapped_bytes = 0;
+    for (const auto& [constraint_id, descriptor] : sidecars_)
+        mapped_bytes += descriptor.mapped_bytes;
+    return {session.census.last_sidecar_query_opens, session.census.last_sidecar_query_preads,
+            session.census.last_sidecar_binary_comparisons, mapped_bytes};
+}
+
+size_t DeltaDatabase::SidecarValidationCountForTest() const {
+    auto state_lock = LockStateShared();
+    return sidecar_validation_count_;
+}
+
+std::optional<uint64_t> DeltaDatabase::SidecarLiveTailForTest(epoch_si_poc::ConstraintId constraint_id) const {
+    auto state_lock = LockStateShared();
+    const auto found = sidecars_.find(constraint_id);
+    if (found == sidecars_.end() || found->second.live_bitmap.empty())
+        return std::nullopt;
+    return found->second.live_bitmap.back();
+}
 
 void DeltaDatabase::RequireUsable() const {
-    if (poisoned_)
+    if (poisoned_.load(std::memory_order_acquire))
         throw std::logic_error("Delta database is poisoned; reopen required");
+}
+
+void DeltaDatabase::CloseWalForTest() {
+    auto state_lock = LockStateUnique();
+    db_.engine().CloseFileForTest();
 }
 
 bool DeltaDatabase::IsDeltaDirectory(const std::string& directory) {
@@ -246,7 +845,7 @@ void DeltaDatabase::SaveCatalog(const Catalog& tables, epoch_si_poc::TableId nex
         ::close(directory_fd);
     } catch (...) {
         if (renamed)
-            poisoned_ = true;
+            poisoned_.store(true, std::memory_order_release);
         throw;
     }
 }
@@ -377,8 +976,14 @@ epoch_si_poc::EpochSiEngine::Txn& DeltaDatabase::Txn(DeltaSession& session) {
 
 CommittedOverlay DeltaDatabase::PrepareCommittedOverlay(const DeltaOverlay& overlay) {
     CommittedOverlay prepared;
-    for (const auto& [key, ids] : overlay)
-        prepared.emplace(key, ids);
+    for (const auto& [key, ids] : overlay) {
+        // Canonicalize while the ticket still owns every allocation, before CommitBatch can make the transaction
+        // durable. InstallCommittedOverlay remains a node-only, allocation-free merge.
+        std::vector<uint64_t> canonical = ids;
+        std::sort(canonical.begin(), canonical.end());
+        canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
+        prepared.emplace(key, std::move(canonical));
+    }
     return prepared;
 }
 
@@ -399,38 +1004,71 @@ void DeltaDatabase::InstallCommittedOverlay(CommittedOverlay& overlay) noexcept 
     }
 }
 
-void DeltaDatabase::Commit(DeltaSession& session, std::unique_lock<std::mutex>& interpreter_lock) {
+void DeltaDatabase::CaptureQueryCensus(const DeltaSession& session, ExecutionCensus& census) const {
+    if (!diagnostics_ || census.captured)
+        return;
+    census.captured = true;
+    census.base_entries = session.census.last_join_base_entries_examined != 0
+                              ? session.census.last_join_base_entries_examined
+                              : session.census.last_base_entries_probed;
+    census.overlay_refs = session.census.last_join_overlay_refs_examined != 0
+                              ? session.census.last_join_overlay_refs_examined
+                              : session.census.last_overlay_refs_examined;
+    census.parameterized_join_probes = session.census.last_parameterized_join_probes;
+    census.join_outer_candidates = session.census.last_join_outer_candidates;
+    census.join_outer_full_scan_rows = session.census.last_join_outer_full_scan_rows;
+    census.join_inferred_literal_components = session.census.last_join_inferred_literal_components;
+    census.join_inferred_literal_probes = session.census.last_join_inferred_literal_probes;
+    census.join_outer_indexed = session.census.last_join_outer_indexed_queries != 0;
+    census.ordered_early_stops = session.census.last_ordered_early_stops;
+}
+
+void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_mutex>& state_lock,
+                           ExecutionCensus* census) {
     if (!session.txn)
         return;
+    if (census != nullptr)
+        CaptureQueryCensus(session, *census);
     auto ticket = std::make_shared<CommitTicket>();
     ticket->overlay = PrepareCommittedOverlay(session.overlay);
     ticket->txn.emplace(std::move(*session.txn));
-    interpreter_lock.unlock();
+    state_lock.unlock();
     bool leader = false;
     try {
         std::unique_lock<std::mutex> queue_lock(commit_mutex_);
+        const auto queue_wait_started = diagnostics_ ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
         commit_slot_available_.wait(queue_lock, [&] { return commit_queue_.size() < kCommitQueueLimit; });
+        if (diagnostics_)
+            commit_queue_wait_ns_.fetch_add(NsSince(queue_wait_started), std::memory_order_relaxed);
+        if (fail_commit_enqueue_for_test_)
+            throw std::runtime_error("test commit enqueue failure");
         commit_queue_.push_back(ticket);
         if (!commit_leader_) {
             commit_leader_ = true;
             leader = true;
         }
     } catch (...) {
-        interpreter_lock.lock();
-        session.txn.emplace(std::move(*ticket->txn));
         ticket->txn.reset();
+        session.txn.reset();
+        session.overlay.clear();
+        session.explicit_txn = false;
+        session.admission.reset();
         throw;
     }
-    session.txn.reset();
-    session.overlay.clear();
-    session.explicit_txn = false;
     if (leader)
         DrainCommitQueue();
     {
         std::unique_lock<std::mutex> queue_lock(commit_mutex_);
+        const auto ready_wait_started = diagnostics_ ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
         ticket->ready.wait(queue_lock, [&] { return ticket->done; });
+        if (diagnostics_)
+            commit_ready_wait_ns_.fetch_add(NsSince(ready_wait_started), std::memory_order_relaxed);
     }
-    interpreter_lock.lock();
+    session.txn.reset();
+    session.overlay.clear();
+    session.explicit_txn = false;
     session.admission.reset();
     if (ticket->error)
         std::rethrow_exception(ticket->error);
@@ -476,21 +1114,61 @@ void DeltaDatabase::DrainCommitQueue() {
                 txns.reserve(batch_count);
                 for (size_t n = 0; n < batch_count; ++n)
                     txns.push_back(&*batch[n]->txn);
-                std::lock_guard<std::mutex> interpreter_lock(mutex_);
+                auto prepare_lock = LockStateUnique();
+                const auto prepare_started =
+                    diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 engine_called = true;
-                results = db_.engine().CommitBatch(txns);
-                if (results.size() != batch_count)
-                    std::terminate();
-                RunCommitInstallHookForTest();
-                for (size_t n = 0; n < batch_count; ++n)
-                    if (results[n].status == epoch_si_poc::CommitStatus::kCommitted)
-                        InstallCommittedOverlay(batch[n]->overlay);
+                auto prepared = db_.engine().PrepareCommitBatch(txns);
+                prepare_lock.unlock();
+                if (diagnostics_)
+                    commit_prepare_unique_ns_.fetch_add(NsSince(prepare_started), std::memory_order_relaxed);
+                results = prepared.results(); // All ticket-result allocation stays before WAL durability.
+                if (commit_sync_hook_for_test_)
+                    commit_sync_hook_for_test_();
+                if (prepared.needs_sync()) {
+                    const auto sync_started =
+                        diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    try {
+                        db_.engine().SyncPreparedCommit(prepared);
+                    } catch (...) {
+                        poisoned_.store(true, std::memory_order_release);
+                        throw;
+                    }
+                    if (diagnostics_)
+                        commit_sync_unlocked_ns_.fetch_add(NsSince(sync_started), std::memory_order_relaxed);
+                }
+                if (commit_reacquire_hook_for_test_)
+                    commit_reacquire_hook_for_test_();
+                const auto reacquire_started = diagnostics_ ? std::chrono::steady_clock::now()
+                                                            : std::chrono::steady_clock::time_point{};
+                auto state_lock = LockStateUnique();
+                if (diagnostics_) {
+                    const uint64_t waited = NsSince(reacquire_started);
+                    commit_leader_reacquire_wait_ns_.fetch_add(waited, std::memory_order_relaxed);
+                    commit_reacquire_ns_.fetch_add(waited, std::memory_order_relaxed);
+                    state_unique_commit_wait_ns_.fetch_add(waited, std::memory_order_relaxed);
+                    state_unique_commit_batches_.fetch_add(1, std::memory_order_relaxed);
+                }
+                try {
+                    const auto publish_started =
+                        diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    if (prepared.needs_publish())
+                        db_.engine().PublishPreparedCommit(prepared);
+                    if (results.size() != batch_count)
+                        std::terminate();
+                    RunCommitInstallHookForTest();
+                    for (size_t n = 0; n < batch_count; ++n)
+                        if (results[n].status == epoch_si_poc::CommitStatus::kCommitted)
+                            InstallCommittedOverlay(batch[n]->overlay);
+                    if (diagnostics_)
+                        commit_publish_unique_ns_.fetch_add(NsSince(publish_started), std::memory_order_relaxed);
+                } catch (...) {
+                    if (engine_called)
+                        poisoned_.store(true, std::memory_order_release);
+                    throw;
+                }
             } catch (...) {
                 error = std::current_exception();
-                if (engine_called) {
-                    std::lock_guard<std::mutex> interpreter_lock(mutex_);
-                    poisoned_ = true;
-                }
             }
         }
         {
@@ -511,7 +1189,13 @@ void DeltaDatabase::DrainCommitQueue() {
 }
 
 void DeltaDatabase::Abort(DeltaSession& session) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (abort_lock_attempt_hook_for_test_)
+        abort_lock_attempt_hook_for_test_();
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    std::shared_lock<std::shared_mutex> admission;
+    if (!session.admission)
+        admission = LockExecutionShared();
+    auto state_lock = LockStateShared();
     AbortLocked(session);
 }
 
@@ -529,20 +1213,20 @@ void DeltaDatabase::AbortLocked(DeltaSession& session) noexcept {
 }
 
 void DeltaDatabase::Checkpoint() {
-    std::unique_lock<std::shared_mutex> admission(execution_gate_);
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto admission = LockExecutionUnique();
+    auto state_lock = LockStateUnique();
     RequireUsable();
     CheckpointSidecars();
 }
 
 uint64_t DeltaDatabase::CatalogGeneration() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto state_lock = LockStateShared();
     RequireUsable();
     return catalog_generation_;
 }
 
 size_t DeltaDatabase::WalFrameCountForTest() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto state_lock = LockStateShared();
     return db_.engine().wal_frame_count();
 }
 
@@ -606,10 +1290,30 @@ std::vector<uint8_t> DeltaDatabase::EncodeKey(const TableSchema& schema, const I
     return key;
 }
 
+std::string DeltaDatabase::DistinctKey(const Column& column, const Cell& cell) const {
+    std::string key(1, static_cast<char>(column.type));
+    const auto append = [&](uint32_t value) {
+        for (size_t i = 0; i < sizeof(value); ++i)
+            key.push_back(static_cast<char>(value >> (i * 8)));
+    };
+    if (column.type == ColumnType::Int)
+        append(static_cast<uint32_t>(cell.integer));
+    else if (column.type == ColumnType::Float) {
+        uint32_t bits;
+        std::memcpy(&bits, &cell.floating, sizeof(bits));
+        if ((bits & 0x7fffffffU) == 0)
+            bits = 0;
+        append(bits);
+    } else
+        key += cell.text;
+    return key;
+}
+
 void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
                                   uint64_t generation) {
     for (size_t n = 0; n < schema.indexes.size(); ++n) {
         const Index& index = schema.indexes[n];
+        sidecars_.erase(index.constraint_id);
         std::vector<SidecarBuildEntry>& sorted = entries[n];
         std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
             return left.key != right.key ? left.key < right.key : left.local_id < right.local_id;
@@ -622,37 +1326,66 @@ void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::ve
             }
             key_bytes += entry.key.size();
         }
-        if (key_bytes > kMaxSidecarBytes - sizeof(SidecarHeader) - sorted.size() * sizeof(SidecarEntry))
+        if (sorted.size() > std::numeric_limits<uint32_t>::max() ||
+            sorted.size() >
+                (kMaxSidecarBytes - kSidecarHeaderBytes - 7) / (kSidecarEntryBytes + kSidecarRowOrderEntryBytes) ||
+            key_bytes > kMaxSidecarBytes - kSidecarHeaderBytes - 7 -
+                            sorted.size() * (kSidecarEntryBytes + kSidecarRowOrderEntryBytes))
             continue;
-        std::vector<SidecarEntry> disk;
-        disk.reserve(sorted.size());
+        std::vector<uint8_t> disk;
+        disk.reserve(sorted.size() * kSidecarEntryBytes);
+        std::vector<std::pair<uint64_t, uint32_t>> row_order;
+        row_order.reserve(sorted.size());
         uint64_t key_offset = 0;
-        for (const auto& entry : sorted) {
-            disk.push_back({key_offset, entry.local_id});
+        for (size_t ordinal = 0; ordinal < sorted.size(); ++ordinal) {
+            const auto& entry = sorted[ordinal];
+            PutLe<uint64_t>(disk, key_offset);
+            PutLe<uint64_t>(disk, entry.local_id);
+            row_order.emplace_back(entry.local_id, static_cast<uint32_t>(ordinal));
             key_offset += entry.key.size();
         }
+        std::sort(row_order.begin(), row_order.end(),
+                  [](const auto& left, const auto& right) { return left.first < right.first; });
+        if (std::adjacent_find(row_order.begin(), row_order.end(), [](const auto& left, const auto& right) {
+                return left.first == right.first;
+            }) != row_order.end()) {
+            continue;
+        }
+        std::vector<uint8_t> row_order_bytes;
+        row_order_bytes.reserve(row_order.size() * kSidecarRowOrderEntryBytes);
+        for (const auto& entry : row_order)
+            PutLe<uint32_t>(row_order_bytes, entry.second);
+        const uint64_t keys_offset = kSidecarHeaderBytes + disk.size();
+        const uint64_t row_order_offset = AlignUp(keys_offset + key_bytes, alignof(uint32_t));
         SidecarHeader header{kSidecarMagic,
-                             sizeof(SidecarHeader),
-                             sizeof(SidecarEntry),
+                             kSidecarFormatVersion,
+                             kSidecarHeaderBytes,
+                             kSidecarEntryBytes,
                              schema.id,
                              index.constraint_id,
                              generation,
-                             disk.size(),
-                             sizeof(SidecarHeader) + disk.size() * sizeof(SidecarEntry) + key_bytes,
+                             db_.engine().published_epoch(),
+                             sorted.size(),
+                             row_order_offset + row_order_bytes.size(),
                              key_bytes,
+                             row_order_offset,
+                             0,
                              0,
                              0,
                              0};
-        header.entries_crc = Crc32(disk.data(), disk.size() * sizeof(SidecarEntry));
+        header.entries_crc = Crc32(disk.data(), disk.size());
         uint32_t keys_crc = 0xffffffffU;
         for (const auto& entry : sorted)
             keys_crc = UpdateCrc32(keys_crc, entry.key.data(), entry.key.size());
         header.keys_crc = ~keys_crc;
-        header.header_crc = Crc32(&header, offsetof(SidecarHeader, header_crc));
+        header.row_order_crc = Crc32(row_order_bytes.data(), row_order_bytes.size());
+        auto encoded_header = EncodeSidecarHeader(header);
+        header.header_crc = Crc32(encoded_header.data(), kSidecarHeaderCrcOffset);
+        encoded_header = EncodeSidecarHeader(header);
         const std::string path =
             directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id);
         const std::string temp = path + ".tmp";
-        const int fd = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        const int fd = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (fd < 0)
             continue;
         const auto write_all = [&](const void* data, size_t bytes) {
@@ -666,9 +1399,12 @@ void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::ve
             }
             return true;
         };
-        bool ok = write_all(&header, sizeof(header)) && write_all(disk.data(), disk.size() * sizeof(SidecarEntry));
+        bool ok = write_all(encoded_header.data(), encoded_header.size()) && write_all(disk.data(), disk.size());
         for (const auto& entry : sorted)
             ok = ok && write_all(entry.key.data(), entry.key.size());
+        std::array<uint8_t, 3> padding{};
+        ok = ok && write_all(padding.data(), static_cast<size_t>(row_order_offset - keys_offset - key_bytes));
+        ok = ok && write_all(row_order_bytes.data(), row_order_bytes.size());
         if (ok)
             ok = fsync(fd) == 0;
         if (close(fd) != 0)
@@ -677,58 +1413,152 @@ void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::ve
             ok = rename(temp.c_str(), path.c_str()) == 0;
         if (!ok)
             unlink(temp.c_str());
-        else
-            sidecars_[index.constraint_id] = SidecarDescriptor{header.count, header.key_bytes};
+        else if (!ValidateSidecar(schema, index))
+            sidecars_.erase(index.constraint_id);
     }
 }
 
 bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& index) {
-    sidecars_.erase(index.constraint_id);
     const std::string path =
         directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id);
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        sidecars_.erase(index.constraint_id);
         return false;
+    }
     ++sidecar_validation_count_;
-    SidecarHeader header{};
+    const auto read_exact = [&](void* output, size_t bytes, uint64_t offset) {
+        auto* out = static_cast<uint8_t*>(output);
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t read_bytes = pread(fd, out + done, bytes - done, static_cast<off_t>(offset + done));
+            if (read_bytes < 0 && errno == EINTR)
+                continue;
+            if (read_bytes <= 0)
+                return false;
+            done += static_cast<size_t>(read_bytes);
+        }
+        return true;
+    };
+    std::array<uint8_t, kSidecarHeaderBytes> header_bytes{};
     struct stat st {};
     const auto generation = db_.TableGeneration(schema.id);
-    bool valid = generation && fstat(fd, &st) == 0 && pread(fd, &header, sizeof(header), 0) == sizeof(header) &&
-                 header.magic == kSidecarMagic && header.header_bytes == sizeof(header) &&
-                 header.entry_bytes == sizeof(SidecarEntry) && header.table_id == schema.id &&
-                 header.constraint_id == index.constraint_id && header.generation == *generation &&
-                 header.total_bytes == static_cast<uint64_t>(st.st_size) &&
-                 header.count <= (kMaxSidecarBytes - sizeof(header)) / sizeof(SidecarEntry) &&
-                 header.key_bytes <= kMaxSidecarBytes &&
-                 header.total_bytes == sizeof(header) + header.count * sizeof(SidecarEntry) + header.key_bytes &&
-                 header.total_bytes <= kMaxSidecarBytes &&
-                 header.header_crc == Crc32(&header, offsetof(SidecarHeader, header_crc));
-    std::vector<SidecarEntry> chunk(std::min<uint64_t>(header.count, 65536));
+    const auto visible_from = db_.TableVisibleFrom(schema.id);
+    const bool read_header = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+                             static_cast<uint64_t>(st.st_size) >= header_bytes.size() &&
+                             read_exact(header_bytes.data(), header_bytes.size(), 0);
+    const SidecarHeader header = read_header ? DecodeSidecarHeader(header_bytes.data()) : SidecarHeader{};
+    const bool header_valid =
+        generation && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && visible_from && read_header &&
+        header.magic == kSidecarMagic && header.format_version == kSidecarFormatVersion &&
+        header.header_bytes == kSidecarHeaderBytes && header.entry_bytes == kSidecarEntryBytes &&
+        GetLeAt<uint32_t>(header_bytes.data() + 28) == 0 && header.table_id == schema.id &&
+        header.constraint_id == index.constraint_id && header.generation == *generation &&
+        *visible_from <= header.snapshot_epoch && header.snapshot_epoch <= db_.engine().published_epoch() &&
+        header.total_bytes == static_cast<uint64_t>(st.st_size) && header.total_bytes <= kMaxSidecarBytes &&
+        header.count <= std::numeric_limits<uint32_t>::max() &&
+        header.total_bytes <= std::numeric_limits<size_t>::max() &&
+        header.header_crc == Crc32(header_bytes.data(), kSidecarHeaderCrcOffset);
+    uint64_t entry_bytes = 0;
+    uint64_t keys_offset = 0;
+    uint64_t keys_end = 0;
+    uint64_t row_order_bytes = 0;
+    uint64_t expected_total_bytes = 0;
+    const bool layout_valid =
+        header.count <= std::numeric_limits<uint64_t>::max() / kSidecarEntryBytes &&
+        CheckedMultiply(header.count, kSidecarEntryBytes, &entry_bytes) &&
+        CheckedAdd(kSidecarHeaderBytes, entry_bytes, &keys_offset) &&
+        CheckedAdd(keys_offset, header.key_bytes, &keys_end) &&
+        header.count <= std::numeric_limits<uint64_t>::max() / kSidecarRowOrderEntryBytes &&
+        CheckedMultiply(header.count, kSidecarRowOrderEntryBytes, &row_order_bytes) &&
+        keys_end <= kMaxSidecarBytes && row_order_bytes <= kMaxSidecarBytes &&
+        header.row_order_offset >= keys_end && header.row_order_offset - keys_end < alignof(uint32_t) &&
+        header.row_order_offset % alignof(uint32_t) == 0 &&
+        header.row_order_offset <= kMaxSidecarBytes - row_order_bytes &&
+        CheckedAdd(header.row_order_offset, row_order_bytes, &expected_total_bytes) &&
+        expected_total_bytes == header.total_bytes;
+    bool valid = header_valid && layout_valid;
+    if (valid) {
+        const size_t padding_bytes = static_cast<size_t>(header.row_order_offset - keys_end);
+        std::array<uint8_t, alignof(uint32_t) - 1> padding{};
+        valid = read_exact(padding.data(), padding_bytes, keys_end) &&
+                std::all_of(padding.begin(), padding.begin() + padding_bytes,
+                            [](uint8_t byte) { return byte == 0; });
+    }
+    std::array<uint8_t, 4096 * kSidecarEntryBytes> chunk{};
     uint64_t done = 0;
     uint32_t crc = 0xffffffffU;
+    uint64_t previous_offset = 0;
+    bool have_previous = false;
     while (valid && done < header.count) {
-        const size_t count = static_cast<size_t>(std::min<uint64_t>(chunk.size(), header.count - done));
-        valid = pread(fd, chunk.data(), count * sizeof(SidecarEntry), sizeof(header) + done * sizeof(SidecarEntry)) ==
-                static_cast<ssize_t>(count * sizeof(SidecarEntry));
-        crc = UpdateCrc32(crc, reinterpret_cast<const uint8_t*>(chunk.data()), count * sizeof(SidecarEntry));
-        for (size_t i = 0; valid && i < count; ++i)
-            valid = chunk[i].key_offset <= header.key_bytes;
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(4096, header.count - done));
+        valid = read_exact(chunk.data(), count * kSidecarEntryBytes, kSidecarHeaderBytes + done * kSidecarEntryBytes);
+        crc = UpdateCrc32(crc, chunk.data(), count * kSidecarEntryBytes);
+        for (size_t i = 0; valid && i < count; ++i) {
+            const uint64_t offset = GetLeAt<uint64_t>(chunk.data() + i * kSidecarEntryBytes);
+            valid = offset <= header.key_bytes && (!have_previous ? offset == 0 : offset > previous_offset) &&
+                    (!have_previous || offset - previous_offset <= kMaxRowBytes);
+            previous_offset = offset;
+            have_previous = true;
+        }
         done += count;
     }
-    std::vector<uint8_t> key_chunk(std::min<uint64_t>(header.key_bytes, 1U << 20));
+    valid = valid &&
+            (have_previous ? header.key_bytes >= previous_offset && header.key_bytes - previous_offset <= kMaxRowBytes
+                           : header.key_bytes == 0);
+    std::array<uint8_t, 1U << 16> key_chunk{};
     uint64_t key_done = 0;
     uint32_t keys_crc = 0xffffffffU;
     while (valid && key_done < header.key_bytes) {
         const size_t bytes = static_cast<size_t>(std::min<uint64_t>(key_chunk.size(), header.key_bytes - key_done));
-        valid = pread(fd, key_chunk.data(), bytes, sizeof(header) + header.count * sizeof(SidecarEntry) + key_done) ==
-                static_cast<ssize_t>(bytes);
+        valid = read_exact(key_chunk.data(), bytes, keys_offset + key_done);
         keys_crc = UpdateCrc32(keys_crc, key_chunk.data(), bytes);
         key_done += bytes;
     }
+    valid = valid && ~crc == header.entries_crc && ~keys_crc == header.keys_crc;
+    std::array<uint8_t, 4096 * kSidecarRowOrderEntryBytes> row_order_chunk{};
+    uint64_t row_order_done = 0;
+    uint32_t row_order_crc = 0xffffffffU;
+    while (valid && row_order_done < header.count) {
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(4096, header.count - row_order_done));
+        valid = read_exact(row_order_chunk.data(), count * kSidecarRowOrderEntryBytes,
+                           header.row_order_offset + row_order_done * kSidecarRowOrderEntryBytes);
+        row_order_crc = UpdateCrc32(row_order_crc, row_order_chunk.data(), count * kSidecarRowOrderEntryBytes);
+        for (size_t i = 0; valid && i < count; ++i) {
+            const uint8_t* entry = row_order_chunk.data() + i * kSidecarRowOrderEntryBytes;
+            valid = GetLeAt<uint32_t>(entry) < header.count;
+        }
+        row_order_done += count;
+    }
+    valid = valid && ~row_order_crc == header.row_order_crc;
+    void* mapping = MAP_FAILED;
+    if (valid)
+        mapping = mmap(nullptr, static_cast<size_t>(header.total_bytes), PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (!valid || ~crc != header.entries_crc || ~keys_crc != header.keys_crc)
+    if (valid && mapping != MAP_FAILED) {
+        const auto* mapped = static_cast<const uint8_t*>(mapping);
+        uint64_t previous_local_id = 0;
+        bool have_previous_local_id = false;
+        for (uint64_t n = 0; valid && n < header.count; ++n) {
+            const uint8_t* row_order = mapped + header.row_order_offset + n * kSidecarRowOrderEntryBytes;
+            const uint64_t ordinal = GetLeAt<uint32_t>(row_order);
+            const uint64_t local_id =
+                GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes + 8);
+            valid = !have_previous_local_id || local_id > previous_local_id;
+            previous_local_id = local_id;
+            have_previous_local_id = true;
+        }
+    }
+    if (!valid || mapping == MAP_FAILED) {
+        if (mapping != MAP_FAILED)
+            munmap(mapping, static_cast<size_t>(header.total_bytes));
+        sidecars_.erase(index.constraint_id);
         return false;
-    sidecars_.emplace(index.constraint_id, SidecarDescriptor{header.count, header.key_bytes});
+    }
+    sidecars_.insert_or_assign(index.constraint_id,
+                               SidecarDescriptor{schema.id, index.constraint_id, *generation, header.snapshot_epoch,
+                                                 header.count, header.key_bytes, row_order_bytes,
+                                                 static_cast<size_t>(header.total_bytes), mapping});
     return true;
 }
 
@@ -771,20 +1601,30 @@ void DeltaDatabase::CheckpointSidecars() {
 }
 
 std::vector<epoch_si_poc::RowId>
-DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema& schema,
-                                 const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions, bool* usable) const {
+DeltaDatabase::IndexedCandidates(DeltaSession& session, const TableSchema& schema,
+                                 const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions, bool* usable,
+                                 const IndexEqualities* equalities, size_t* inferred_used) const {
     *usable = false;
+    if (inferred_used)
+        *inferred_used = 0;
     const Index* selected = nullptr;
     std::vector<Cell> cells;
     std::vector<Cell> selected_cells;
     size_t prefix_columns = 0;
     const ast::BinaryExpr* lower = nullptr;
     const ast::BinaryExpr* upper = nullptr;
+    size_t selected_inferred = 0;
     for (const Index& index : schema.indexes) {
         cells.assign(schema.columns.size(), Cell{});
         size_t equal = 0;
+        size_t index_inferred = 0;
         for (; equal < index.columns.size(); ++equal) {
             const uint32_t column = index.columns[equal];
+            if (equalities && column < equalities->values.size() && equalities->values[column]) {
+                cells[column] = *equalities->values[column];
+                index_inferred += column < equalities->inferred.size() && equalities->inferred[column];
+                continue;
+            }
             const auto found = std::find_if(conditions.begin(), conditions.end(), [&](const auto& condition) {
                 if (!condition || condition->op != ast::SV_OP_EQ || !condition->lhs || !condition->rhs ||
                     condition->lhs->type != ast::AstType::Col || condition->rhs->type == ast::AstType::Col)
@@ -816,10 +1656,13 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
             selected = &index;
             prefix_columns = equal;
             selected_cells = cells;
+            selected_inferred = index_inferred;
         }
     }
     if (!selected)
         return {};
+    if (inferred_used)
+        *inferred_used = selected_inferred;
     cells = std::move(selected_cells);
     for (const auto& condition : conditions) {
         if (!condition || !condition->lhs || !condition->rhs || condition->lhs->type != ast::AstType::Col ||
@@ -861,109 +1704,217 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
     return result;
 }
 
-void DeltaDatabase::VisitIndexInterval(const DeltaSession& session, const TableSchema& schema, const Index& index,
+std::optional<DeltaDatabase::OrderedIndexAccess>
+DeltaDatabase::FindOrderedIndexAccess(const TableSchema& schema, const std::string& alias,
+                                      const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
+                                      const std::vector<size_t>& ordered_columns) const {
+    if (ordered_columns.empty())
+        return std::nullopt;
+    const auto matches_column = [&](const ast::BinaryExpr& condition, size_t position) {
+        const auto* column = condition.lhs ? dynamic_cast<const ast::Col*>(condition.lhs.get()) : nullptr;
+        return column && (column->tab_name.empty() || column->tab_name == schema.name || column->tab_name == alias) &&
+               column->col_name == schema.columns[position].name;
+    };
+    for (const Index& index : schema.indexes) {
+        std::vector<Cell> cells(schema.columns.size());
+        size_t prefix = 0;
+        for (; prefix < index.columns.size(); ++prefix) {
+            const auto found = std::find_if(conditions.begin(), conditions.end(), [&](const auto& condition) {
+                return condition && condition->op == ast::SV_OP_EQ && condition->rhs &&
+                       dynamic_cast<const ast::Value*>(condition->rhs.get()) &&
+                       matches_column(*condition, index.columns[prefix]);
+            });
+            if (found == conditions.end())
+                break;
+            Cell value = Literal(schema.columns[index.columns[prefix]], static_cast<const ast::Value&>(*(*found)->rhs));
+            if (value.is_null)
+                break;
+            cells[index.columns[prefix]] = std::move(value);
+        }
+        if (prefix + ordered_columns.size() > index.columns.size() ||
+            !std::equal(ordered_columns.begin(), ordered_columns.end(), index.columns.begin() + prefix) ||
+            !sidecars_.count(index.constraint_id))
+            continue;
+        EncodedKey first = EncodeKey(schema, index, cells, prefix);
+        EncodedKey last = PrefixSuccessor(first);
+        const ast::BinaryExpr* lower = nullptr;
+        const ast::BinaryExpr* upper = nullptr;
+        for (const auto& condition : conditions) {
+            if (!condition || !condition->rhs || !dynamic_cast<const ast::Value*>(condition->rhs.get()) ||
+                !matches_column(*condition, ordered_columns.front()))
+                continue;
+            if (condition->op == ast::SV_OP_GT || condition->op == ast::SV_OP_GE)
+                lower = condition.get();
+            else if (condition->op == ast::SV_OP_LT || condition->op == ast::SV_OP_LE)
+                upper = condition.get();
+        }
+        if (lower) {
+            cells[ordered_columns.front()] =
+                Literal(schema.columns[ordered_columns.front()], static_cast<const ast::Value&>(*lower->rhs));
+            if (!cells[ordered_columns.front()].is_null) {
+                first = EncodeKey(schema, index, cells, prefix + 1);
+                if (lower->op == ast::SV_OP_GT)
+                    first = PrefixSuccessor(std::move(first));
+            }
+        }
+        if (upper) {
+            cells[ordered_columns.front()] =
+                Literal(schema.columns[ordered_columns.front()], static_cast<const ast::Value&>(*upper->rhs));
+            if (!cells[ordered_columns.front()].is_null) {
+                last = EncodeKey(schema, index, cells, prefix + 1);
+                if (upper->op == ast::SV_OP_LE)
+                    last = PrefixSuccessor(std::move(last));
+            }
+        }
+        if (!last.empty() && first > last)
+            first = last;
+        return OrderedIndexAccess{&index, std::move(first), std::move(last)};
+    }
+    return std::nullopt;
+}
+
+void DeltaDatabase::VisitIndexInterval(DeltaSession& session, const TableSchema& schema, const Index& index,
                                        const EncodedKey& first_key, const EncodedKey& last_key,
                                        const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor,
                                        bool* usable) const {
-    *usable = false;
-    const auto descriptor = sidecars_.find(index.constraint_id);
-    if (descriptor == sidecars_.end())
-        return;
     std::vector<std::pair<EncodedKey, epoch_si_poc::RowId>> keyed;
-    const std::string path =
-        directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id);
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        const auto read = [&](uint64_t position, SidecarEntry* entry) {
-            return pread(fd, entry, sizeof(*entry), sizeof(SidecarHeader) + position * sizeof(*entry)) ==
-                   sizeof(*entry);
-        };
-        const auto key_at = [&](uint64_t position, std::vector<uint8_t>* key, SidecarEntry* entry) {
-            SidecarEntry next{};
-            if (!read(position, entry) || entry->key_offset > descriptor->second.key_bytes ||
-                (position + 1 < descriptor->second.count && !read(position + 1, &next)))
-                return false;
-            const uint64_t end =
-                position + 1 == descriptor->second.count ? descriptor->second.key_bytes : next.key_offset;
-            if (end < entry->key_offset || end - entry->key_offset > kMaxRowBytes)
-                return false;
-            key->resize(static_cast<size_t>(end - entry->key_offset));
-            return key->empty() || pread(fd, key->data(), key->size(),
-                                         sizeof(SidecarHeader) + descriptor->second.count * sizeof(SidecarEntry) +
-                                             entry->key_offset) == static_cast<ssize_t>(key->size());
-        };
-        const auto lower_bound = [&](const std::vector<uint8_t>& key) {
-            uint64_t first = 0, last = descriptor->second.count;
-            while (first < last) {
-                const uint64_t middle = first + (last - first) / 2;
-                SidecarEntry entry{};
-                std::vector<uint8_t> current;
-                if (!key_at(middle, &current, &entry))
-                    return std::pair<uint64_t, bool>{0, false};
-                if (current < key)
-                    first = middle + 1;
-                else
-                    last = middle;
-            }
-            return std::pair<uint64_t, bool>{first, true};
-        };
-        bool valid = true;
-        auto [first, first_ok] = lower_bound(first_key);
-        auto [last, last_ok] =
-            last_key.empty() ? std::pair<uint64_t, bool>{descriptor->second.count, true} : lower_bound(last_key);
-        valid = first_ok && last_ok;
-        for (; valid && first < last; ++first) {
-            SidecarEntry entry{};
-            EncodedKey key;
-            valid = key_at(first, &key, &entry);
-            if (valid)
-                keyed.push_back({std::move(key), {schema.id, entry.local_id}});
-        }
-        close(fd);
-        if (!valid)
-            sidecars_.erase(index.constraint_id);
-        *usable = valid;
-    }
+    VisitOrderedIndexInterval(
+        session, schema, index, first_key, last_key, false,
+        [&](const EncodedKey& key, epoch_si_poc::RowId id) {
+            keyed.push_back({key, id});
+            return true;
+        },
+        usable);
     if (!*usable)
         return;
-    VisitOverlayInterval(session, schema.id, index.constraint_id, first_key, last_key,
-                         [&](const EncodedKey& key, epoch_si_poc::RowId id) { keyed.push_back({key, id}); });
-    std::sort(keyed.begin(), keyed.end());
-    keyed.erase(std::unique(keyed.begin(), keyed.end()), keyed.end());
     for (const auto& [key, id] : keyed)
         visitor(key, id);
 }
 
-void DeltaDatabase::VisitOverlayInterval(
-    const DeltaSession& session, epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id,
-    const EncodedKey& first, const EncodedKey& last,
-    const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor) const {
-    last_overlay_nodes_probed_ = 0;
-    last_row_ids_probed_ = 0;
-    const auto append = [&](const auto& overlay) {
-        auto position = overlay.lower_bound({table_id, constraint_id, first});
-        for (; position != overlay.end() && std::get<0>(position->first) == table_id &&
-               std::get<1>(position->first) == constraint_id && (last.empty() || std::get<2>(position->first) < last);
-             ++position) {
-            ++last_overlay_nodes_probed_;
-            last_row_ids_probed_ += position->second.size();
-            for (uint64_t local_id : position->second)
-                visitor(std::get<2>(position->first), {table_id, local_id});
-        }
+void DeltaDatabase::VisitOrderedIndexInterval(
+    DeltaSession& session, const TableSchema& schema, const Index& index, const EncodedKey& first_key,
+    const EncodedKey& last_key, bool reverse,
+    const std::function<bool(const EncodedKey&, epoch_si_poc::RowId)>& visitor, bool* usable) const {
+    *usable = false;
+    session.census.last_base_entries_probed = 0;
+    session.census.last_overlay_nodes_probed = 0;
+    session.census.last_row_ids_probed = 0;
+    session.census.last_overlay_refs_examined = 0;
+    session.census.last_overlay_refs_copied = 0;
+    session.census.last_overlay_order_ops = 0;
+    const auto descriptor = sidecars_.find(index.constraint_id);
+    if (descriptor == sidecars_.end())
+        return;
+    const SidecarDescriptor& sidecar = descriptor->second;
+    if (sidecar.table_id != schema.id || sidecar.constraint_id != index.constraint_id || !sidecar.mapping)
+        return;
+    const auto* mapped = static_cast<const uint8_t*>(sidecar.mapping);
+    const uint8_t* keys = mapped + kSidecarHeaderBytes + sidecar.count * kSidecarEntryBytes;
+    struct KeySpan {
+        const uint8_t* data;
+        size_t size;
     };
-    append(overlay_);
-    append(session.overlay);
+    const auto key_at = [&](uint64_t position) {
+        const uint64_t begin = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + position * kSidecarEntryBytes);
+        const uint64_t end =
+            position + 1 == sidecar.count
+                ? sidecar.key_bytes
+                : GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + (position + 1) * kSidecarEntryBytes);
+        return KeySpan{keys + begin, static_cast<size_t>(end - begin)};
+    };
+    const auto compare = [&](KeySpan current, const EncodedKey& key) {
+        ++session.census.last_sidecar_binary_comparisons;
+        const size_t shared = std::min(current.size, key.size());
+        const int compared = shared == 0 ? 0 : std::memcmp(current.data, key.data(), shared);
+        if (compared != 0)
+            return compared;
+        if (current.size < key.size())
+            return -1;
+        return current.size == key.size() ? 0 : 1;
+    };
+    const auto lower_bound = [&](const EncodedKey& key) {
+        uint64_t first = 0, last = sidecar.count;
+        while (first < last) {
+            const uint64_t middle = first + (last - first) / 2;
+            if (compare(key_at(middle), key) < 0)
+                first = middle + 1;
+            else
+                last = middle;
+        }
+        return first;
+    };
+    uint64_t base_first = lower_bound(first_key);
+    const uint64_t base_last = last_key.empty() ? sidecar.count : lower_bound(last_key);
+    if (base_first > base_last)
+        base_first = base_last;
+    uint64_t base_position = reverse ? base_last : base_first;
+    bool base_valid = false;
+    std::pair<EncodedKey, epoch_si_poc::RowId> base_current;
+    const auto advance_base = [&]() {
+        if ((!reverse && base_position == base_last) || (reverse && base_position == base_first)) {
+            base_valid = false;
+            return true;
+        }
+        const uint64_t position = reverse ? --base_position : base_position++;
+        ++session.census.last_base_entries_probed;
+        const KeySpan span = key_at(position);
+        base_current = {
+            EncodedKey(span.data, span.data + span.size),
+            {schema.id, GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + position * kSidecarEntryBytes + 8)}};
+        base_valid = true;
+        return true;
+    };
+    advance_base();
+    OverlayRangeCursor<CommittedOverlay> committed(overlay_, schema.id, index.constraint_id, first_key, last_key,
+                                                   reverse, session.census.last_overlay_nodes_probed,
+                                                   session.census.last_row_ids_probed,
+                                                   session.census.last_overlay_refs_examined);
+    OverlayRangeCursor<DeltaOverlay> local(session.overlay, schema.id, index.constraint_id, first_key, last_key,
+                                           reverse, session.census.last_overlay_nodes_probed,
+                                           session.census.last_row_ids_probed,
+                                           session.census.last_overlay_refs_examined);
+    std::optional<std::pair<EncodedKey, epoch_si_poc::RowId>> emitted;
+    for (;;) {
+        std::optional<std::pair<EncodedKey, epoch_si_poc::RowId>> selected;
+        const auto consider = [&](std::pair<EncodedKey, epoch_si_poc::RowId> candidate) {
+            if (!selected || (reverse ? *selected < candidate : candidate < *selected))
+                selected = std::move(candidate);
+        };
+        if (base_valid)
+            consider(base_current);
+        if (committed.valid())
+            consider({committed.key(), committed.id()});
+        if (local.valid())
+            consider({local.key(), local.id()});
+        if (!selected)
+            break;
+        enum class Source { Base, Committed, Local } source;
+        if (base_valid && base_current == *selected) {
+            source = Source::Base;
+        } else if (committed.valid() && std::pair{committed.key(), committed.id()} == *selected) {
+            source = Source::Committed;
+        } else {
+            source = Source::Local;
+        }
+        if ((!emitted || *emitted != *selected) && !visitor(selected->first, selected->second)) {
+            *usable = true;
+            return;
+        }
+        emitted = std::move(selected);
+        if (source == Source::Base) {
+            advance_base();
+        } else if (source == Source::Committed)
+            committed.Advance();
+        else
+            local.Advance();
+    }
+    *usable = true;
 }
 
 template <typename Overlay>
 void DeltaDatabase::AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
                                epoch_si_poc::RowId id, const std::vector<Cell>* previous) {
     for (const Index& index : schema.indexes) {
-        bool has_null = false;
-        for (uint32_t column : index.columns)
-            has_null = has_null || cells[column].is_null;
-        if (has_null)
-            continue;
         EncodedKey key = EncodeKey(schema, index, cells);
         if (!previous || key != EncodeKey(schema, index, *previous))
             AppendOverlay(overlay, {schema.id, index.constraint_id, std::move(key)}, id.local_id);
@@ -973,19 +1924,19 @@ void DeltaDatabase::AddOverlay(Overlay& overlay, const TableSchema& schema, cons
 void DeltaDatabase::VisitRows(DeltaSession& session, const TableSchema& schema,
                               const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                               const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor,
-                              bool* used_index) {
+                              bool* used_index, const IndexEqualities* equalities, size_t* inferred_used) {
     auto& txn = Txn(session);
     bool usable = false;
-    const auto candidates = IndexedCandidates(session, schema, conditions, &usable);
+    const auto candidates = IndexedCandidates(session, schema, conditions, &usable, equalities, inferred_used);
     if (used_index)
         *used_index = usable;
-    last_row_reads_probed_ = 0;
+    session.census.last_row_reads_probed = 0;
     if (!usable) {
         db_.engine().VisitScan(txn, schema.id, visitor);
         return;
     }
     for (epoch_si_poc::RowId id : candidates) {
-        ++last_row_reads_probed_;
+        ++session.census.last_row_reads_probed;
         if (auto row = db_.engine().Read(txn, id))
             visitor(id, *row);
     }
@@ -1208,16 +2159,7 @@ void DeltaDatabase::EmitRows(const TableSchema& schema, const ast::SelectStmt& s
                     if (value.is_null)
                         continue;
                     if (agg.is_distinct) {
-                        std::string key = std::to_string(static_cast<unsigned>(outputs[i].type)) + ":";
-                        if (outputs[i].type == ColumnType::Int)
-                            key += std::to_string(value.integer);
-                        else if (outputs[i].type == ColumnType::Float) {
-                            uint32_t bits;
-                            std::memcpy(&bits, &value.floating, sizeof(bits));
-                            key += std::to_string(bits);
-                        } else
-                            key += value.text;
-                        if (!state.distinct.insert(std::move(key)).second)
+                        if (!state.distinct.insert(DistinctKey(schema.columns[positions[i]], value)).second)
                             continue;
                     }
                     ++state.count;
@@ -1512,7 +2454,7 @@ void DeltaDatabase::LoadCsv(const ast::LoadStmt& load, DeltaSession& session) {
 
 PreparedDescription DeltaDatabase::DescribePrepared(const ast::TreeNode& tree,
                                                     const std::vector<DeltaValueType>& declared_parameters) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto state_lock = LockStateShared();
     RequireUsable();
     PreparedDescription result;
     result.catalog_generation = catalog_generation_;
@@ -1716,6 +2658,8 @@ PreparedDescription DeltaDatabase::DescribePrepared(const ast::TreeNode& tree,
 bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& session, QueryResultSink* sink) {
     if (!tree)
         return false;
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    const DiagnosticOperation diagnostic_operation = ClassifyDiagnosticOperation(tree->type);
     const bool exclusive = tree->type == ast::AstType::StaticCheckpoint || tree->type == ast::AstType::CreateTable ||
                            tree->type == ast::AstType::CreateIndex || tree->type == ast::AstType::LoadStmt;
     if (exclusive && session.admission)
@@ -1723,14 +2667,76 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
     std::unique_lock<std::shared_mutex> exclusive_admission;
     std::shared_lock<std::shared_mutex> statement_admission;
     if (exclusive)
-        exclusive_admission = std::unique_lock<std::shared_mutex>(execution_gate_);
+        exclusive_admission = LockExecutionUnique();
     else if (!session.admission)
-        statement_admission = std::shared_lock<std::shared_mutex>(execution_gate_);
-    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
-    if (execute_blocked_hook_for_test_ && !lock.try_lock())
-        execute_blocked_hook_for_test_();
-    if (!lock.owns_lock())
-        lock.lock();
+        statement_admission = LockExecutionShared();
+    std::unique_lock<std::shared_mutex> unique_state_lock;
+    std::shared_lock<std::shared_mutex> lock;
+    const auto shared_wait_started =
+        !exclusive && diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (exclusive)
+        unique_state_lock = LockStateUnique();
+    else {
+        lock = LockStateShared(true);
+        if (diagnostics_) {
+            execute_shared_wait_ns_.fetch_add(NsSince(shared_wait_started), std::memory_order_relaxed);
+            execute_shared_calls_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const bool counted_execution = diagnostics_ != nullptr;
+    if (counted_execution) {
+        const uint64_t active = inflight_execute_.fetch_add(1, std::memory_order_relaxed) + 1;
+        uint64_t peak = peak_inflight_execute_.load(std::memory_order_relaxed);
+        while (peak < active && !peak_inflight_execute_.compare_exchange_weak(peak, active, std::memory_order_relaxed,
+                                                                              std::memory_order_relaxed)) {
+        }
+    }
+    ExecutionCensus census;
+    struct ExecutionDiagnosticsScope {
+        DeltaDatabase* database;
+        const DeltaSession* session;
+        DiagnosticOperation operation;
+        ExecutionCensus* census;
+        std::chrono::steady_clock::time_point started;
+        bool counted_execution;
+        ~ExecutionDiagnosticsScope() {
+            if (!counted_execution)
+                return;
+            database->CaptureQueryCensus(*session, *census);
+            const size_t index = static_cast<size_t>(operation);
+            database->execute_calls_[index].fetch_add(1, std::memory_order_relaxed);
+            database->execute_ns_[index].fetch_add(NsSince(started), std::memory_order_relaxed);
+            database->sidecar_base_entries_.fetch_add(census->base_entries, std::memory_order_relaxed);
+            database->sidecar_overlay_refs_.fetch_add(census->overlay_refs, std::memory_order_relaxed);
+            database->join_parameterized_probes_.fetch_add(census->parameterized_join_probes,
+                                                            std::memory_order_relaxed);
+            if (census->join_parameterized)
+                database->join_parameterized_.fetch_add(1, std::memory_order_relaxed);
+            if (census->join_fallback)
+                database->join_fallback_.fetch_add(1, std::memory_order_relaxed);
+            if (census->join_outer_indexed)
+                database->join_outer_indexed_.fetch_add(1, std::memory_order_relaxed);
+            database->join_outer_candidates_.fetch_add(census->join_outer_candidates, std::memory_order_relaxed);
+            database->join_outer_full_scan_rows_.fetch_add(census->join_outer_full_scan_rows,
+                                                           std::memory_order_relaxed);
+            database->join_inferred_literal_components_.fetch_add(census->join_inferred_literal_components,
+                                                                  std::memory_order_relaxed);
+            database->join_inferred_literal_probes_.fetch_add(census->join_inferred_literal_probes,
+                                                              std::memory_order_relaxed);
+            database->ordered_early_stop_.fetch_add(census->ordered_early_stops, std::memory_order_relaxed);
+            if (census->ordered_stream)
+                database->ordered_stream_.fetch_add(1, std::memory_order_relaxed);
+            if (census->ordered_materialize)
+                database->ordered_materialize_.fetch_add(1, std::memory_order_relaxed);
+            database->inflight_execute_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    } diagnostics_scope{this,
+                        &session,
+                        diagnostic_operation,
+                        &census,
+                        diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{},
+                        counted_execution};
+    session.census = {};
     RequireUsable();
     if (execute_lock_hook_for_test_)
         execute_lock_hook_for_test_();
@@ -1753,7 +2759,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
         return false;
     }
     if (tree->type == ast::AstType::TxnCommit) {
-        Commit(session, lock);
+        Commit(session, lock, &census);
         return false;
     }
     if (tree->type == ast::AstType::TxnAbort || tree->type == ast::AstType::TxnRollback) {
@@ -1882,15 +2888,25 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 const ast::AggExpr* aggregate_ptr =
                     projection_query ? nullptr : static_cast<const ast::AggExpr*>(select.select_items[0]->expr.get());
                 if (!projection_query &&
-                    (aggregate_ptr->func != ast::AGG_COUNT || aggregate_ptr->is_star || !aggregate_ptr->col))
+                    ((aggregate_ptr->func != ast::AGG_COUNT && aggregate_ptr->func != ast::AGG_SUM &&
+                      aggregate_ptr->func != ast::AGG_MIN && aggregate_ptr->func != ast::AGG_MAX) ||
+                     aggregate_ptr->is_star || !aggregate_ptr->col))
                     throw std::runtime_error("unsupported Delta multi-table aggregate");
                 const TableSchema& left_schema = Table(select.tabs[0].table_name);
                 const TableSchema& right_schema = Table(select.tabs[1].table_name);
-                last_parameterized_join_probes_ = 0;
-                last_join_inner_rows_resolved_ = 0;
-                last_join_pairs_rechecked_ = 0;
-                last_join_full_scan_rows_ = 0;
-                last_join_right_rows_visited_ = 0;
+                session.census.last_parameterized_join_probes = 0;
+                session.census.last_join_inner_rows_resolved = 0;
+                session.census.last_join_pairs_rechecked = 0;
+                session.census.last_join_full_scan_rows = 0;
+                session.census.last_join_right_rows_visited = 0;
+                session.census.last_join_base_entries_examined = 0;
+                session.census.last_join_overlay_entries_examined = 0;
+                session.census.last_join_overlay_refs_examined = 0;
+                session.census.last_join_outer_indexed_queries = 0;
+                session.census.last_join_outer_candidates = 0;
+                session.census.last_join_outer_full_scan_rows = 0;
+                session.census.last_join_inferred_literal_components = 0;
+                session.census.last_join_inferred_literal_probes = 0;
                 const auto pos = [](const TableSchema& schema, const std::string& name) {
                     for (size_t i = 0; i < schema.columns.size(); ++i)
                         if (schema.columns[i].name == name)
@@ -1922,6 +2938,21 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                         out_cell = &right[i];
                     }
                 };
+                const Column* aggregate_column = nullptr;
+                Column aggregate_output;
+                if (!projection_query) {
+                    const Cell* ignored;
+                    const std::vector<Cell> left(left_schema.columns.size());
+                    const std::vector<Cell> right(right_schema.columns.size());
+                    resolve(*aggregate_ptr->col, left, right, aggregate_column, ignored);
+                    aggregate_output = *aggregate_column;
+                    aggregate_output.name =
+                        select.select_items[0]->alias.empty() ? "?column?" : select.select_items[0]->alias;
+                    if (aggregate_ptr->func == ast::AGG_COUNT)
+                        aggregate_output = {aggregate_output.name, ColumnType::Int, 4, false};
+                    else if (aggregate_ptr->func == ast::AGG_SUM && aggregate_column->type == ColumnType::Char)
+                        throw std::runtime_error("Delta SUM requires numeric column");
+                }
                 std::vector<ColMeta> projection_meta;
                 std::vector<std::string> projection_names;
                 int projection_size = 0;
@@ -1998,6 +3029,94 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                                             : cross_predicates;
                     destination.push_back(std::move(predicate));
                 }
+                const size_t equality_columns = left_schema.columns.size() + right_schema.columns.size();
+                std::vector<size_t> equality_parent(equality_columns);
+                for (size_t i = 0; i < equality_parent.size(); ++i)
+                    equality_parent[i] = i;
+                const auto equality_node = [&](int side, size_t position) {
+                    return side == 0 ? position : left_schema.columns.size() + position;
+                };
+                const auto equality_column = [&](size_t node) -> const Column& {
+                    return node < left_schema.columns.size() ? left_schema.columns[node]
+                                                             : right_schema.columns[node - left_schema.columns.size()];
+                };
+                const auto find_root = [&](size_t node) {
+                    while (equality_parent[node] != node)
+                        node = equality_parent[node];
+                    return node;
+                };
+                const auto each_predicate = [&](const auto& visitor) {
+                    for (const auto& predicate : left_predicates)
+                        visitor(predicate);
+                    for (const auto& predicate : right_predicates)
+                        visitor(predicate);
+                    for (const auto& predicate : cross_predicates)
+                        visitor(predicate);
+                };
+                each_predicate([&](const BoundPredicate& predicate) {
+                    if (predicate.op != ast::SV_OP_EQ || predicate.rhs_side < 0)
+                        return;
+                    const size_t left = find_root(equality_node(predicate.lhs_side, predicate.lhs_pos));
+                    const size_t right = find_root(equality_node(predicate.rhs_side, predicate.rhs_pos));
+                    if (left != right)
+                        equality_parent[right] = left;
+                });
+                std::vector<std::optional<Cell>> component_literals(equality_columns);
+                std::vector<bool> direct_literals(equality_columns);
+                bool equality_unsatisfiable = false;
+                const auto same_literal = [&](const Column& column, const Cell& left, const Cell& right) {
+                    if (left.is_null || right.is_null)
+                        return left.is_null == right.is_null;
+                    if (column.type == ColumnType::Int)
+                        return left.integer == right.integer;
+                    if (column.type == ColumnType::Float)
+                        return left.floating == right.floating;
+                    return left.text == right.text;
+                };
+                each_predicate([&](const BoundPredicate& predicate) {
+                    if (predicate.op != ast::SV_OP_EQ || predicate.rhs_side >= 0)
+                        return;
+                    const size_t node = equality_node(predicate.lhs_side, predicate.lhs_pos);
+                    const size_t root = find_root(node);
+                    direct_literals[node] = true;
+                    if (predicate.literal.is_null ||
+                        (component_literals[root] &&
+                         !same_literal(equality_column(root), *component_literals[root], predicate.literal))) {
+                        equality_unsatisfiable = true;
+                        return;
+                    }
+                    component_literals[root] = predicate.literal;
+                });
+                IndexEqualities left_equalities;
+                left_equalities.values.resize(left_schema.columns.size());
+                left_equalities.inferred.resize(left_schema.columns.size());
+                IndexEqualities right_equalities;
+                right_equalities.values.resize(right_schema.columns.size());
+                right_equalities.inferred.resize(right_schema.columns.size());
+                std::vector<bool> inferred_components(equality_columns);
+                for (size_t node = 0; node < equality_columns; ++node) {
+                    const size_t root = find_root(node);
+                    if (!component_literals[root])
+                        continue;
+                    const Cell& value = *component_literals[root];
+                    if (equality_column(node).type == ColumnType::Char &&
+                        value.text.size() > equality_column(node).length) {
+                        equality_unsatisfiable = true;
+                        continue;
+                    }
+                    const bool inferred = !direct_literals[node];
+                    inferred_components[root] = inferred_components[root] || inferred;
+                    if (node < left_schema.columns.size()) {
+                        left_equalities.values[node] = value;
+                        left_equalities.inferred[node] = inferred;
+                    } else {
+                        const size_t right = node - left_schema.columns.size();
+                        right_equalities.values[right] = value;
+                        right_equalities.inferred[right] = inferred;
+                    }
+                }
+                session.census.last_join_inferred_literal_components =
+                    static_cast<size_t>(std::count(inferred_components.begin(), inferred_components.end(), true));
                 const auto matches = [](const std::vector<BoundPredicate>& predicates, const std::vector<Cell>& left,
                                         const std::vector<Cell>& right) {
                     for (const auto& predicate : predicates) {
@@ -2026,35 +3145,48 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 std::vector<epoch_si_poc::RowImage> left_rows;
                 size_t left_bytes = 0;
                 bool left_used_index = false;
-                VisitRows(
-                    session, left_schema, select.conds,
-                    [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
-                        if (!left_used_index)
-                            ++last_join_full_scan_rows_;
-                        auto left = DecodeRow(left_schema, image);
-                        if (!matches(left_predicates, left, {}))
-                            return;
-                        size_t image_bytes = sizeof(epoch_si_poc::RowImage);
-                        const auto add_image_bytes = [&](size_t bytes) {
-                            if (bytes > kMaxJoinMaterializedBytes - image_bytes)
+                size_t outer_inferred_used = 0;
+                if (!equality_unsatisfiable) {
+                    VisitRows(
+                        session, left_schema, select.conds,
+                        [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
+                            if (!left_used_index) {
+                                ++session.census.last_join_full_scan_rows;
+                                ++session.census.last_join_outer_full_scan_rows;
+                            }
+                            auto left = DecodeRow(left_schema, image);
+                            if (!matches(left_predicates, left, {}))
+                                return;
+                            size_t image_bytes = sizeof(epoch_si_poc::RowImage);
+                            const auto add_image_bytes = [&](size_t bytes) {
+                                if (bytes > kMaxJoinMaterializedBytes - image_bytes)
+                                    throw std::runtime_error("unsupported Delta join exceeds memory limit");
+                                image_bytes += bytes;
+                            };
+                            add_image_bytes(image.bytes.size());
+                            if (image.claims.size() >
+                                (kMaxJoinMaterializedBytes - image_bytes) / sizeof(epoch_si_poc::ConstraintClaim))
                                 throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                            image_bytes += bytes;
-                        };
-                        add_image_bytes(image.bytes.size());
-                        if (image.claims.size() >
-                            (kMaxJoinMaterializedBytes - image_bytes) / sizeof(epoch_si_poc::ConstraintClaim))
-                            throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                        image_bytes += image.claims.size() * sizeof(epoch_si_poc::ConstraintClaim);
-                        for (const auto& claim : image.claims)
-                            add_image_bytes(claim.bytes.size());
-                        if (left_rows.size() == kMaxJoinMaterializedRows ||
-                            image_bytes > kMaxJoinMaterializedBytes - left_bytes)
-                            throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                        left_bytes += image_bytes;
-                        left_rows.push_back(image);
-                    },
-                    &left_used_index);
+                            image_bytes += image.claims.size() * sizeof(epoch_si_poc::ConstraintClaim);
+                            for (const auto& claim : image.claims)
+                                add_image_bytes(claim.bytes.size());
+                            if (left_rows.size() == kMaxJoinMaterializedRows ||
+                                image_bytes > kMaxJoinMaterializedBytes - left_bytes)
+                                throw std::runtime_error("unsupported Delta join exceeds memory limit");
+                            left_bytes += image_bytes;
+                            left_rows.push_back(image);
+                        },
+                        &left_used_index, &left_equalities, &outer_inferred_used);
+                    if (left_used_index) {
+                        session.census.last_join_outer_indexed_queries = 1;
+                        session.census.last_join_outer_candidates = session.census.last_row_reads_probed;
+                        session.census.last_join_inferred_literal_probes = outer_inferred_used != 0;
+                    }
+                }
                 int64_t count = 0;
+                bool aggregate_seen = false;
+                double sum = 0;
+                Cell extreme;
                 std::set<std::string> distinct;
                 const auto emit_pair = [&](const std::vector<Cell>& left, const std::vector<Cell>& right) {
                     if (projection_query) {
@@ -2090,15 +3222,24 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     resolve(*aggregate_ptr->col, left, right, value_column, value);
                     if (value->is_null)
                         return;
-                    if (aggregate_ptr->is_distinct) {
-                        std::string key = std::to_string(static_cast<unsigned>(value_column->type)) + ":" +
-                                          (value_column->type == ColumnType::Int     ? std::to_string(value->integer)
-                                           : value_column->type == ColumnType::Float ? std::to_string(value->floating)
-                                                                                     : value->text);
-                        if (!distinct.insert(std::move(key)).second)
-                            return;
+                    if (aggregate_ptr->is_distinct && !distinct.insert(DistinctKey(*value_column, *value)).second)
+                        return;
+                    if (aggregate_ptr->func == ast::AGG_COUNT)
+                        ++count;
+                    else if (aggregate_ptr->func == ast::AGG_SUM) {
+                        sum += value_column->type == ColumnType::Int ? value->integer : value->floating;
+                        aggregate_seen = true;
+                    } else {
+                        const int comparison =
+                            value_column->type == ColumnType::Int
+                                ? (value->integer < extreme.integer ? -1 : value->integer > extreme.integer)
+                            : value_column->type == ColumnType::Float
+                                ? (value->floating < extreme.floating ? -1 : value->floating > extreme.floating)
+                                : value->text.compare(extreme.text);
+                        if (!aggregate_seen || (aggregate_ptr->func == ast::AGG_MIN ? comparison < 0 : comparison > 0))
+                            extreme = *value;
+                        aggregate_seen = true;
                     }
-                    ++count;
                 };
                 struct ProbeKeySource {
                     bool from_literal = false;
@@ -2112,7 +3253,14 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     for (uint32_t right_pos : index.columns) {
                         ProbeKeySource source;
                         bool found = false;
+                        if (right_equalities.values[right_pos]) {
+                            source.from_literal = true;
+                            source.literal = *right_equalities.values[right_pos];
+                            found = true;
+                        }
                         for (const BoundPredicate& predicate : right_predicates) {
+                            if (found)
+                                break;
                             if (predicate.lhs_pos == right_pos && predicate.op == ast::SV_OP_EQ &&
                                 predicate.rhs_side < 0 && !predicate.literal.is_null) {
                                 source.from_literal = true;
@@ -2164,23 +3312,9 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     }
                     return EncodeKey(right_schema, *probe_index, right);
                 };
-                bool parameterized = probe_index != nullptr;
-                if (parameterized) {
-                    for (const auto& left_image : left_rows) {
-                        const auto left = DecodeRow(left_schema, left_image);
-                        const auto key = make_probe_key(left);
-                        if (!key)
-                            continue;
-                        bool usable = false;
-                        VisitIndexInterval(
-                            session, right_schema, *probe_index, *key, PrefixSuccessor(*key),
-                            [](const EncodedKey&, epoch_si_poc::RowId) {}, &usable);
-                        if (!usable) {
-                            parameterized = false;
-                            break;
-                        }
-                    }
-                }
+                const bool parameterized = probe_index != nullptr;
+                census.join_parameterized = parameterized;
+                census.join_fallback = !parameterized;
                 if (projection_query && sink)
                     sink->begin_query(projection_meta, projection_names);
                 if (parameterized) {
@@ -2190,12 +3324,12 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                         const auto key = make_probe_key(left);
                         if (!key)
                             continue;
-                        ++last_parameterized_join_probes_;
+                        ++session.census.last_parameterized_join_probes;
                         bool usable = false;
                         VisitIndexInterval(
                             session, right_schema, *probe_index, *key, PrefixSuccessor(*key),
                             [&](const EncodedKey& candidate_key, epoch_si_poc::RowId id) {
-                                ++last_join_inner_rows_resolved_;
+                                ++session.census.last_join_inner_rows_resolved;
                                 const auto image = db_.engine().Read(txn, id);
                                 if (!image)
                                     return;
@@ -2203,11 +3337,14 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                                 if (EncodeKey(right_schema, *probe_index, right) != candidate_key ||
                                     !matches(right_predicates, {}, right))
                                     return;
-                                ++last_join_pairs_rechecked_;
+                                ++session.census.last_join_pairs_rechecked;
                                 if (matches(cross_predicates, left, right))
                                     emit_pair(left, right);
                             },
                             &usable);
+                        session.census.last_join_base_entries_examined += session.census.last_base_entries_probed;
+                        session.census.last_join_overlay_entries_examined += session.census.last_overlay_nodes_probed;
+                        session.census.last_join_overlay_refs_examined += session.census.last_row_ids_probed;
                         if (!usable)
                             throw std::runtime_error("Delta parameterized index became unavailable");
                     }
@@ -2216,15 +3353,15 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     VisitRows(
                         session, right_schema, select.conds,
                         [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
-                            ++last_join_right_rows_visited_;
+                            ++session.census.last_join_right_rows_visited;
                             if (!right_used_index)
-                                ++last_join_full_scan_rows_;
+                                ++session.census.last_join_full_scan_rows;
                             const auto right = DecodeRow(right_schema, image);
                             if (!matches(right_predicates, {}, right))
                                 return;
                             for (const auto& left_image : left_rows) {
                                 const auto left = DecodeRow(left_schema, left_image);
-                                ++last_join_pairs_rechecked_;
+                                ++session.census.last_join_pairs_rechecked;
                                 if (matches(cross_predicates, left, right))
                                     emit_pair(left, right);
                             }
@@ -2233,15 +3370,31 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 }
                 if (!projection_query) {
                     Cell value;
-                    value.is_null = false;
-                    value.integer = static_cast<int32_t>(count);
-                    EmitRows(left_schema, select, {{value}}, sink, true);
+                    if (aggregate_ptr->func == ast::AGG_COUNT) {
+                        value.is_null = false;
+                        value.integer = static_cast<int32_t>(count);
+                    } else if (aggregate_seen) {
+                        if (aggregate_ptr->func == ast::AGG_SUM) {
+                            value.is_null = false;
+                            if (aggregate_column->type == ColumnType::Int)
+                                value.integer = static_cast<int32_t>(sum);
+                            else
+                                value.floating = static_cast<float>(sum);
+                        } else
+                            value = extreme;
+                    }
+                    EmitCells({aggregate_output}, {{value}}, sink);
                 }
                 if (implicit)
-                    Commit(session, lock);
+                    Commit(session, lock, &census);
                 return true;
             }
             const TableSchema& schema = Table(select.tabs[0].table_name);
+            census.ordered_materialize = select.has_sort;
+            session.census.last_ordered_candidates_examined = 0;
+            session.census.last_ordered_rows_decoded = 0;
+            session.census.last_ordered_sort_input_rows = 0;
+            session.census.last_ordered_early_stops = 0;
             if (!select.group_by_cols.empty()) {
                 if (select.has_sort || select.has_limit)
                     throw std::runtime_error("unsupported Delta GROUP BY shape");
@@ -2402,7 +3555,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 }
                 EmitCells(columns, rows, sink);
                 if (implicit)
-                    Commit(session, lock);
+                    Commit(session, lock, &census);
                 return true;
             }
             const bool aggregate =
@@ -2437,6 +3590,48 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     if (positions[i] == schema.columns.size())
                         throw std::runtime_error("Delta aggregate column not found");
                 }
+                if (select.select_items.size() == 1) {
+                    const auto& expr = static_cast<const ast::AggExpr&>(*select.select_items[0]->expr);
+                    if (!expr.is_distinct && !expr.is_star &&
+                        (expr.func == ast::AGG_MIN || expr.func == ast::AGG_MAX)) {
+                        const auto access =
+                            FindOrderedIndexAccess(schema, select.tabs[0].alias, select.conds, {positions[0]});
+                        if (access) {
+                            bool usable = false;
+                            bool seen = false;
+                            Cell value;
+                            auto& txn = Txn(session);
+                            VisitOrderedIndexInterval(
+                                session, schema, *access->index, access->first, access->last, expr.func == ast::AGG_MAX,
+                                [&](const EncodedKey& candidate_key, epoch_si_poc::RowId id) {
+                                    ++session.census.last_ordered_candidates_examined;
+                                    const auto image = db_.engine().Read(txn, id);
+                                    if (!image)
+                                        return true;
+                                    auto cells = DecodeRow(schema, *image);
+                                    ++session.census.last_ordered_rows_decoded;
+                                    if (EncodeKey(schema, *access->index, cells) != candidate_key ||
+                                        !Matches(schema, cells, select.conds) || cells[positions[0]].is_null)
+                                        return true;
+                                    value = std::move(cells[positions[0]]);
+                                    seen = true;
+                                    ++session.census.last_ordered_early_stops;
+                                    return false;
+                                },
+                                &usable);
+                            if (usable) {
+                                census.ordered_stream = true;
+                                census.ordered_materialize = false;
+                                if (!seen)
+                                    value = {};
+                                EmitRows(schema, select, {{std::move(value)}}, sink, true);
+                                if (implicit)
+                                    Commit(session, lock, &census);
+                                return true;
+                            }
+                        }
+                    }
+                }
                 VisitRows(session, schema, select.conds, [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
                     const auto cells = DecodeRow(schema, image);
                     if (!Matches(schema, cells, select.conds))
@@ -2453,17 +3648,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                             continue;
                         if (expr.func == ast::AGG_COUNT) {
                             if (expr.is_distinct) {
-                                std::string key =
-                                    std::to_string(static_cast<unsigned>(schema.columns[positions[i]].type)) + ":";
-                                if (schema.columns[positions[i]].type == ColumnType::Int)
-                                    key += std::to_string(value.integer);
-                                else if (schema.columns[positions[i]].type == ColumnType::Float) {
-                                    uint32_t bits;
-                                    std::memcpy(&bits, &value.floating, sizeof(bits));
-                                    key += std::to_string(bits);
-                                } else
-                                    key += value.text;
-                                if (!state.distinct.insert(std::move(key)).second)
+                                if (!state.distinct.insert(DistinctKey(schema.columns[positions[i]], value)).second)
                                     continue;
                             }
                             ++state.count;
@@ -2509,8 +3694,74 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 }
                 EmitRows(schema, select, {std::move(values)}, sink, true);
                 if (implicit)
-                    Commit(session, lock);
+                    Commit(session, lock, &census);
                 return true;
+            }
+            if (select.has_sort && select.has_limit && !select.limit_is_parameter && !select.offset_is_parameter &&
+                select.limit >= 0 && select.limit <= 4096 && select.offset >= 0) {
+                std::vector<size_t> order_columns;
+                std::optional<bool> reverse;
+                bool eligible = true;
+                for (const auto& item : select.order_by_items) {
+                    const auto* column = dynamic_cast<const ast::Col*>(item->expr.get());
+                    const bool item_reverse = item->orderby_dir == ast::OrderBy_DESC;
+                    if (!column ||
+                        (!column->tab_name.empty() && column->tab_name != schema.name &&
+                         column->tab_name != select.tabs[0].alias) ||
+                        (reverse && *reverse != item_reverse)) {
+                        eligible = false;
+                        break;
+                    }
+                    reverse = item_reverse;
+                    size_t position = 0;
+                    while (position < schema.columns.size() && schema.columns[position].name != column->col_name)
+                        ++position;
+                    if (position == schema.columns.size())
+                        throw std::runtime_error("Delta ORDER BY column not found");
+                    order_columns.push_back(position);
+                }
+                const auto access =
+                    eligible ? FindOrderedIndexAccess(schema, select.tabs[0].alias, select.conds, order_columns)
+                             : std::nullopt;
+                if (access) {
+                    const size_t offset = static_cast<size_t>(select.offset);
+                    const size_t limit = static_cast<size_t>(select.limit);
+                    const size_t target = offset + limit;
+                    std::vector<std::vector<Cell>> ordered_rows;
+                    size_t valid_rows = 0;
+                    bool usable = limit == 0;
+                    auto& txn = Txn(session);
+                    if (limit != 0) {
+                        VisitOrderedIndexInterval(
+                            session, schema, *access->index, access->first, access->last, *reverse,
+                            [&](const EncodedKey& candidate_key, epoch_si_poc::RowId id) {
+                                ++session.census.last_ordered_candidates_examined;
+                                const auto image = db_.engine().Read(txn, id);
+                                if (!image)
+                                    return true;
+                                auto cells = DecodeRow(schema, *image);
+                                ++session.census.last_ordered_rows_decoded;
+                                if (EncodeKey(schema, *access->index, cells) != candidate_key ||
+                                    !Matches(schema, cells, select.conds))
+                                    return true;
+                                if (valid_rows++ >= offset)
+                                    ordered_rows.push_back(std::move(cells));
+                                if (valid_rows < target)
+                                    return true;
+                                ++session.census.last_ordered_early_stops;
+                                return false;
+                            },
+                            &usable);
+                    }
+                    if (usable) {
+                        census.ordered_stream = true;
+                        census.ordered_materialize = false;
+                        EmitRows(schema, select, ordered_rows, sink);
+                        if (implicit)
+                            Commit(session, lock, &census);
+                        return true;
+                    }
+                }
             }
             std::vector<std::vector<Cell>> rows;
             bool query_started = false;
@@ -2524,6 +3775,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 } else {
                     if (rows.size() == 4096)
                         throw std::runtime_error("Delta ORDER BY result exceeds 4096 rows");
+                    ++session.census.last_ordered_sort_input_rows;
                     rows.push_back(std::move(cells));
                 }
             });
@@ -2544,7 +3796,10 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                             throw std::runtime_error("Delta ORDER BY expression unsupported");
                         const size_t pos = position(*column);
                         const int comparison =
-                            schema.columns[pos].type == ColumnType::Int
+                            left[pos].is_null || right[pos].is_null ? (left[pos].is_null == right[pos].is_null ? 0
+                                                                       : left[pos].is_null                     ? -1
+                                                                                                               : 1)
+                            : schema.columns[pos].type == ColumnType::Int
                                 ? (left[pos].integer < right[pos].integer ? -1 : left[pos].integer > right[pos].integer)
                             : schema.columns[pos].type == ColumnType::Float
                                 ? (left[pos].floating < right[pos].floating ? -1
@@ -2566,7 +3821,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
             else if (!query_started)
                 EmitRows(schema, select, rows, sink);
             if (implicit)
-                Commit(session, lock);
+                Commit(session, lock, &census);
             return true;
         } else if (tree->type == ast::AstType::DeleteStmt || tree->type == ast::AstType::UpdateStmt) {
             const bool deleting = tree->type == ast::AstType::DeleteStmt;
@@ -2655,7 +3910,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
         } else
             throw std::runtime_error("unsupported SQL for DeltaKernel");
         if (implicit)
-            Commit(session, lock);
+            Commit(session, lock, &census);
         return false;
     } catch (...) {
         if (implicit && session.txn)

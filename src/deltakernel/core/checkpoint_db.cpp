@@ -3,6 +3,7 @@
 #include "file_wal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -526,6 +527,7 @@ ImmutableTable::~ImmutableTable() {
 }
 
 std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
+    const auto diagnostics = diagnostics_;
     auto upper = std::upper_bound(block_first_ids_.begin(), block_first_ids_.end(), local_id);
     if (upper == block_first_ids_.begin())
         return std::nullopt;
@@ -537,7 +539,16 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
         stop - offset > std::vector<uint8_t>().max_size())
         throw std::runtime_error("invalid immutable table block range");
     std::vector<uint8_t> bytes(static_cast<size_t>(stop - offset));
+    const auto pread_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     PreadLoop(fd_, bytes.data(), bytes.size(), offset);
+    if (diagnostics) {
+        const auto pread_done = std::chrono::steady_clock::now();
+        diagnostics->immutable_reads.fetch_add(1, std::memory_order_relaxed);
+        diagnostics->immutable_bytes.fetch_add(bytes.size(), std::memory_order_relaxed);
+        diagnostics->immutable_pread_ns.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(pread_done - pread_started).count()),
+            std::memory_order_relaxed);
+    }
     size_t pos = 0;
     while (pos < bytes.size()) {
         const uint64_t id = GetLe<uint64_t>(bytes, pos, bytes.size());
@@ -546,18 +557,32 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
             throw std::runtime_error("invalid immutable row length");
         if (id > local_id)
             return std::nullopt;
-        if (id == local_id)
-            return DecodeRow(std::vector<uint8_t>(bytes.begin() + pos, bytes.begin() + pos + length));
+        if (id == local_id) {
+            const auto decode_started = diagnostics ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+            const auto decoded = DecodeRow(std::vector<uint8_t>(bytes.begin() + pos, bytes.begin() + pos + length));
+            if (diagnostics) {
+                diagnostics->immutable_decode_ns.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - decode_started)
+                                               .count()),
+                    std::memory_order_relaxed);
+            }
+            return decoded;
+        }
         pos += length;
     }
     return std::nullopt;
 }
 
-bool ImmutableTable::Contains(uint64_t local_id) const {
-    return Read(local_id).has_value();
+void ImmutableTable::SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics) const {
+    diagnostics_ = std::move(diagnostics);
 }
 
 void ImmutableTable::Visit(const std::function<void(uint64_t, Row&&)>& visitor) const {
+    const auto diagnostics = diagnostics_;
+    if (diagnostics)
+        diagnostics->immutable_scan_calls.fetch_add(1, std::memory_order_relaxed);
     constexpr size_t kBufferBytes = 1U << 20;
     const uint64_t end = kTableHeaderBytes + payload_bytes_;
     std::vector<uint8_t> buffer(kBufferBytes);
@@ -573,7 +598,18 @@ void ImmutableTable::Visit(const std::function<void(uint64_t, Row&&)>& visitor) 
                 const size_t available = static_cast<size_t>(std::min<uint64_t>(buffer.size(), end - next_read));
                 if (available == 0)
                     throw std::runtime_error("immutable table row count mismatch");
+                const auto pread_started =
+                    diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 PreadLoop(fd_, buffer.data(), available, next_read);
+                if (diagnostics) {
+                    diagnostics->immutable_scan_pread_calls.fetch_add(1, std::memory_order_relaxed);
+                    diagnostics->immutable_scan_bytes.fetch_add(available, std::memory_order_relaxed);
+                    diagnostics->immutable_scan_pread_ns.fetch_add(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - pread_started)
+                                                  .count()),
+                        std::memory_order_relaxed);
+                }
                 next_read += available;
                 buffer_pos = 0;
                 buffer_size = available;
@@ -605,7 +641,19 @@ void ImmutableTable::Visit(const std::function<void(uint64_t, Row&&)>& visitor) 
             throw std::runtime_error("invalid immutable row length");
         std::vector<uint8_t> encoded(length);
         read_bytes(encoded.data(), encoded.size());
-        visitor(id, DecodeRow(encoded));
+        const auto decode_started =
+            diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        Row decoded = DecodeRow(encoded);
+        if (diagnostics) {
+            diagnostics->immutable_scan_rows.fetch_add(1, std::memory_order_relaxed);
+            diagnostics->immutable_scan_decode_calls.fetch_add(1, std::memory_order_relaxed);
+            diagnostics->immutable_scan_decode_ns.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - decode_started)
+                                          .count()),
+                std::memory_order_relaxed);
+        }
+        visitor(id, std::move(decoded));
         previous_id = id;
         have_previous_id = true;
     }

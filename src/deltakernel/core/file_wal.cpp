@@ -1,5 +1,7 @@
 #include "file_wal.h"
 
+#include "epoch_si_engine.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
@@ -8,6 +10,8 @@
 #include <system_error>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <chrono>
 
 namespace epoch_si_poc {
 namespace {
@@ -74,7 +78,7 @@ FileWal::~FileWal() {
 
 FileWal::FileWal(FileWal&& other) noexcept
     : fd_(other.fd_), end_offset_(other.end_offset_), max_write_chunk_(other.max_write_chunk_),
-      write_calls_(other.write_calls_), sync_calls_(other.sync_calls_) {
+      write_calls_(other.write_calls_), sync_calls_(other.sync_calls_), diagnostics_(std::move(other.diagnostics_)) {
     other.fd_ = -1;
     other.end_offset_ = 0;
 }
@@ -91,6 +95,7 @@ FileWal& FileWal::operator=(FileWal&& other) noexcept {
     max_write_chunk_ = other.max_write_chunk_;
     write_calls_ = other.write_calls_;
     sync_calls_ = other.sync_calls_;
+    diagnostics_ = std::move(other.diagnostics_);
     other.fd_ = -1;
     other.end_offset_ = 0;
     return *this;
@@ -124,7 +129,16 @@ void FileWal::Append(const std::vector<uint8_t>& bytes, size_t limit) {
     while (done < target) {
         const size_t chunk =
             std::min({target - done, max_write_chunk_, static_cast<size_t>(std::numeric_limits<ssize_t>::max())});
+        const auto started = diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const ssize_t written = pwrite(fd_, bytes.data() + done, chunk, static_cast<off_t>(end_offset_));
+        if (diagnostics_) {
+            diagnostics_->wal_pwrite_calls.fetch_add(1, std::memory_order_relaxed);
+            diagnostics_->wal_pwrite_ns.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - started)
+                                           .count()),
+                std::memory_order_relaxed);
+        }
         if (written < 0 && errno == EINTR) {
             continue;
         }
@@ -136,15 +150,26 @@ void FileWal::Append(const std::vector<uint8_t>& bytes, size_t limit) {
         }
         done += static_cast<size_t>(written);
         end_offset_ += static_cast<size_t>(written);
+        if (diagnostics_)
+            diagnostics_->wal_pwrite_bytes.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
         ++write_calls_;
     }
 }
 
 void FileWal::Sync() {
+    const auto started = diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     while (fdatasync(fd_) != 0) {
         if (errno != EINTR) {
             ThrowSystemError("sync WAL");
         }
+    }
+    if (diagnostics_) {
+        diagnostics_->wal_fdatasync_calls.fetch_add(1, std::memory_order_relaxed);
+        diagnostics_->wal_fdatasync_ns.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count()),
+            std::memory_order_relaxed);
     }
     ++sync_calls_;
 }

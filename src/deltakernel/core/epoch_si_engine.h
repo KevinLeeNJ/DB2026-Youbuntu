@@ -2,9 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -64,6 +67,39 @@ using Row = RowImage;
 using BaseImage = std::map<RowId, Row>;
 using ImmutableTables = std::map<TableId, std::shared_ptr<const ImmutableTable>>;
 
+// Installed only when RMDB_DELTA_DIAGNOSTICS is set.  The normal path keeps this
+// pointer null, so it performs no counter writes.
+struct DeltaDiagnostics {
+    std::atomic<uint64_t> immutable_reads{0};
+    std::atomic<uint64_t> immutable_bytes{0};
+    std::atomic<uint64_t> immutable_pread_ns{0};
+    std::atomic<uint64_t> immutable_decode_ns{0};
+    std::atomic<uint64_t> immutable_scan_calls{0};
+    std::atomic<uint64_t> immutable_scan_rows{0};
+    std::atomic<uint64_t> immutable_scan_bytes{0};
+    std::atomic<uint64_t> immutable_scan_pread_calls{0};
+    std::atomic<uint64_t> immutable_scan_pread_ns{0};
+    std::atomic<uint64_t> immutable_scan_decode_calls{0};
+    std::atomic<uint64_t> immutable_scan_decode_ns{0};
+    std::atomic<uint64_t> scan_version_entries_examined{0};
+    std::atomic<uint64_t> scan_private_entries_examined{0};
+    std::atomic<uint64_t> private_hits{0};
+    std::atomic<uint64_t> version_hits{0};
+    std::atomic<uint64_t> base_hits{0};
+    std::atomic<uint64_t> wal_pwrite_calls{0};
+    std::atomic<uint64_t> wal_pwrite_bytes{0};
+    std::atomic<uint64_t> wal_pwrite_ns{0};
+    std::atomic<uint64_t> wal_fdatasync_calls{0};
+    std::atomic<uint64_t> wal_fdatasync_ns{0};
+    std::atomic<uint64_t> commit_encode_ns{0};
+    std::atomic<uint64_t> commit_prepare_ns{0};
+    std::atomic<uint64_t> commit_install_ns{0};
+    std::atomic<uint64_t> commit_publish_ns{0};
+    std::atomic<uint64_t> commit_frames{0};
+    std::atomic<uint64_t> commit_tickets{0};
+    std::array<std::atomic<uint64_t>, 33> commit_batch_hist{};
+};
+
 class ImmutableTable {
 public:
     ~ImmutableTable();
@@ -89,9 +125,9 @@ public:
         return (block_first_ids_.size() + block_offsets_.size()) * sizeof(uint64_t);
     }
     std::optional<Row> Read(uint64_t local_id) const;
-    bool Contains(uint64_t local_id) const;
     void Visit(const std::function<void(uint64_t, Row&&)>& visitor) const;
     void ValidateRowsForInstall();
+    void SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics) const;
 
     // CheckpointDb is the only production caller; public keeps the concrete file reader factory trivial.
     ImmutableTable(std::string path, int fd, TableId table_id, uint64_t generation, Epoch visible_from,
@@ -110,6 +146,7 @@ private:
     uint64_t next_local_id_ = 0;
     std::vector<uint64_t> block_first_ids_;
     std::vector<uint64_t> block_offsets_;
+    mutable std::shared_ptr<DeltaDiagnostics> diagnostics_;
 };
 
 enum class CommitStatus { kCommitted, kWriteConflict, kUniqueConflict };
@@ -139,12 +176,34 @@ public:
 class EpochSiEngine {
 private:
     friend class CheckpointDb;
+    struct PendingCommit;
     struct OwnerState {
-        size_t active_count = 0;
-        bool valid = true;
+        std::atomic<size_t> active_count{0};
+        std::atomic<bool> valid{true};
     };
 
 public:
+    // The caller holds the engine's external state lock while preparing and
+    // publishing.  Syncing the already-built frame intentionally needs none.
+    class PreparedCommit {
+    public:
+        PreparedCommit();
+        ~PreparedCommit();
+        PreparedCommit(const PreparedCommit&) = delete;
+        PreparedCommit& operator=(const PreparedCommit&) = delete;
+        PreparedCommit(PreparedCommit&&) noexcept;
+        PreparedCommit& operator=(PreparedCommit&&) = delete;
+
+        bool needs_sync() const noexcept;
+        bool needs_publish() const noexcept;
+        const std::vector<CommitResult>& results() const noexcept;
+
+    private:
+        friend class EpochSiEngine;
+        EpochSiEngine* engine_ = nullptr;
+        std::unique_ptr<PendingCommit> pending_;
+    };
+
     struct Txn {
         Txn() = default;
         ~Txn();
@@ -159,6 +218,7 @@ public:
         std::shared_ptr<OwnerState> owner_;
         Epoch start_epoch_ = 0;
         bool active_ = false;
+        bool prepared_ = false;
         std::map<RowId, Row> writes_;
         std::set<RowId> inserts_;
     };
@@ -188,6 +248,10 @@ public:
     void Erase(Txn& txn, RowId row_id);
     void Abort(Txn& txn);
     std::vector<CommitResult> CommitBatch(const std::vector<Txn*>& txns);
+    PreparedCommit PrepareCommitBatch(const std::vector<Txn*>& txns);
+    void SyncPreparedCommit(PreparedCommit& prepared);
+    void PublishPreparedCommit(PreparedCommit& prepared);
+    void SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics);
 
     void SetCrashPointForTest(CrashPoint point, size_t position = 0);
     void SetFileMaxWriteChunkForTest(size_t bytes);
@@ -223,7 +287,7 @@ public:
         return wal_transaction_count_;
     }
     size_t active_transaction_count() const {
-        return identity_ ? identity_->active_count : 0;
+        return identity_ ? identity_->active_count.load(std::memory_order_acquire) : 0;
     }
     BaseImage MaterializePublished() const;
     bool CanInstallPristineTable(TableId table_id) const;
@@ -231,6 +295,7 @@ public:
         return base_.size();
     }
     size_t immutable_index_bytes() const;
+    size_t immutable_read_probes_for_test() const;
     size_t immutable_table_count() const {
         return immutable_tables_.size();
     }
@@ -268,6 +333,16 @@ private:
         size_t staged_entries;
         size_t staged_versions;
     };
+    struct PendingCommit {
+        std::vector<CommitResult> results;
+        std::vector<Txn*> accepted;
+        std::vector<uint8_t> frame;
+        PreparedState publication;
+        Epoch epoch = 0;
+        size_t accepted_count = 0;
+        bool synced = false;
+        bool published = false;
+    };
     struct PreparedTableInstall {
         ImmutableTables tables;
         std::map<RowId, Epoch> last_row_epoch;
@@ -278,7 +353,7 @@ private:
 
     EpochSiEngine(BaseImage base, ImmutableTables tables, Epoch base_epoch);
     std::optional<Row> ReadCommitted(RowId row_id, Epoch snapshot) const;
-    std::optional<Epoch> LastRowEpoch(RowId row_id) const;
+    Epoch LastExistingRowEpoch(RowId row_id) const;
     static std::vector<uint8_t> EncodeFrame(Epoch epoch, const std::vector<Txn*>& txns,
                                             const std::vector<uint64_t>& commit_seqs);
     void RequireActive(const Txn& txn) const;
@@ -301,6 +376,8 @@ private:
     std::map<RowId, Epoch> last_row_epoch_;
     std::map<ConstraintClaim, Epoch> last_claim_epoch_;
     std::map<ConstraintClaim, RowId> claim_owner_;
+    // Insert execution only reserves a private RowId. Publication still owns all committed structural state.
+    std::mutex row_id_allocator_mutex_;
     std::map<TableId, uint64_t> next_row_id_;
     std::shared_ptr<OwnerState> identity_;
     Epoch published_epoch_ = 0;
@@ -317,7 +394,9 @@ private:
     size_t last_install_version_nodes_ = 0;
     CrashPoint crash_point_ = CrashPoint::kNone;
     size_t crash_position_ = 0;
-    bool poisoned_ = false;
+    std::atomic<bool> poisoned_{false};
+    std::atomic<bool> pending_prepared_{false};
+    std::shared_ptr<DeltaDiagnostics> diagnostics_;
 };
 
 } // namespace epoch_si_poc

@@ -108,6 +108,21 @@ TEST(FileWalTest, ReopenPreservesFramesAndUsesRealFdatasync) {
     reopened.Abort(view);
 }
 
+TEST(FileWalTest, DiagnosticsAreOptInAndCountDurableCommitIo) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+    auto diagnostics = std::make_shared<DeltaDiagnostics>();
+    engine.SetDiagnostics(diagnostics);
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kTable, 1}, test_row::Make(kTable, "a", 99));
+    ASSERT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(diagnostics->commit_tickets.load(), 1U);
+    EXPECT_EQ(diagnostics->commit_frames.load(), 1U);
+    EXPECT_GT(diagnostics->wal_pwrite_calls.load(), 0U);
+    EXPECT_GT(diagnostics->wal_pwrite_bytes.load(), 0U);
+    EXPECT_GT(diagnostics->wal_fdatasync_calls.load(), 0U);
+}
+
 TEST(FileWalTest, ReadOnlyCommitsAppendAndSyncInEveryAckWindow) {
     TempWal temp;
     auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());

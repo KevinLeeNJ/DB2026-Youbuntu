@@ -5,12 +5,16 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <set>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 
@@ -167,6 +171,166 @@ TEST(EpochSiEngineTest, ImmutableScanUsesSnapshotVersionsAndDecodedBaseRows) {
     EXPECT_EQ(test_row::Value(local_rows[1].second), 30);
     db.engine().Abort(old);
     db.engine().Abort(current);
+}
+
+TEST(EpochSiEngineTest, ClaimFreeImmutableCommitsDoNotReprobeBase) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto writer = db.BeginTableBase(kAccounts);
+    writer.Append(ImmutableRow("a", 10));
+    writer.Append(ImmutableRow("b", 20));
+    writer.Append(ImmutableRow("c", 30));
+    db.PublishTableBase(std::move(writer));
+    db.engine().SetDiagnostics(std::make_shared<DeltaDiagnostics>());
+
+    auto update = db.engine().Begin();
+    auto erase = db.engine().Begin();
+    auto insert = db.engine().Begin();
+    db.engine().PutImage(update, {kAccounts, 0}, ImmutableRow("a", 11));
+    db.engine().Erase(erase, {kAccounts, 1});
+    const RowId inserted = db.engine().InsertImage(insert, kAccounts, ImmutableRow("d", 40));
+    const size_t execution_probes = db.engine().immutable_read_probes_for_test();
+    EXPECT_EQ(execution_probes, 2U);
+
+    const auto batch = db.engine().CommitBatch({&update, &erase, &insert});
+    ASSERT_EQ(batch.size(), 3U);
+    EXPECT_EQ(batch[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(batch[1].status, CommitStatus::kCommitted);
+    EXPECT_EQ(batch[2].status, CommitStatus::kCommitted);
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), execution_probes);
+
+    auto stale = db.engine().Begin();
+    auto winner = db.engine().Begin();
+    db.engine().PutImage(stale, {kAccounts, 2}, ImmutableRow("c", 31));
+    db.engine().PutImage(winner, {kAccounts, 2}, ImmutableRow("c", 32));
+    const size_t winner_execution_probes = db.engine().immutable_read_probes_for_test();
+    ASSERT_EQ(db.engine().CommitBatch({&winner})[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), winner_execution_probes);
+    EXPECT_EQ(db.engine().CommitBatch({&stale})[0].status, CommitStatus::kWriteConflict);
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), winner_execution_probes);
+
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto view = reopened.engine().Begin();
+    EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, {kAccounts, 0})), 11);
+    EXPECT_FALSE(reopened.engine().Read(view, {kAccounts, 1}));
+    EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, {kAccounts, 2})), 32);
+    EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, inserted)), 40);
+    reopened.engine().Abort(view);
+}
+
+TEST(EpochSiEngineTest, ImmutableReadDiagnosticsCountOneReadAcrossManyTables) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto accounts = db.BeginTableBase(kAccounts);
+    accounts.Append(ImmutableRow("a", 10));
+    db.PublishTableBase(std::move(accounts));
+    auto orders = db.BeginTableBase(kOrders);
+    orders.Append(ImmutableRow("o", 20));
+    db.PublishTableBase(std::move(orders));
+    auto diagnostics = std::make_shared<DeltaDiagnostics>();
+    db.engine().SetDiagnostics(diagnostics);
+
+    auto txn = db.engine().Begin();
+    ASSERT_TRUE(db.engine().Read(txn, {kAccounts, 0}).has_value());
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), 1U);
+    db.engine().Abort(txn);
+}
+
+TEST(EpochSiEngineTest, ImmutableScanIsTableLocalAndNeverPointProbes) {
+    TempDbDirectory temp;
+    BaseImage accounts;
+    accounts.emplace(RowId{kAccounts, 0}, ImmutableRow("a", 10));
+    accounts.emplace(RowId{kAccounts, 2}, ImmutableRow("c", 30)); // Preserve an immutable-base hole.
+    auto db = CheckpointDb::Create(temp.path(), std::move(accounts));
+
+    auto old = db.engine().Begin();
+    auto update = db.engine().Begin();
+    auto erase = db.engine().Begin();
+    auto insert = db.engine().Begin();
+    db.engine().PutImage(update, {kAccounts, 0}, ImmutableRow("a", 11));
+    db.engine().Erase(erase, {kAccounts, 2});
+    const RowId committed_insert = db.engine().InsertImage(insert, kAccounts, ImmutableRow("d", 40));
+    ASSERT_EQ(committed_insert, (RowId{kAccounts, 3}));
+    const auto committed = db.engine().CommitBatch({&update, &erase, &insert});
+    ASSERT_EQ(committed[0].status, CommitStatus::kCommitted);
+    ASSERT_EQ(committed[1].status, CommitStatus::kCommitted);
+    ASSERT_EQ(committed[2].status, CommitStatus::kCommitted);
+
+    auto old_diagnostics = std::make_shared<DeltaDiagnostics>();
+    db.engine().SetDiagnostics(old_diagnostics);
+    const auto old_rows = db.engine().Scan(old, kAccounts);
+    ASSERT_EQ(old_rows.size(), 2U);
+    EXPECT_EQ(old_rows[0].first, (RowId{kAccounts, 0}));
+    EXPECT_EQ(test_row::Value(old_rows[0].second), 10);
+    EXPECT_EQ(old_rows[1].first, (RowId{kAccounts, 2}));
+    EXPECT_EQ(test_row::Value(old_rows[1].second), 30);
+    EXPECT_EQ(old_diagnostics->immutable_reads.load(), 0U);
+    db.engine().Abort(old);
+
+    auto orders = db.BeginTableBase(kOrders); // A later table generation has a different visible_from epoch.
+    orders.Append(ImmutableRow("o", 1));
+    db.PublishTableBase(std::move(orders));
+    auto order_versions = db.engine().Begin();
+    for (int64_t value = 0; value < 128; ++value)
+        db.engine().InsertImage(order_versions, kOrders, ImmutableRow("ov" + std::to_string(value), value));
+    ASSERT_EQ(db.engine().CommitBatch({&order_versions})[0].status, CommitStatus::kCommitted);
+
+    auto private_view = db.engine().Begin();
+    db.engine().PutImage(private_view, {kAccounts, 0}, ImmutableRow("a", 99));
+    db.engine().Erase(private_view, committed_insert);
+    const RowId private_insert = db.engine().InsertImage(private_view, kAccounts, ImmutableRow("e", 50));
+    ASSERT_EQ(private_insert, (RowId{kAccounts, 4}));
+    for (int64_t value = 0; value < 128; ++value)
+        db.engine().InsertImage(private_view, kOrders, ImmutableRow("pv" + std::to_string(value), value));
+
+    auto diagnostics = std::make_shared<DeltaDiagnostics>();
+    db.engine().SetDiagnostics(diagnostics);
+    const auto private_rows = db.engine().Scan(private_view, kAccounts);
+    ASSERT_EQ(private_rows.size(), 2U);
+    EXPECT_EQ(private_rows[0].first, (RowId{kAccounts, 0}));
+    EXPECT_EQ(test_row::Value(private_rows[0].second), 99);
+    EXPECT_EQ(private_rows[1].first, private_insert);
+    EXPECT_EQ(test_row::Value(private_rows[1].second), 50);
+    EXPECT_EQ(diagnostics->immutable_reads.load(), 0U);
+    EXPECT_EQ(diagnostics->immutable_scan_calls.load(), 1U);
+    EXPECT_EQ(diagnostics->immutable_scan_rows.load(), 2U);
+    EXPECT_EQ(diagnostics->immutable_scan_decode_calls.load(), 2U);
+    EXPECT_EQ(diagnostics->immutable_scan_pread_calls.load(), 1U);
+    EXPECT_GT(diagnostics->immutable_scan_bytes.load(), 0U);
+    EXPECT_EQ(diagnostics->scan_version_entries_examined.load(), 2U); // Private id 0 short-circuits its version.
+    EXPECT_EQ(diagnostics->scan_private_entries_examined.load(), 3U);
+
+    db.engine().SetDiagnostics(nullptr);
+    std::vector<std::pair<RowId, Row>> point_rows;
+    for (uint64_t local_id = 0; local_id <= private_insert.local_id; ++local_id)
+        if (auto row = db.engine().Read(private_view, {kAccounts, local_id}))
+            point_rows.emplace_back(RowId{kAccounts, local_id}, std::move(*row));
+    EXPECT_EQ(private_rows, point_rows);
+    const uint64_t calls_with_diagnostics = diagnostics->immutable_scan_calls.load();
+    EXPECT_EQ(db.engine().Scan(private_view, kAccounts), point_rows);
+    EXPECT_EQ(diagnostics->immutable_scan_calls.load(), calls_with_diagnostics);
+    db.engine().Abort(private_view);
+
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto recovered_diagnostics = std::make_shared<DeltaDiagnostics>();
+    reopened.engine().SetDiagnostics(recovered_diagnostics);
+    auto recovered_view = reopened.engine().Begin();
+    const auto recovered_rows = reopened.engine().Scan(recovered_view, kAccounts);
+    ASSERT_EQ(recovered_rows.size(), 2U);
+    EXPECT_EQ(test_row::Value(recovered_rows[0].second), 11);
+    EXPECT_EQ(recovered_rows[1].first, committed_insert);
+    EXPECT_EQ(recovered_diagnostics->immutable_reads.load(), 0U);
+    reopened.engine().Abort(recovered_view);
+
+    reopened.engine().SetDiagnostics(nullptr);
+    reopened.OfflineCheckpoint();
+    auto checkpointed = CheckpointDb::Open(temp.path());
+    auto checkpoint_diagnostics = std::make_shared<DeltaDiagnostics>();
+    checkpointed.engine().SetDiagnostics(checkpoint_diagnostics);
+    auto checkpoint_view = checkpointed.engine().Begin();
+    EXPECT_EQ(checkpointed.engine().Scan(checkpoint_view, kAccounts), recovered_rows);
+    EXPECT_EQ(checkpoint_diagnostics->immutable_reads.load(), 0U);
+    checkpointed.engine().Abort(checkpoint_view);
 }
 
 TEST(EpochSiEngineTest, ImmutableScanCrossesSparseBlockBoundary) {
@@ -357,6 +521,319 @@ TEST(EpochSiEngineTest, MoveLeavesOneValidOwner) {
     EXPECT_THROW(original.Begin(), std::logic_error);
     EXPECT_THROW(original.CommitBatch({&txn}), std::logic_error);
     EXPECT_EQ(moved.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+}
+
+TEST(EpochSiEngineTest, ConcurrentBeginMoveFinishAndInsertIdsStayExact) {
+    EpochSiEngine engine(BaseImage{});
+    constexpr size_t kThreads = 8;
+    constexpr size_t kInsertsPerThread = 128;
+    std::array<std::vector<RowId>, kThreads> ids;
+    std::mutex mutex;
+    std::condition_variable ready;
+    size_t active = 0;
+    bool finish = false;
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (size_t thread = 0; thread < kThreads; ++thread) {
+        workers.emplace_back([&, thread] {
+            auto first = engine.Begin();
+            for (size_t i = 0; i < kInsertsPerThread; ++i) {
+                ids[thread].push_back(engine.InsertImage(
+                    first, kAccounts, ImmutableRow(std::to_string(thread) + ":" + std::to_string(i), i)));
+            }
+            auto second = std::move(first);
+            auto final = std::move(second);
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ++active;
+                ready.notify_all();
+                ready.wait(lock, [&] { return finish; });
+            }
+            if (thread % 2 == 0)
+                engine.Abort(final);
+        });
+    }
+    bool all_active = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        all_active = ready.wait_for(lock, std::chrono::seconds(5), [&] { return active == kThreads; });
+        if (all_active) {
+            EXPECT_EQ(engine.active_transaction_count(), kThreads);
+        }
+        finish = true;
+    }
+    ready.notify_all();
+    for (auto& worker : workers)
+        worker.join();
+    ASSERT_TRUE(all_active);
+
+    std::set<RowId> unique;
+    for (const auto& thread_ids : ids)
+        unique.insert(thread_ids.begin(), thread_ids.end());
+    EXPECT_EQ(unique.size(), kThreads * kInsertsPerThread);
+    uint64_t expected = 0;
+    for (const RowId id : unique) {
+        EXPECT_EQ(id, (RowId{kAccounts, expected}));
+        ++expected;
+    }
+    EXPECT_EQ(engine.active_transaction_count(), 0U);
+    auto next = engine.Begin();
+    EXPECT_EQ(engine.InsertImage(next, kAccounts, ImmutableRow("next", 1)),
+              (RowId{kAccounts, kThreads * kInsertsPerThread}));
+    engine.Abort(next);
+}
+
+TEST(EpochSiEngineTest, PreparedPublicationDoesNotRewindConcurrentRowIdAllocation) {
+    EpochSiEngine engine(BaseImage{});
+    auto first = engine.Begin();
+    EXPECT_EQ(engine.InsertImage(first, kAccounts, ImmutableRow("first", 1)), (RowId{kAccounts, 0}));
+    auto prepared = engine.PrepareCommitBatch({&first});
+
+    auto concurrent = engine.Begin();
+    EXPECT_EQ(engine.InsertImage(concurrent, kAccounts, ImmutableRow("concurrent", 2)), (RowId{kAccounts, 1}));
+    engine.SyncPreparedCommit(prepared);
+    engine.PublishPreparedCommit(prepared);
+
+    auto next = engine.Begin();
+    EXPECT_EQ(engine.InsertImage(next, kAccounts, ImmutableRow("next", 3)), (RowId{kAccounts, 2}));
+    engine.Abort(concurrent);
+    engine.Abort(next);
+}
+
+TEST(EpochSiEngineTest, ReadOnlyCommitStillStabilizesAndRecovers) {
+    TempDbDirectory temp;
+    const std::string wal = temp.path() + "/db.log";
+    EpochSiEngine engine = EpochSiEngine::CreateFile(Base(), wal);
+    const size_t bytes_before = engine.durable_wal_bytes();
+    const size_t syncs_before = engine.wal_sync_calls_for_test();
+    auto read_only = engine.Begin();
+    const auto result = engine.CommitBatch({&read_only});
+    ASSERT_EQ(result.size(), 1U);
+    EXPECT_EQ(result[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(result[0].epoch, 1U);
+    EXPECT_EQ(result[0].commit_seq, 1U);
+    EXPECT_GT(engine.durable_wal_bytes(), bytes_before);
+    EXPECT_EQ(engine.wal_sync_calls_for_test(), syncs_before + 1);
+
+    auto recovered = EpochSiEngine::OpenFile(Base(), wal);
+    EXPECT_EQ(recovered.published_epoch(), 1U);
+    auto write = recovered.Begin();
+    recovered.PutImage(write, {kAccounts, 1}, test_row::Make(kAccounts, "a", 11));
+    const auto next = recovered.CommitBatch({&write});
+    EXPECT_EQ(next[0].commit_seq, 2U);
+}
+
+TEST(EpochSiEngineTest, MixedReadOnlyAndWriteCommitSharesOneStabilizedFrame) {
+    TempDbDirectory temp;
+    const std::string wal = temp.path() + "/db.log";
+    EpochSiEngine engine = EpochSiEngine::CreateFile(Base(), wal);
+    const size_t syncs_before = engine.wal_sync_calls_for_test();
+    auto first = engine.Begin();
+    auto write = engine.Begin();
+    auto last = engine.Begin();
+    engine.PutImage(write, {kAccounts, 1}, test_row::Make(kAccounts, "a", 22));
+    const auto result = engine.CommitBatch({&first, &write, &last});
+    ASSERT_EQ(result.size(), 3U);
+    EXPECT_EQ(result[0].epoch, result[1].epoch);
+    EXPECT_EQ(result[1].epoch, result[2].epoch);
+    EXPECT_EQ(result[0].commit_seq + 1, result[1].commit_seq);
+    EXPECT_EQ(result[1].commit_seq + 1, result[2].commit_seq);
+    EXPECT_EQ(engine.wal_sync_calls_for_test(), syncs_before + 1);
+
+    auto recovered = EpochSiEngine::OpenFile(Base(), wal);
+    EXPECT_EQ(recovered.published_epoch(), result[0].epoch);
+    auto view = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 1})), 22);
+    recovered.Abort(view);
+}
+
+TEST(EpochSiEngineTest, SyncedPreparedCommitCannotBeDropped) {
+    EXPECT_DEATH(
+        {
+            EpochSiEngine engine(Base());
+            auto txn = engine.Begin();
+            engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+            auto prepared = engine.PrepareCommitBatch({&txn});
+            engine.SyncPreparedCommit(prepared);
+        },
+        "");
+}
+
+TEST(EpochSiEngineTest, PreparedTransactionRejectsFurtherMutationAndPrepare) {
+    EpochSiEngine engine(Base());
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+    auto prepared = engine.PrepareCommitBatch({&txn});
+    EXPECT_THROW(engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 34)), std::logic_error);
+    EXPECT_THROW(engine.PrepareCommitBatch({&txn}), std::invalid_argument);
+    EXPECT_THROW(engine.Abort(txn), std::logic_error);
+    engine.SyncPreparedCommit(prepared);
+    engine.PublishPreparedCommit(prepared);
+}
+
+TEST(EpochSiEngineTest, PreparedTransactionCannotMoveOrOutliveToken) {
+    EXPECT_DEATH(
+        {
+            EpochSiEngine engine(Base());
+            auto txn = engine.Begin();
+            engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+            auto prepared = engine.PrepareCommitBatch({&txn});
+            auto moved = std::move(txn);
+        },
+        "");
+    EXPECT_DEATH(
+        {
+            EpochSiEngine engine(Base());
+            auto txn = std::make_unique<EpochSiEngine::Txn>(engine.Begin());
+            engine.PutImage(*txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+            auto prepared = engine.PrepareCommitBatch({txn.get()});
+            txn.reset();
+        },
+        "");
+}
+
+TEST(EpochSiEngineTest, AbandonedUnsyncedPreparedCommitUnfreezesTransaction) {
+    EpochSiEngine engine(Base());
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+    {
+        auto prepared = engine.PrepareCommitBatch({&txn});
+    }
+    EXPECT_NO_THROW(engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 34)));
+    EXPECT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+}
+
+TEST(EpochSiEngineTest, PoisonedSyncCannotRetryPreparedCommit) {
+    TempDbDirectory temp;
+    const std::string wal = temp.path() + "/db.log";
+    EpochSiEngine engine = EpochSiEngine::CreateFile(Base(), wal);
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+    auto prepared = engine.PrepareCommitBatch({&txn});
+    engine.CloseFileForTest();
+    EXPECT_THROW(engine.SyncPreparedCommit(prepared), std::system_error);
+    EXPECT_THROW(engine.SyncPreparedCommit(prepared), std::logic_error);
+    EXPECT_THROW(engine.PublishPreparedCommit(prepared), std::logic_error);
+}
+
+TEST(EpochSiEngineTest, MixedPreparedBatchDoesNotRetainRejectedTransaction) {
+    TempDbDirectory temp;
+    const std::string wal = temp.path() + "/db.log";
+    EpochSiEngine engine = EpochSiEngine::CreateFile(Base(), wal);
+    auto stale = std::make_unique<EpochSiEngine::Txn>(engine.Begin());
+    auto winner = engine.Begin();
+    engine.PutImage(winner, {kAccounts, 1}, test_row::Make(kAccounts, "a", 11));
+    ASSERT_EQ(engine.CommitBatch({&winner})[0].status, CommitStatus::kCommitted);
+
+    auto accepted = engine.Begin();
+    engine.PutImage(*stale, {kAccounts, 1}, test_row::Make(kAccounts, "a", 12));
+    engine.PutImage(accepted, {kAccounts, 2}, test_row::Make(kAccounts, "b", 22));
+    auto prepared = engine.PrepareCommitBatch({stale.get(), &accepted});
+    ASSERT_EQ(prepared.results()[0].status, CommitStatus::kWriteConflict);
+    ASSERT_EQ(prepared.results()[1].status, CommitStatus::kCommitted);
+    stale.reset();
+    engine.SyncPreparedCommit(prepared);
+    engine.PublishPreparedCommit(prepared);
+
+    auto recovered = EpochSiEngine::OpenFile(Base(), wal);
+    auto view = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 1})), 11);
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 2})), 22);
+    recovered.Abort(view);
+}
+
+TEST(EpochSiEngineTest, AllRejectedPreparedCommitDoesNotHoldOutstandingGuard) {
+    EpochSiEngine engine(Base());
+    auto stale = engine.Begin();
+    auto winner = engine.Begin();
+    engine.PutImage(winner, {kAccounts, 1}, test_row::Make(kAccounts, "a", 11));
+    ASSERT_EQ(engine.CommitBatch({&winner})[0].status, CommitStatus::kCommitted);
+    engine.PutImage(stale, {kAccounts, 1}, test_row::Make(kAccounts, "a", 12));
+    const Epoch before_epoch = engine.published_epoch();
+    auto rejected = engine.PrepareCommitBatch({&stale});
+    ASSERT_EQ(rejected.results()[0].status, CommitStatus::kWriteConflict);
+    EXPECT_FALSE(rejected.needs_sync());
+    EXPECT_FALSE(rejected.needs_publish());
+    auto next = engine.Begin();
+    auto accepted = engine.PrepareCommitBatch({&next});
+    EXPECT_EQ(engine.published_epoch(), before_epoch);
+}
+
+TEST(EpochSiEngineTest, EngineMoveWithPreparedCommitFailsStop) {
+    EXPECT_DEATH(
+        {
+            EpochSiEngine engine(Base());
+            auto txn = engine.Begin();
+            engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+            auto prepared = engine.PrepareCommitBatch({&txn});
+            EpochSiEngine moved(std::move(engine));
+        },
+        "");
+}
+
+TEST(EpochSiEngineTest, WrongEngineCannotPublishPreparedCommit) {
+    EpochSiEngine first(Base());
+    EpochSiEngine second(Base());
+    auto txn = first.Begin();
+    first.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 33));
+    {
+        auto prepared = first.PrepareCommitBatch({&txn});
+        EXPECT_THROW(second.SyncPreparedCommit(prepared), std::invalid_argument);
+        EXPECT_THROW(second.PublishPreparedCommit(prepared), std::invalid_argument);
+    }
+    first.Abort(txn);
+}
+
+TEST(EpochSiEngineTest, MovedSyncedPreparedCommitPublishesAndRecovers) {
+    TempDbDirectory temp;
+    const std::string wal = temp.path() + "/db.log";
+    EpochSiEngine engine = EpochSiEngine::CreateFile(Base(), wal);
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 44));
+    auto prepared = engine.PrepareCommitBatch({&txn});
+    engine.SyncPreparedCommit(prepared);
+    auto moved = std::move(prepared);
+    engine.PublishPreparedCommit(moved);
+
+    auto recovered = EpochSiEngine::OpenFile(Base(), wal);
+    auto view = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 1})), 44);
+    recovered.Abort(view);
+}
+
+TEST(EpochSiEngineTest, PublishedPreparedCommitMayOutliveEngine) {
+    auto engine = std::make_unique<EpochSiEngine>(Base());
+    auto txn = std::make_unique<EpochSiEngine::Txn>(engine->Begin());
+    engine->PutImage(*txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 44));
+    auto prepared = engine->PrepareCommitBatch({txn.get()});
+    engine->SyncPreparedCommit(prepared);
+    engine->PublishPreparedCommit(prepared);
+    EXPECT_THROW(engine->PublishPreparedCommit(prepared), std::logic_error);
+    EXPECT_THROW(engine->SyncPreparedCommit(prepared), std::logic_error);
+    txn.reset();
+    engine.reset();
+}
+
+TEST(EpochSiEngineTest, PublishedTokenDestructionCannotClearNextOutstandingGuard) {
+    EpochSiEngine engine(Base());
+    auto first = engine.Begin();
+    engine.PutImage(first, {kAccounts, 1}, test_row::Make(kAccounts, "a", 44));
+    auto published = std::make_unique<EpochSiEngine::PreparedCommit>(engine.PrepareCommitBatch({&first}));
+    engine.SyncPreparedCommit(*published);
+    engine.PublishPreparedCommit(*published);
+
+    auto second = engine.Begin();
+    engine.PutImage(second, {kAccounts, 2}, test_row::Make(kAccounts, "b", 55));
+    auto pending = std::make_unique<EpochSiEngine::PreparedCommit>(engine.PrepareCommitBatch({&second}));
+    published.reset();
+    auto third = engine.Begin();
+    EXPECT_THROW(engine.PrepareCommitBatch({&third}), std::logic_error);
+    pending.reset();
+    {
+        auto accepted = engine.PrepareCommitBatch({&second});
+    }
+    engine.Abort(second);
+    engine.Abort(third);
 }
 
 TEST(EpochSiEngineTest, SharedEpochCrossTableRecoveryIsAtomic) {

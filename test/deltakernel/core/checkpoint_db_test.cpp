@@ -177,6 +177,28 @@ TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     reopened.engine().Abort(view);
 }
 
+TEST(CheckpointDbTest, DiagnosticsContinueAcrossOfflineCheckpoint) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+    auto diagnostics = std::make_shared<DeltaDiagnostics>();
+    db.engine().SetDiagnostics(diagnostics);
+    auto before = db.engine().Begin();
+    db.engine().PutImage(before, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 71)));
+    ASSERT_EQ(db.engine().CommitBatch({&before})[0].status, CommitStatus::kCommitted);
+    const uint64_t writes_before = diagnostics->wal_pwrite_calls.load();
+    ASSERT_GT(writes_before, 0U);
+
+    db.OfflineCheckpoint();
+
+    auto after = db.engine().Begin();
+    db.engine().PutImage(after, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 72)));
+    ASSERT_EQ(db.engine().CommitBatch({&after})[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(diagnostics->commit_tickets.load(), 2U);
+    EXPECT_EQ(diagnostics->commit_frames.load(), 2U);
+    EXPECT_GT(diagnostics->wal_pwrite_calls.load(), writes_before);
+    EXPECT_GT(diagnostics->wal_fdatasync_calls.load(), 1U);
+}
+
 TEST(CheckpointDbTest, MigratesLegacyWalBeforeServingCommits) {
     TempDbDirectory temp;
     {

@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "server/wire_session_internal.h"
 
+#include <chrono>
+
 namespace wire_session_internal {
 struct BatchExecutionContext {
     BatchExecutionContext(DatabaseInstance& database, SessionState& session)
@@ -269,9 +271,18 @@ void handle_batch(DatabaseInstance& database, int fd, Reader& reader, SessionSta
                 if (statement->catalog_generation != database.delta_database->CatalogGeneration())
                     revalidate_prepared(database, *statement, session.isolation);
                 result.begin_operation(i);
-                const bool query = database.delta_database->Execute(
-                    ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i])),
-                    session.delta_session, &result);
+                std::unique_ptr<ast::TreeNode> bound_tree;
+                if (database.delta_database->DiagnosticsEnabled()) {
+                    const auto clone_started = std::chrono::steady_clock::now();
+                    bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
+                    database.delta_database->RecordPreparedClone(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - clone_started)
+                                                   .count()));
+                } else {
+                    bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
+                }
+                const bool query = database.delta_database->Execute(std::move(bound_tree), session.delta_session, &result);
                 result.finish_operation(query);
                 ++executed;
             }

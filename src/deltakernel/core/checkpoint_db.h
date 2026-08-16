@@ -67,6 +67,11 @@ public:
         const auto found = tables_.find(table_id);
         return found == tables_.end() ? std::nullopt : std::optional<uint64_t>(found->second.file_generation);
     }
+    std::optional<Epoch> TableVisibleFrom(TableId table_id) const {
+        RequireUsable();
+        const auto found = tables_.find(table_id);
+        return found == tables_.end() ? std::nullopt : std::optional<Epoch>(found->second.visible_from);
+    }
     Epoch base_epoch() const {
         RequireUsable();
         return base_epoch_;
