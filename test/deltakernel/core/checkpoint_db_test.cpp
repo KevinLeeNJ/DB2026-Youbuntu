@@ -162,7 +162,7 @@ TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     EXPECT_EQ(db.engine().wal_frame_count(), 0U);
     EXPECT_TRUE(std::filesystem::exists(temp.path() + "/tablebase.1.1"));
     EXPECT_TRUE(std::filesystem::exists(temp.path() + "/tablebase.2.1"));
-    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/wal.1"));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
     ExpectPopulatedState(db);
 
     auto post_cut = db.engine().Begin();
@@ -175,6 +175,121 @@ TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     auto view = reopened.engine().Begin();
     EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, {kAccounts, 1})), 99);
     reopened.engine().Abort(view);
+}
+
+TEST(CheckpointDbTest, MigratesLegacyWalBeforeServingCommits) {
+    TempDbDirectory temp;
+    {
+        auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+        auto txn = db.engine().Begin();
+        db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 77)));
+        ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    }
+    ASSERT_EQ(rename((temp.path() + "/db.log.0").c_str(), (temp.path() + "/wal.0").c_str()), 0);
+
+    auto legacy = CheckpointDb::Open(temp.path());
+    EXPECT_EQ(legacy.wal_open_directory_syncs_for_test(), 1U);
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.0"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.0"));
+    auto view = legacy.engine().Begin();
+    EXPECT_EQ(test_row::Value(*legacy.engine().Read(view, {kAccounts, 1})), 77);
+    ASSERT_EQ(legacy.engine().CommitBatch({&view})[0].status, CommitStatus::kCommitted);
+    const size_t migrated_bytes = std::filesystem::file_size(temp.path() + "/db.log.0");
+    EXPECT_GT(migrated_bytes, 0U);
+    legacy.OfflineCheckpoint();
+
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.0"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_EQ(CheckpointDb::Open(temp.path()).engine().published_epoch(), 2U);
+}
+
+TEST(CheckpointDbTest, RejectsAmbiguousAndNonRegularWalAuthorities) {
+    {
+        TempDbDirectory temp;
+        auto db = CheckpointDb::Create(temp.path(), {});
+        std::filesystem::copy_file(temp.path() + "/db.log.0", temp.path() + "/wal.0");
+        EXPECT_THROW(CheckpointDb::Open(temp.path()), std::runtime_error);
+    }
+    for (const std::string name : {"db.log.0", "wal.0"}) {
+        TempDbDirectory temp;
+        TempDbDirectory external;
+        { auto db = CheckpointDb::Create(temp.path(), {}); }
+        ASSERT_TRUE(std::filesystem::remove(temp.path() + "/db.log.0"));
+        const std::string target = external.path() + "/outside.log";
+        WriteFile(target, {});
+        ASSERT_EQ(symlink(target.c_str(), (temp.path() + "/" + name).c_str()), 0);
+        EXPECT_THROW(CheckpointDb::Open(temp.path()), std::runtime_error) << name;
+        EXPECT_TRUE(std::filesystem::is_symlink(temp.path() + "/" + name));
+    }
+}
+
+TEST(CheckpointDbTest, ReopenCompletesAlreadyRenamedLegacyMigration) {
+    TempDbDirectory temp;
+    {
+        auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+        auto txn = db.engine().Begin();
+        db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 88)));
+        ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    }
+    ASSERT_EQ(rename((temp.path() + "/db.log.0").c_str(), (temp.path() + "/wal.0").c_str()), 0);
+    // Models a crash after renameat but before the migration directory fsync.
+    ASSERT_EQ(rename((temp.path() + "/wal.0").c_str(), (temp.path() + "/db.log.0").c_str()), 0);
+
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_EQ(reopened.wal_open_directory_syncs_for_test(), 1U);
+    auto view = reopened.engine().Begin();
+    EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, {kAccounts, 1})), 88);
+    ASSERT_EQ(reopened.engine().CommitBatch({&view})[0].status, CommitStatus::kCommitted);
+}
+
+TEST(CheckpointDbTest, CheckpointReplacesLegacyFutureWalOrphan) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+    WriteFile(temp.path() + "/wal.1", {});
+
+    EXPECT_NO_THROW(db.OfflineCheckpoint());
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 1U);
+}
+
+TEST(CheckpointDbTest, CheckpointRejectsNonRegularFutureWalOrphans) {
+    for (const std::string name : {"db.log.1", "wal.1"}) {
+        TempDbDirectory temp;
+        TempDbDirectory external;
+        auto db = CheckpointDb::Create(temp.path(), {});
+        const std::string target = external.path() + "/outside.log";
+        WriteFile(target, {});
+        ASSERT_EQ(symlink(target.c_str(), (temp.path() + "/" + name).c_str()), 0);
+
+        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << name;
+        EXPECT_TRUE(std::filesystem::is_symlink(temp.path() + "/" + name));
+        EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 0U);
+    }
+    for (const std::string name : {"db.log.1", "wal.1"}) {
+        TempDbDirectory temp;
+        auto db = CheckpointDb::Create(temp.path(), {});
+        ASSERT_TRUE(std::filesystem::create_directory(temp.path() + "/" + name));
+
+        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << name;
+        EXPECT_TRUE(std::filesystem::is_directory(temp.path() + "/" + name));
+        EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 0U);
+    }
+}
+
+TEST(CheckpointDbTest, RetryAfterPreManifestWalCrashCleansBothFutureNames) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    db.SetCrashPointForTest(CheckpointCrashPoint::kAfterWalCreate);
+    EXPECT_THROW(db.OfflineCheckpoint(), SimulatedCrash);
+    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
+    WriteFile(temp.path() + "/wal.1", {});
+
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_NO_THROW(reopened.OfflineCheckpoint());
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 1U);
 }
 
 TEST(CheckpointDbTest, OpaqueRowsSurviveCheckpoint) {
@@ -284,7 +399,7 @@ TEST(CheckpointDbTest, MissingAuthoritativeWalFailsWithoutRecreation) {
         db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 88)));
         ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
     }
-    const std::string wal = temp.path() + "/wal.1";
+    const std::string wal = temp.path() + "/db.log.1";
     ASSERT_TRUE(std::filesystem::remove(wal));
     EXPECT_THROW(CheckpointDb::Open(temp.path()), std::system_error);
     EXPECT_FALSE(std::filesystem::exists(wal));
@@ -466,8 +581,8 @@ TEST(CheckpointDbTest, CheckpointReusesCleanTableAndPreservesBaseSnapshot) {
     struct stat after {};
     ASSERT_EQ(stat(clean_path.c_str(), &after), 0);
     EXPECT_EQ(before.st_ino, after.st_ino);
-    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.0"));
-    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/wal.1"));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/db.log.0"));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
     EXPECT_EQ(db.engine().durable_wal_bytes(), 0U);
     EXPECT_FALSE(std::filesystem::exists(TablePath(temp, kAccounts, 1)));
 }

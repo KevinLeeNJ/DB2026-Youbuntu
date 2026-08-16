@@ -12,6 +12,7 @@ public:
     enum class OpenMode { kExisting, kCreateNew };
 
     explicit FileWal(const std::string& path, OpenMode mode = OpenMode::kExisting);
+    FileWal(int directory_fd, const std::string& name, OpenMode mode);
     ~FileWal();
 
     FileWal(const FileWal&) = delete;
@@ -27,6 +28,12 @@ public:
     size_t size() const {
         return end_offset_;
     }
+    size_t write_calls_for_test() const {
+        return write_calls_;
+    }
+    size_t sync_calls_for_test() const {
+        return sync_calls_;
+    }
     void SetMaxWriteChunkForTest(size_t bytes) {
         max_write_chunk_ = bytes == 0 ? 1 : bytes;
     }
@@ -36,6 +43,8 @@ private:
     int fd_ = -1;
     size_t end_offset_ = 0;
     size_t max_write_chunk_ = SIZE_MAX;
+    size_t write_calls_ = 0;
+    size_t sync_calls_ = 0;
 };
 
 } // namespace epoch_si_poc

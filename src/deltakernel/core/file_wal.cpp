@@ -19,8 +19,33 @@ void ThrowSystemError(const char* operation) {
 } // namespace
 
 FileWal::FileWal(const std::string& path, OpenMode mode) {
-    const int flags = O_RDWR | O_CLOEXEC | (mode == OpenMode::kCreateNew ? O_CREAT | O_EXCL : 0);
+    const int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (mode == OpenMode::kCreateNew ? O_CREAT | O_EXCL : 0);
     fd_ = open(path.c_str(), flags, 0600);
+    if (fd_ < 0) {
+        ThrowSystemError("open WAL");
+    }
+    struct stat stat_buf {};
+    if (fstat(fd_, &stat_buf) != 0) {
+        const int saved_errno = errno;
+        close(fd_);
+        fd_ = -1;
+        errno = saved_errno;
+        ThrowSystemError("stat WAL");
+    }
+    if (!S_ISREG(stat_buf.st_mode) || stat_buf.st_size < 0 ||
+        static_cast<uintmax_t>(stat_buf.st_size) > std::numeric_limits<size_t>::max()) {
+        close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("WAL must be a representable regular file");
+    }
+    end_offset_ = static_cast<size_t>(stat_buf.st_size);
+}
+
+FileWal::FileWal(int directory_fd, const std::string& name, OpenMode mode) {
+    if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos)
+        throw std::invalid_argument("WAL name must be one path component");
+    const int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (mode == OpenMode::kCreateNew ? O_CREAT | O_EXCL : 0);
+    fd_ = openat(directory_fd, name.c_str(), flags, 0600);
     if (fd_ < 0) {
         ThrowSystemError("open WAL");
     }
@@ -48,7 +73,8 @@ FileWal::~FileWal() {
 }
 
 FileWal::FileWal(FileWal&& other) noexcept
-    : fd_(other.fd_), end_offset_(other.end_offset_), max_write_chunk_(other.max_write_chunk_) {
+    : fd_(other.fd_), end_offset_(other.end_offset_), max_write_chunk_(other.max_write_chunk_),
+      write_calls_(other.write_calls_), sync_calls_(other.sync_calls_) {
     other.fd_ = -1;
     other.end_offset_ = 0;
 }
@@ -63,6 +89,8 @@ FileWal& FileWal::operator=(FileWal&& other) noexcept {
     fd_ = other.fd_;
     end_offset_ = other.end_offset_;
     max_write_chunk_ = other.max_write_chunk_;
+    write_calls_ = other.write_calls_;
+    sync_calls_ = other.sync_calls_;
     other.fd_ = -1;
     other.end_offset_ = 0;
     return *this;
@@ -108,6 +136,7 @@ void FileWal::Append(const std::vector<uint8_t>& bytes, size_t limit) {
         }
         done += static_cast<size_t>(written);
         end_offset_ += static_cast<size_t>(written);
+        ++write_calls_;
     }
 }
 
@@ -117,6 +146,7 @@ void FileWal::Sync() {
             ThrowSystemError("sync WAL");
         }
     }
+    ++sync_calls_;
 }
 
 void FileWal::TruncateAndSync(size_t bytes) {

@@ -158,8 +158,8 @@ bool DeltaDatabase::IsDeltaDirectory(const std::string& directory) {
         return false;
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
         const std::string name = entry.path().filename().string();
-        if (name == std::string(kCatalog) + ".tmp" || name == "MANIFEST.tmp" || name.rfind("base.", 0) == 0 ||
-            name.rfind("wal.", 0) == 0)
+        if (name == std::string(kCatalog) + ".tmp" || name == "MANIFEST" || name == "MANIFEST.tmp" ||
+            name.rfind("base.", 0) == 0 || name.rfind("db.log.", 0) == 0 || name.rfind("wal.", 0) == 0)
             return true;
     }
     return false;
@@ -606,63 +606,6 @@ std::vector<uint8_t> DeltaDatabase::EncodeKey(const TableSchema& schema, const I
     return key;
 }
 
-uint64_t DeltaDatabase::HashKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells) const {
-    uint64_t hash = 1469598103934665603ULL;
-    const auto feed = [&](uint8_t byte) {
-        hash ^= byte;
-        hash *= 1099511628211ULL;
-    };
-    const auto feed_le = [&](auto value) {
-        using T = decltype(value);
-        using U = typename std::make_unsigned<T>::type;
-        for (size_t n = 0; n < sizeof(T); ++n)
-            feed(static_cast<uint8_t>(static_cast<U>(value) >> (n * 8)));
-    };
-    for (uint32_t position : index.columns) {
-        const Column& column = schema.columns[position];
-        const Cell& cell = cells[position];
-        feed(static_cast<uint8_t>(column.type));
-        feed(cell.is_null ? 0 : 1);
-        if (cell.is_null)
-            continue;
-        if (column.type == ColumnType::Int)
-            feed_le(cell.integer);
-        else if (column.type == ColumnType::Float) {
-            uint32_t bits;
-            std::memcpy(&bits, &cell.floating, sizeof(bits));
-            feed_le(bits);
-        } else {
-            feed_le(static_cast<uint32_t>(cell.text.size()));
-            for (unsigned char byte : cell.text)
-                feed(byte);
-        }
-    }
-    return hash;
-}
-
-bool DeltaDatabase::SameKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& left,
-                            const std::vector<Cell>& right) const {
-    for (uint32_t position : index.columns) {
-        const Cell& a = left[position];
-        const Cell& b = right[position];
-        if (a.is_null != b.is_null)
-            return false;
-        if (a.is_null)
-            continue;
-        const ColumnType type = schema.columns[position].type;
-        if (type == ColumnType::Int     ? a.integer != b.integer
-            : type == ColumnType::Float ? [&] {
-                  uint32_t x, y;
-                  std::memcpy(&x, &a.floating, 4);
-                  std::memcpy(&y, &b.floating, 4);
-                  return x != y;
-              }()
-                                        : a.text != b.text)
-            return false;
-    }
-    return true;
-}
-
 void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
                                   uint64_t generation) {
     for (size_t n = 0; n < schema.indexes.size(); ++n) {
@@ -857,7 +800,19 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
                 break;
             cells[column] = std::move(value);
         }
-        if (equal > prefix_columns) {
+        const bool range =
+            equal < index.columns.size() &&
+            std::any_of(conditions.begin(), conditions.end(), [&](const auto& condition) {
+                if (!condition || !condition->lhs || !condition->rhs || condition->lhs->type != ast::AstType::Col ||
+                    condition->rhs->type == ast::AstType::Col)
+                    return false;
+                const auto& lhs = static_cast<const ast::Col&>(*condition->lhs);
+                return (lhs.tab_name.empty() || lhs.tab_name == schema.name) &&
+                       lhs.col_name == schema.columns[index.columns[equal]].name &&
+                       (condition->op == ast::SV_OP_GT || condition->op == ast::SV_OP_GE ||
+                        condition->op == ast::SV_OP_LT || condition->op == ast::SV_OP_LE);
+            });
+        if ((equal || range) && (!selected || equal > prefix_columns)) {
             selected = &index;
             prefix_columns = equal;
             selected_cells = cells;
@@ -879,12 +834,44 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
         else if (condition->op == ast::SV_OP_LT || condition->op == ast::SV_OP_LE)
             upper = condition.get();
     }
-    const auto descriptor = sidecars_.find(selected->constraint_id);
-    if (descriptor == sidecars_.end())
-        return {};
-    const std::string path =
-        directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(selected->constraint_id);
     std::vector<epoch_si_poc::RowId> result;
+    EncodedKey first_key = EncodeKey(schema, *selected, cells, prefix_columns);
+    if (lower) {
+        cells[selected->columns[prefix_columns]] =
+            Literal(schema.columns[selected->columns[prefix_columns]], static_cast<const ast::Value&>(*lower->rhs));
+        first_key = EncodeKey(schema, *selected, cells, prefix_columns + 1);
+        if (lower->op == ast::SV_OP_GT)
+            first_key = PrefixSuccessor(std::move(first_key));
+    }
+    EncodedKey last_key = PrefixSuccessor(EncodeKey(schema, *selected, cells, prefix_columns));
+    if (upper) {
+        cells[selected->columns[prefix_columns]] =
+            Literal(schema.columns[selected->columns[prefix_columns]], static_cast<const ast::Value&>(*upper->rhs));
+        last_key = EncodeKey(schema, *selected, cells, prefix_columns + 1);
+        if (upper->op == ast::SV_OP_LE)
+            last_key = PrefixSuccessor(std::move(last_key));
+    }
+    VisitIndexInterval(
+        session, schema, *selected, first_key, last_key,
+        [&](const EncodedKey&, epoch_si_poc::RowId id) { result.push_back(id); }, usable);
+    if (!*usable)
+        return {};
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+void DeltaDatabase::VisitIndexInterval(const DeltaSession& session, const TableSchema& schema, const Index& index,
+                                       const EncodedKey& first_key, const EncodedKey& last_key,
+                                       const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor,
+                                       bool* usable) const {
+    *usable = false;
+    const auto descriptor = sidecars_.find(index.constraint_id);
+    if (descriptor == sidecars_.end())
+        return;
+    std::vector<std::pair<EncodedKey, epoch_si_poc::RowId>> keyed;
+    const std::string path =
+        directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id);
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         const auto read = [&](uint64_t position, SidecarEntry* entry) {
@@ -921,79 +908,87 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
             return std::pair<uint64_t, bool>{first, true};
         };
         bool valid = true;
-        std::vector<uint8_t> first_key = EncodeKey(schema, *selected, cells, prefix_columns);
-        if (lower) {
-            cells[selected->columns[prefix_columns]] =
-                Literal(schema.columns[selected->columns[prefix_columns]], static_cast<const ast::Value&>(*lower->rhs));
-            first_key = EncodeKey(schema, *selected, cells, prefix_columns + 1);
-            if (lower->op == ast::SV_OP_GT)
-                first_key = PrefixSuccessor(std::move(first_key));
-        }
-        std::vector<uint8_t> last_key = PrefixSuccessor(EncodeKey(schema, *selected, cells, prefix_columns));
-        if (upper) {
-            cells[selected->columns[prefix_columns]] =
-                Literal(schema.columns[selected->columns[prefix_columns]], static_cast<const ast::Value&>(*upper->rhs));
-            last_key = EncodeKey(schema, *selected, cells, prefix_columns + 1);
-            if (upper->op == ast::SV_OP_LE)
-                last_key = PrefixSuccessor(std::move(last_key));
-        }
         auto [first, first_ok] = lower_bound(first_key);
         auto [last, last_ok] =
             last_key.empty() ? std::pair<uint64_t, bool>{descriptor->second.count, true} : lower_bound(last_key);
         valid = first_ok && last_ok;
         for (; valid && first < last; ++first) {
             SidecarEntry entry{};
-            valid = read(first, &entry);
+            EncodedKey key;
+            valid = key_at(first, &key, &entry);
             if (valid)
-                result.push_back({schema.id, entry.local_id});
+                keyed.push_back({std::move(key), {schema.id, entry.local_id}});
         }
         close(fd);
         if (!valid)
-            sidecars_.erase(selected->constraint_id);
+            sidecars_.erase(index.constraint_id);
         *usable = valid;
     }
     if (!*usable)
-        return {};
-    for (const auto& [key, ids] : overlay_)
-        if (std::get<0>(key) == schema.id && std::get<1>(key) == selected->constraint_id)
-            for (uint64_t local_id : ids)
-                result.push_back({schema.id, local_id});
-    for (const auto& [key, ids] : session.overlay)
-        if (std::get<0>(key) == schema.id && std::get<1>(key) == selected->constraint_id)
-            for (uint64_t local_id : ids)
-                result.push_back({schema.id, local_id});
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    return result;
+        return;
+    VisitOverlayInterval(session, schema.id, index.constraint_id, first_key, last_key,
+                         [&](const EncodedKey& key, epoch_si_poc::RowId id) { keyed.push_back({key, id}); });
+    std::sort(keyed.begin(), keyed.end());
+    keyed.erase(std::unique(keyed.begin(), keyed.end()), keyed.end());
+    for (const auto& [key, id] : keyed)
+        visitor(key, id);
+}
+
+void DeltaDatabase::VisitOverlayInterval(
+    const DeltaSession& session, epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id,
+    const EncodedKey& first, const EncodedKey& last,
+    const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor) const {
+    last_overlay_nodes_probed_ = 0;
+    last_row_ids_probed_ = 0;
+    const auto append = [&](const auto& overlay) {
+        auto position = overlay.lower_bound({table_id, constraint_id, first});
+        for (; position != overlay.end() && std::get<0>(position->first) == table_id &&
+               std::get<1>(position->first) == constraint_id && (last.empty() || std::get<2>(position->first) < last);
+             ++position) {
+            ++last_overlay_nodes_probed_;
+            last_row_ids_probed_ += position->second.size();
+            for (uint64_t local_id : position->second)
+                visitor(std::get<2>(position->first), {table_id, local_id});
+        }
+    };
+    append(overlay_);
+    append(session.overlay);
 }
 
 template <typename Overlay>
 void DeltaDatabase::AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
                                epoch_si_poc::RowId id, const std::vector<Cell>* previous) {
     for (const Index& index : schema.indexes) {
-        if (previous && SameKey(schema, index, *previous, cells))
-            continue;
         bool has_null = false;
         for (uint32_t column : index.columns)
             has_null = has_null || cells[column].is_null;
-        if (!has_null)
-            AppendOverlay(overlay, {schema.id, index.constraint_id, HashKey(schema, index, cells)}, id.local_id);
+        if (has_null)
+            continue;
+        EncodedKey key = EncodeKey(schema, index, cells);
+        if (!previous || key != EncodeKey(schema, index, *previous))
+            AppendOverlay(overlay, {schema.id, index.constraint_id, std::move(key)}, id.local_id);
     }
 }
 
 void DeltaDatabase::VisitRows(DeltaSession& session, const TableSchema& schema,
                               const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
-                              const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor) {
+                              const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor,
+                              bool* used_index) {
     auto& txn = Txn(session);
     bool usable = false;
     const auto candidates = IndexedCandidates(session, schema, conditions, &usable);
+    if (used_index)
+        *used_index = usable;
+    last_row_reads_probed_ = 0;
     if (!usable) {
         db_.engine().VisitScan(txn, schema.id, visitor);
         return;
     }
-    for (epoch_si_poc::RowId id : candidates)
+    for (epoch_si_poc::RowId id : candidates) {
+        ++last_row_reads_probed_;
         if (auto row = db_.engine().Read(txn, id))
             visitor(id, *row);
+    }
 }
 
 epoch_si_poc::RowImage DeltaDatabase::EncodeRow(const TableSchema& schema, const std::vector<Cell>& cells) const {
@@ -1891,6 +1886,11 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     throw std::runtime_error("unsupported Delta multi-table aggregate");
                 const TableSchema& left_schema = Table(select.tabs[0].table_name);
                 const TableSchema& right_schema = Table(select.tabs[1].table_name);
+                last_parameterized_join_probes_ = 0;
+                last_join_inner_rows_resolved_ = 0;
+                last_join_pairs_rechecked_ = 0;
+                last_join_full_scan_rows_ = 0;
+                last_join_right_rows_visited_ = 0;
                 const auto pos = [](const TableSchema& schema, const std::string& name) {
                     for (size_t i = 0; i < schema.columns.size(); ++i)
                         if (schema.columns[i].name == name)
@@ -2025,90 +2025,212 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 // ponytail: logical RowImage object/payload bound, not exact RSS; add a spill/hash join when too big.
                 std::vector<epoch_si_poc::RowImage> left_rows;
                 size_t left_bytes = 0;
-                VisitRows(session, left_schema, select.conds,
-                          [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
-                              auto left = DecodeRow(left_schema, image);
-                              if (!matches(left_predicates, left, {}))
-                                  return;
-                              size_t image_bytes = sizeof(epoch_si_poc::RowImage);
-                              const auto add_image_bytes = [&](size_t bytes) {
-                                  if (bytes > kMaxJoinMaterializedBytes - image_bytes)
-                                      throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                                  image_bytes += bytes;
-                              };
-                              add_image_bytes(image.bytes.size());
-                              if (image.claims.size() >
-                                  (kMaxJoinMaterializedBytes - image_bytes) / sizeof(epoch_si_poc::ConstraintClaim))
-                                  throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                              image_bytes += image.claims.size() * sizeof(epoch_si_poc::ConstraintClaim);
-                              for (const auto& claim : image.claims)
-                                  add_image_bytes(claim.bytes.size());
-                              if (left_rows.size() == kMaxJoinMaterializedRows ||
-                                  image_bytes > kMaxJoinMaterializedBytes - left_bytes)
-                                  throw std::runtime_error("unsupported Delta join exceeds memory limit");
-                              left_bytes += image_bytes;
-                              left_rows.push_back(image);
-                          });
-                if (projection_query && sink)
-                    sink->begin_query(projection_meta, projection_names);
+                bool left_used_index = false;
+                VisitRows(
+                    session, left_schema, select.conds,
+                    [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
+                        if (!left_used_index)
+                            ++last_join_full_scan_rows_;
+                        auto left = DecodeRow(left_schema, image);
+                        if (!matches(left_predicates, left, {}))
+                            return;
+                        size_t image_bytes = sizeof(epoch_si_poc::RowImage);
+                        const auto add_image_bytes = [&](size_t bytes) {
+                            if (bytes > kMaxJoinMaterializedBytes - image_bytes)
+                                throw std::runtime_error("unsupported Delta join exceeds memory limit");
+                            image_bytes += bytes;
+                        };
+                        add_image_bytes(image.bytes.size());
+                        if (image.claims.size() >
+                            (kMaxJoinMaterializedBytes - image_bytes) / sizeof(epoch_si_poc::ConstraintClaim))
+                            throw std::runtime_error("unsupported Delta join exceeds memory limit");
+                        image_bytes += image.claims.size() * sizeof(epoch_si_poc::ConstraintClaim);
+                        for (const auto& claim : image.claims)
+                            add_image_bytes(claim.bytes.size());
+                        if (left_rows.size() == kMaxJoinMaterializedRows ||
+                            image_bytes > kMaxJoinMaterializedBytes - left_bytes)
+                            throw std::runtime_error("unsupported Delta join exceeds memory limit");
+                        left_bytes += image_bytes;
+                        left_rows.push_back(image);
+                    },
+                    &left_used_index);
                 int64_t count = 0;
                 std::set<std::string> distinct;
-                VisitRows(
-                    session, right_schema, select.conds, [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
-                        const auto right = DecodeRow(right_schema, image);
-                        if (!matches(right_predicates, {}, right))
+                const auto emit_pair = [&](const std::vector<Cell>& left, const std::vector<Cell>& right) {
+                    if (projection_query) {
+                        if (!sink)
                             return;
-                        for (const auto& left_image : left_rows) {
-                            const auto left = DecodeRow(left_schema, left_image);
-                            if (!matches(cross_predicates, left, right))
-                                continue;
-                            if (projection_query) {
-                                if (!sink)
-                                    continue;
-                                std::vector<char> tuple(
-                                    static_cast<size_t>(projection_size + null_bitmap_bytes(projection_meta.size())),
-                                    0);
-                                auto columns = projection_meta;
-                                for (size_t i = 0; i < select.select_items.size(); ++i) {
-                                    const Column* source;
-                                    const Cell* value;
-                                    resolve(static_cast<const ast::Col&>(*select.select_items[i]->expr), left, right,
-                                            source, value);
-                                    if (value->is_null) {
-                                        set_null(tuple.data(), columns[i]);
-                                        continue;
-                                    }
-                                    if (columns[i].type == TYPE_INT)
-                                        write_unaligned<int32_t>(tuple.data() + columns[i].offset, value->integer);
-                                    else if (columns[i].type == TYPE_FLOAT)
-                                        write_float(tuple.data() + columns[i].offset, value->floating);
-                                    else {
-                                        std::memcpy(tuple.data() + columns[i].offset, value->text.data(),
-                                                    value->text.size());
-                                        columns[i].value_length_is_exact = true;
-                                        columns[i].len = static_cast<int>(value->text.size());
-                                    }
-                                }
-                                sink->append_row(columns, tuple.data(), tuple.size());
-                                continue;
-                            }
-                            const Column* value_column;
+                        std::vector<char> tuple(
+                            static_cast<size_t>(projection_size + null_bitmap_bytes(projection_meta.size())), 0);
+                        auto columns = projection_meta;
+                        for (size_t i = 0; i < select.select_items.size(); ++i) {
+                            const Column* source;
                             const Cell* value;
-                            resolve(*aggregate_ptr->col, left, right, value_column, value);
-                            if (value->is_null)
+                            resolve(static_cast<const ast::Col&>(*select.select_items[i]->expr), left, right, source,
+                                    value);
+                            if (value->is_null) {
+                                set_null(tuple.data(), columns[i]);
                                 continue;
-                            if (aggregate_ptr->is_distinct) {
-                                std::string key =
-                                    std::to_string(static_cast<unsigned>(value_column->type)) + ":" +
-                                    (value_column->type == ColumnType::Int     ? std::to_string(value->integer)
-                                     : value_column->type == ColumnType::Float ? std::to_string(value->floating)
-                                                                               : value->text);
-                                if (!distinct.insert(std::move(key)).second)
-                                    continue;
                             }
-                            ++count;
+                            if (columns[i].type == TYPE_INT)
+                                write_unaligned<int32_t>(tuple.data() + columns[i].offset, value->integer);
+                            else if (columns[i].type == TYPE_FLOAT)
+                                write_float(tuple.data() + columns[i].offset, value->floating);
+                            else {
+                                std::memcpy(tuple.data() + columns[i].offset, value->text.data(), value->text.size());
+                                columns[i].value_length_is_exact = true;
+                                columns[i].len = static_cast<int>(value->text.size());
+                            }
                         }
-                    });
+                        sink->append_row(columns, tuple.data(), tuple.size());
+                        return;
+                    }
+                    const Column* value_column;
+                    const Cell* value;
+                    resolve(*aggregate_ptr->col, left, right, value_column, value);
+                    if (value->is_null)
+                        return;
+                    if (aggregate_ptr->is_distinct) {
+                        std::string key = std::to_string(static_cast<unsigned>(value_column->type)) + ":" +
+                                          (value_column->type == ColumnType::Int     ? std::to_string(value->integer)
+                                           : value_column->type == ColumnType::Float ? std::to_string(value->floating)
+                                                                                     : value->text);
+                        if (!distinct.insert(std::move(key)).second)
+                            return;
+                    }
+                    ++count;
+                };
+                struct ProbeKeySource {
+                    bool from_literal = false;
+                    size_t left_pos = 0;
+                    Cell literal;
+                };
+                const Index* probe_index = nullptr;
+                std::vector<ProbeKeySource> probe_sources;
+                for (const Index& index : right_schema.indexes) {
+                    std::vector<ProbeKeySource> sources;
+                    for (uint32_t right_pos : index.columns) {
+                        ProbeKeySource source;
+                        bool found = false;
+                        for (const BoundPredicate& predicate : right_predicates) {
+                            if (predicate.lhs_pos == right_pos && predicate.op == ast::SV_OP_EQ &&
+                                predicate.rhs_side < 0 && !predicate.literal.is_null) {
+                                source.from_literal = true;
+                                source.literal = predicate.literal;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            for (const BoundPredicate& predicate : cross_predicates) {
+                                if (predicate.op != ast::SV_OP_EQ)
+                                    continue;
+                                if (predicate.lhs_side == 1 && predicate.lhs_pos == right_pos &&
+                                    predicate.rhs_side == 0) {
+                                    source.left_pos = predicate.rhs_pos;
+                                    found = true;
+                                    break;
+                                }
+                                if (predicate.rhs_side == 1 && predicate.rhs_pos == right_pos &&
+                                    predicate.lhs_side == 0) {
+                                    source.left_pos = predicate.lhs_pos;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!found) {
+                            sources.clear();
+                            break;
+                        }
+                        sources.push_back(std::move(source));
+                    }
+                    if (sources.size() == index.columns.size() && sidecars_.count(index.constraint_id)) {
+                        probe_index = &index;
+                        probe_sources = std::move(sources);
+                        break;
+                    }
+                }
+                const auto make_probe_key = [&](const std::vector<Cell>& left) -> std::optional<EncodedKey> {
+                    if (!probe_index)
+                        return std::nullopt;
+                    std::vector<Cell> right(right_schema.columns.size());
+                    for (size_t i = 0; i < probe_sources.size(); ++i) {
+                        const Cell& value =
+                            probe_sources[i].from_literal ? probe_sources[i].literal : left[probe_sources[i].left_pos];
+                        if (value.is_null)
+                            return std::nullopt;
+                        right[probe_index->columns[i]] = value;
+                    }
+                    return EncodeKey(right_schema, *probe_index, right);
+                };
+                bool parameterized = probe_index != nullptr;
+                if (parameterized) {
+                    for (const auto& left_image : left_rows) {
+                        const auto left = DecodeRow(left_schema, left_image);
+                        const auto key = make_probe_key(left);
+                        if (!key)
+                            continue;
+                        bool usable = false;
+                        VisitIndexInterval(
+                            session, right_schema, *probe_index, *key, PrefixSuccessor(*key),
+                            [](const EncodedKey&, epoch_si_poc::RowId) {}, &usable);
+                        if (!usable) {
+                            parameterized = false;
+                            break;
+                        }
+                    }
+                }
+                if (projection_query && sink)
+                    sink->begin_query(projection_meta, projection_names);
+                if (parameterized) {
+                    auto& txn = Txn(session);
+                    for (const auto& left_image : left_rows) {
+                        const auto left = DecodeRow(left_schema, left_image);
+                        const auto key = make_probe_key(left);
+                        if (!key)
+                            continue;
+                        ++last_parameterized_join_probes_;
+                        bool usable = false;
+                        VisitIndexInterval(
+                            session, right_schema, *probe_index, *key, PrefixSuccessor(*key),
+                            [&](const EncodedKey& candidate_key, epoch_si_poc::RowId id) {
+                                ++last_join_inner_rows_resolved_;
+                                const auto image = db_.engine().Read(txn, id);
+                                if (!image)
+                                    return;
+                                const auto right = DecodeRow(right_schema, *image);
+                                if (EncodeKey(right_schema, *probe_index, right) != candidate_key ||
+                                    !matches(right_predicates, {}, right))
+                                    return;
+                                ++last_join_pairs_rechecked_;
+                                if (matches(cross_predicates, left, right))
+                                    emit_pair(left, right);
+                            },
+                            &usable);
+                        if (!usable)
+                            throw std::runtime_error("Delta parameterized index became unavailable");
+                    }
+                } else {
+                    bool right_used_index = false;
+                    VisitRows(
+                        session, right_schema, select.conds,
+                        [&](epoch_si_poc::RowId, const epoch_si_poc::RowImage& image) {
+                            ++last_join_right_rows_visited_;
+                            if (!right_used_index)
+                                ++last_join_full_scan_rows_;
+                            const auto right = DecodeRow(right_schema, image);
+                            if (!matches(right_predicates, {}, right))
+                                return;
+                            for (const auto& left_image : left_rows) {
+                                const auto left = DecodeRow(left_schema, left_image);
+                                ++last_join_pairs_rechecked_;
+                                if (matches(cross_predicates, left, right))
+                                    emit_pair(left, right);
+                            }
+                        },
+                        &right_used_index);
+                }
                 if (!projection_query) {
                     Cell value;
                     value.is_null = false;

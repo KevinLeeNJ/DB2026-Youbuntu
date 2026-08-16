@@ -16,6 +16,23 @@ namespace epoch_si_poc {
 namespace {
 
 constexpr TableId kTable = 1;
+constexpr size_t kHeaderBytes = 48;
+constexpr size_t kFooterBytes = 16;
+
+uint32_t Crc32(const uint8_t* data, size_t size) {
+    uint32_t crc = 0xffffffffU;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+    return ~crc;
+}
+
+template <typename T> void WriteLe(std::vector<uint8_t>& bytes, size_t offset, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bytes.at(offset + i) = static_cast<uint8_t>(value >> (8 * i));
+}
 
 BaseImage FileBase() {
     return {{{kTable, 1}, test_row::Make(kTable, "a", 10)}, {{kTable, 2}, test_row::Make(kTable, "b", 20)}};
@@ -89,6 +106,107 @@ TEST(FileWalTest, ReopenPreservesFramesAndUsesRealFdatasync) {
     EXPECT_EQ(reopened.wal_frame_count(), 1U);
     EXPECT_EQ(reopened.wal_transaction_count(), 2U);
     reopened.Abort(view);
+}
+
+TEST(FileWalTest, ReadOnlyCommitsAppendAndSyncInEveryAckWindow) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+    size_t bytes = engine.durable_wal_bytes();
+    size_t writes = engine.wal_write_calls_for_test();
+    size_t syncs = engine.wal_sync_calls_for_test();
+    for (uint64_t expected = 1; expected <= 2; ++expected) {
+        auto read_only = engine.Begin();
+        ASSERT_TRUE(engine.Read(read_only, {kTable, 1}).has_value());
+        const auto result = engine.CommitBatch({&read_only})[0];
+        EXPECT_EQ(result.status, CommitStatus::kCommitted);
+        EXPECT_EQ(result.epoch, expected);
+        EXPECT_EQ(result.commit_seq, expected);
+        EXPECT_GT(engine.durable_wal_bytes(), bytes);
+        EXPECT_EQ(engine.wal_write_calls_for_test(), writes + 1);
+        EXPECT_EQ(engine.wal_sync_calls_for_test(), syncs + 1);
+        bytes = engine.durable_wal_bytes();
+        writes = engine.wal_write_calls_for_test();
+        syncs = engine.wal_sync_calls_for_test();
+    }
+
+    auto reopened = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    EXPECT_EQ(reopened.published_epoch(), 2U);
+    EXPECT_EQ(reopened.wal_frame_count(), 2U);
+    EXPECT_EQ(reopened.wal_transaction_count(), 2U);
+}
+
+TEST(FileWalTest, MixedBatchPersistsReadOnlyTransactionsInOrder) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+    auto first_read = engine.Begin();
+    auto writer = engine.Begin();
+    auto second_read = engine.Begin();
+    engine.PutImage(writer, {kTable, 1}, test_row::Make(kTable, "a", 55));
+    const auto result = engine.CommitBatch({&first_read, &writer, &second_read});
+    ASSERT_EQ(result.size(), 3U);
+    for (size_t i = 0; i < result.size(); ++i) {
+        EXPECT_EQ(result[i].status, CommitStatus::kCommitted);
+        EXPECT_EQ(result[i].epoch, 1U);
+        EXPECT_EQ(result[i].commit_seq, i + 1);
+    }
+    EXPECT_EQ(engine.wal_write_calls_for_test(), 1U);
+    EXPECT_EQ(engine.wal_transaction_count(), 3U);
+
+    auto reopened = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    EXPECT_EQ(reopened.published_epoch(), 1U);
+    EXPECT_EQ(reopened.wal_transaction_count(), 3U);
+    auto view = reopened.Begin();
+    EXPECT_EQ(test_row::Value(*reopened.Read(view, {kTable, 1})), 55);
+    reopened.Abort(view);
+}
+
+TEST(FileWalTest, ZeroOperationFramesRecoverRejectCorruptionAndDiscardTornTail) {
+    EpochSiEngine engine(FileBase());
+    auto read_only = engine.Begin();
+    ASSERT_EQ(engine.CommitBatch({&read_only})[0].status, CommitStatus::kCommitted);
+    const auto frame = engine.recovery_wal_image_for_test();
+    ASSERT_GT(frame.size(), kHeaderBytes + kFooterBytes);
+    auto recovered = EpochSiEngine::Recover(FileBase(), frame);
+    EXPECT_EQ(recovered.published_epoch(), 1U);
+    EXPECT_EQ(recovered.wal_transaction_count(), 1U);
+
+    auto torn = frame;
+    torn.pop_back();
+    auto discarded = EpochSiEngine::Recover(FileBase(), torn);
+    EXPECT_EQ(discarded.published_epoch(), 0U);
+    EXPECT_EQ(discarded.durable_wal_bytes(), 0U);
+
+    auto corrupt = frame;
+    WriteLe<uint32_t>(corrupt, 36, 1); // Claims one mutation absent from the payload.
+    WriteLe<uint32_t>(corrupt, 44, Crc32(corrupt.data(), 44));
+    EXPECT_THROW(EpochSiEngine::Recover(FileBase(), corrupt), std::runtime_error);
+}
+
+TEST(FileWalTest, LegacyV2MutationFrameStillRecovers) {
+    EpochSiEngine engine(FileBase());
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kTable, 1}, test_row::Make(kTable, "a", 66));
+    ASSERT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    auto legacy = engine.recovery_wal_image_for_test();
+    WriteLe<uint32_t>(legacy, 4, 2);
+    WriteLe<uint32_t>(legacy, 44, Crc32(legacy.data(), 44));
+
+    auto recovered = EpochSiEngine::Recover(FileBase(), legacy);
+    auto view = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kTable, 1})), 66);
+    recovered.Abort(view);
+}
+
+TEST(FileWalTest, ReadOnlyAfterSyncCrashRecoversDurableCommit) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+    auto read_only = engine.Begin();
+    engine.SetCrashPointForTest(CrashPoint::kAfterSync);
+    EXPECT_THROW(engine.CommitBatch({&read_only}), SimulatedCrash);
+
+    auto recovered = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    EXPECT_EQ(recovered.published_epoch(), 1U);
+    EXPECT_EQ(recovered.wal_transaction_count(), 1U);
 }
 
 TEST(FileWalTest, TornTailIsTruncatedBeforeNewCommit) {

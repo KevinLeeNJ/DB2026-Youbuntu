@@ -128,6 +128,9 @@ std::string Join(const std::string& directory, const std::string& name) {
     return directory + "/" + name;
 }
 std::string WalName(uint64_t generation) {
+    return "db.log." + std::to_string(generation);
+}
+std::string LegacyWalName(uint64_t generation) {
     return "wal." + std::to_string(generation);
 }
 std::string TableName(TableId table_id, uint64_t generation) {
@@ -194,6 +197,61 @@ void SyncDirectory(const std::string& directory) {
     }
     if (close(fd) != 0)
         ThrowSystemError("close database directory");
+}
+
+class DirectoryFd {
+public:
+    explicit DirectoryFd(const std::string& directory)
+        : fd_(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+        if (fd_ < 0)
+            ThrowSystemError("open database directory");
+    }
+    ~DirectoryFd() {
+        if (fd_ >= 0)
+            close(fd_);
+    }
+    int get() const {
+        return fd_;
+    }
+    void Sync() const {
+        while (fsync(fd_) != 0)
+            if (errno != EINTR)
+                ThrowSystemError("sync database directory");
+    }
+
+private:
+    int fd_;
+};
+
+bool WalEntryExists(int directory_fd, const std::string& name) {
+    struct stat state {};
+    if (fstatat(directory_fd, name.c_str(), &state, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(state.st_mode))
+            throw std::runtime_error("WAL authority must be a regular file");
+        return true;
+    }
+    if (errno == ENOENT)
+        return false;
+    ThrowSystemError("stat WAL entry");
+    return false;
+}
+
+std::string ResolveAndMigrateWal(const DirectoryFd& directory, uint64_t generation) {
+    const std::string current = WalName(generation);
+    const std::string legacy = LegacyWalName(generation);
+    const bool current_exists = WalEntryExists(directory.get(), current);
+    const bool legacy_exists = WalEntryExists(directory.get(), legacy);
+    if (current_exists && legacy_exists)
+        throw std::runtime_error("ambiguous WAL authority");
+    if (!current_exists && !legacy_exists)
+        return current;
+    if (!current_exists) {
+        if (renameat(directory.get(), legacy.c_str(), directory.get(), current.c_str()) != 0)
+            ThrowSystemError("migrate legacy WAL");
+    }
+    // This also completes a prior rename whose directory sync was interrupted.
+    directory.Sync();
+    return current;
 }
 
 void RenameFile(const std::string& from, const std::string& to) {
@@ -309,8 +367,8 @@ void PublishManifest(const std::string& directory, const ManifestState& state, C
     SyncDirectory(directory);
 }
 
-void CreateEmptyWal(const std::string& path) {
-    FileWal wal(path, FileWal::OpenMode::kCreateNew);
+void CreateEmptyWal(int directory_fd, const std::string& name) {
+    FileWal wal(directory_fd, name, FileWal::OpenMode::kCreateNew);
     wal.Sync();
 }
 
@@ -667,9 +725,10 @@ void GarbageCollectTables(const std::string& directory, const std::map<TableId, 
 } // namespace
 
 CheckpointDb::CheckpointDb(std::string directory, uint64_t generation, uint64_t wal_generation, Epoch base_epoch,
-                           std::map<TableId, TableRef> tables, EpochSiEngine engine)
+                           std::map<TableId, TableRef> tables, EpochSiEngine engine, size_t wal_open_directory_syncs)
     : directory_(std::move(directory)), generation_(generation), wal_generation_(wal_generation),
-      base_epoch_(base_epoch), tables_(std::move(tables)), engine_(std::move(engine)) {}
+      base_epoch_(base_epoch), tables_(std::move(tables)), engine_(std::move(engine)),
+      wal_open_directory_syncs_(wal_open_directory_syncs) {}
 
 void CheckpointDb::RequireUsable() const {
     if (poisoned_)
@@ -690,8 +749,9 @@ CheckpointDb CheckpointDb::Create(const std::string& directory, BaseImage initia
         tables.emplace(table_id, writer.impl_->Finish(CheckpointCrashPoint::kNone));
         writer.impl_.reset();
     }
-    CreateEmptyWal(Join(directory, WalName(0)));
-    SyncDirectory(directory);
+    DirectoryFd directory_fd(directory);
+    CreateEmptyWal(directory_fd.get(), WalName(0));
+    directory_fd.Sync();
     ManifestState manifest;
     manifest.tables = std::move(tables);
     PublishManifest(directory, manifest, CheckpointCrashPoint::kNone);
@@ -703,11 +763,13 @@ CheckpointDb CheckpointDb::Open(const std::string& directory) {
     ImmutableTables tables;
     for (const auto& [id, ref] : manifest.tables)
         tables.emplace(id, OpenTable(directory, ref));
-    EpochSiEngine engine = EpochSiEngine::OpenFile(
-        {}, std::move(tables), Join(directory, WalName(manifest.wal_generation)), manifest.wal_base_epoch);
+    DirectoryFd directory_fd(directory);
+    const std::string wal_name = ResolveAndMigrateWal(directory_fd, manifest.wal_generation);
+    EpochSiEngine engine =
+        EpochSiEngine::OpenFileAt({}, std::move(tables), directory_fd.get(), wal_name, manifest.wal_base_epoch);
     GarbageCollectTables(directory, manifest.tables);
     return CheckpointDb(directory, manifest.generation, manifest.wal_generation, manifest.wal_base_epoch,
-                        std::move(manifest.tables), std::move(engine));
+                        std::move(manifest.tables), std::move(engine), 1);
 }
 
 TableBaseWriter CheckpointDb::BeginTableBase(TableId table_id) {
@@ -773,11 +835,19 @@ void CheckpointDb::OfflineCheckpoint() {
         next_refs[table_id] = ref;
         writer.impl_.reset();
     }
-    const std::string next_wal_path = Join(directory_, WalName(next_wal));
-    if (unlink(next_wal_path.c_str()) != 0 && errno != ENOENT)
+    const std::string next_wal_name = WalName(next_wal);
+    const std::string next_legacy_wal_name = LegacyWalName(next_wal);
+    DirectoryFd directory_fd(directory_);
+    const bool current_exists = WalEntryExists(directory_fd.get(), next_wal_name);
+    const bool legacy_exists = WalEntryExists(directory_fd.get(), next_legacy_wal_name);
+    if (current_exists && unlinkat(directory_fd.get(), next_wal_name.c_str(), 0) != 0)
         ThrowSystemError("remove abandoned checkpoint WAL");
-    CreateEmptyWal(next_wal_path);
-    SyncDirectory(directory_);
+    if (legacy_exists && unlinkat(directory_fd.get(), next_legacy_wal_name.c_str(), 0) != 0)
+        ThrowSystemError("remove abandoned checkpoint WAL");
+    if (current_exists || legacy_exists)
+        directory_fd.Sync();
+    CreateEmptyWal(directory_fd.get(), next_wal_name);
+    directory_fd.Sync();
     if (crash_point_ == CheckpointCrashPoint::kAfterWalCreate)
         throw SimulatedCrash();
     ImmutableTables readers;
@@ -785,7 +855,8 @@ void CheckpointDb::OfflineCheckpoint() {
         readers.emplace(id, OpenTable(directory_, ref));
     if (crash_point_ == CheckpointCrashPoint::kBeforeNextEngineOpen)
         throw SimulatedCrash();
-    EpochSiEngine next_engine = EpochSiEngine::OpenFile({}, std::move(readers), next_wal_path, cut);
+    EpochSiEngine next_engine =
+        EpochSiEngine::OpenFileAt({}, std::move(readers), directory_fd.get(), next_wal_name, cut);
     ManifestState next{next_generation, next_wal, cut, next_refs};
     try {
         PublishManifest(directory_, next, crash_point_);

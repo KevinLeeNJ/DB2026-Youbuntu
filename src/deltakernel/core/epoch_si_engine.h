@@ -175,6 +175,8 @@ public:
     static EpochSiEngine OpenFile(BaseImage base, const std::string& wal_path, Epoch base_epoch = 0);
     static EpochSiEngine OpenFile(BaseImage base, ImmutableTables tables, const std::string& wal_path,
                                   Epoch base_epoch = 0);
+    static EpochSiEngine OpenFileAt(BaseImage base, ImmutableTables tables, int directory_fd,
+                                    const std::string& wal_name, Epoch base_epoch = 0);
     static EpochSiEngine CreateFile(BaseImage base, const std::string& wal_path, Epoch base_epoch = 0);
 
     Txn Begin();
@@ -194,6 +196,8 @@ public:
         return published_epoch_;
     }
     size_t durable_wal_bytes() const;
+    size_t wal_write_calls_for_test() const;
+    size_t wal_sync_calls_for_test() const;
     size_t version_count() const {
         return version_count_;
     }

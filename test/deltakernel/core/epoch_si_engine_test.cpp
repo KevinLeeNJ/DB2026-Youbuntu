@@ -325,9 +325,11 @@ TEST(EpochSiEngineTest, PreflightOwnershipEmptyWritesAndMutationValidation) {
     const size_t before = engine.durable_wal_bytes();
     const auto empty = engine.CommitBatch({&txn})[0];
     EXPECT_EQ(empty.status, CommitStatus::kCommitted);
-    EXPECT_EQ(empty.epoch, 0U);
-    EXPECT_EQ(empty.commit_seq, 0U);
-    EXPECT_EQ(engine.durable_wal_bytes(), before);
+    EXPECT_EQ(empty.epoch, 1U);
+    EXPECT_EQ(empty.commit_seq, 1U);
+    EXPECT_GT(engine.durable_wal_bytes(), before);
+    EXPECT_EQ(engine.wal_frame_count(), 1U);
+    EXPECT_EQ(engine.wal_transaction_count(), 1U);
 
     auto aborted_insert = engine.Begin();
     const RowId hole = engine.InsertImage(aborted_insert, kAccounts, test_row::Make(kAccounts, "hole", 1));
@@ -663,7 +665,8 @@ public:
         for (size_t i = 0; i < txns.size(); ++i) {
             RefTxn& txn = *txns[i];
             if (txn.writes.empty()) {
-                result[i] = {CommitStatus::kCommitted, published_, 0};
+                result[i].status = CommitStatus::kCommitted;
+                accepted.push_back(i);
                 continue;
             }
             bool row_conflict = false;

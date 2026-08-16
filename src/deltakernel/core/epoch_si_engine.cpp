@@ -10,7 +10,8 @@ namespace epoch_si_poc {
 namespace {
 
 constexpr uint32_t kFrameMagic = 0x31495345; // ESI1
-constexpr uint32_t kFrameVersion = 2;
+constexpr uint32_t kFrameVersion = 3;
+constexpr uint32_t kLegacyFrameVersion = 2;
 constexpr uint32_t kFooterMagic = 0x454e4f44; // DONE
 constexpr uint32_t kHeaderBytes = 48;
 constexpr uint32_t kFooterBytes = 16;
@@ -120,6 +121,8 @@ std::vector<uint8_t> EpochSiEngine::EncodeFrame(Epoch epoch, const std::vector<T
     if (txns.empty() || txns.size() != commit_seqs.size()) {
         throw std::invalid_argument("WAL frame requires committed transactions");
     }
+    if (txns.size() > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("too many WAL transactions");
     std::vector<uint8_t> out;
     out.reserve(kHeaderBytes + kFooterBytes + txns.size() * kMinTxnBytes);
     PutLe<uint32_t>(out, kFrameMagic);
@@ -299,8 +302,8 @@ EpochSiEngine EpochSiEngine::Recover(BaseImage base, ImmutableTables tables, con
         const uint32_t operation_count = GetLe<uint32_t>(wal_image, pos, frame_start + kHeaderBytes);
         const uint32_t payload_bytes = GetLe<uint32_t>(wal_image, pos, frame_start + kHeaderBytes);
         const uint32_t header_crc = GetLe<uint32_t>(wal_image, pos, frame_start + kHeaderBytes);
-        if (magic != kFrameMagic || version != kFrameVersion || header_bytes != kHeaderBytes ||
-            header_crc != Crc32(wal_image.data() + frame_start, kHeaderCrcOffset)) {
+        if (magic != kFrameMagic || (version != kFrameVersion && version != kLegacyFrameVersion) ||
+            header_bytes != kHeaderBytes || header_crc != Crc32(wal_image.data() + frame_start, kHeaderCrcOffset)) {
             throw std::runtime_error("corrupt WAL frame header");
         }
         if (frame_bytes < kHeaderBytes + kFooterBytes || frame_bytes > kMaxFrameBytes ||
@@ -325,8 +328,9 @@ EpochSiEngine EpochSiEngine::Recover(BaseImage base, ImmutableTables tables, con
         }
         const uint64_t minimum_payload =
             static_cast<uint64_t>(txn_count) * kMinTxnBytes + static_cast<uint64_t>(operation_count) * kMinOpBytes;
-        if (txn_count == 0 || txn_count > operation_count || txn_count > payload_bytes / kMinTxnBytes ||
-            operation_count > payload_bytes / kMinOpBytes || minimum_payload > payload_bytes) {
+        if (txn_count == 0 || (version == kLegacyFrameVersion && txn_count > operation_count) ||
+            txn_count > payload_bytes / kMinTxnBytes || operation_count > payload_bytes / kMinOpBytes ||
+            minimum_payload > payload_bytes) {
             throw std::runtime_error("impossible WAL counts");
         }
         if (engine.published_epoch_ == std::numeric_limits<Epoch>::max() || epoch != engine.published_epoch_ + 1) {
@@ -351,7 +355,8 @@ EpochSiEngine EpochSiEngine::Recover(BaseImage base, ImmutableTables tables, con
             }
             const uint64_t seq = GetLe<uint64_t>(wal_image, payload_pos, footer_start);
             const uint32_t op_count = GetLe<uint32_t>(wal_image, payload_pos, footer_start);
-            if (seq != expected_seq || op_count == 0 || op_count > (footer_start - payload_pos) / kMinOpBytes) {
+            if (seq != expected_seq || (version == kLegacyFrameVersion && op_count == 0) ||
+                op_count > (footer_start - payload_pos) / kMinOpBytes) {
                 throw std::runtime_error("invalid WAL transaction");
             }
             recovered_txns.emplace_back();
@@ -422,6 +427,21 @@ EpochSiEngine EpochSiEngine::OpenFile(BaseImage base, ImmutableTables tables, co
     return engine;
 }
 
+EpochSiEngine EpochSiEngine::OpenFileAt(BaseImage base, ImmutableTables tables, int directory_fd,
+                                        const std::string& wal_name, Epoch base_epoch) {
+    auto file = std::make_unique<FileWal>(directory_fd, wal_name, FileWal::OpenMode::kExisting);
+    const std::vector<uint8_t> image = file->ReadAll();
+    EpochSiEngine engine = Recover(std::move(base), std::move(tables), image, base_epoch);
+    const size_t intact_bytes = engine.recovery_wal_image_.size();
+    if (intact_bytes != image.size()) {
+        file->TruncateAndSync(intact_bytes);
+    }
+    engine.volatile_wal_.clear();
+    engine.recovery_wal_image_.clear();
+    engine.file_wal_ = std::move(file);
+    return engine;
+}
+
 EpochSiEngine EpochSiEngine::CreateFile(BaseImage base, const std::string& wal_path, Epoch base_epoch) {
     auto file = std::make_unique<FileWal>(wal_path, FileWal::OpenMode::kCreateNew);
     file->Sync();
@@ -432,6 +452,14 @@ EpochSiEngine EpochSiEngine::CreateFile(BaseImage base, const std::string& wal_p
 
 size_t EpochSiEngine::durable_wal_bytes() const {
     return file_wal_ ? file_wal_->size() : recovery_wal_image_.size();
+}
+
+size_t EpochSiEngine::wal_write_calls_for_test() const {
+    return file_wal_ ? file_wal_->write_calls_for_test() : 0;
+}
+
+size_t EpochSiEngine::wal_sync_calls_for_test() const {
+    return file_wal_ ? file_wal_->sync_calls_for_test() : 0;
 }
 
 EpochSiEngine::Txn EpochSiEngine::Begin() {
@@ -934,7 +962,8 @@ std::vector<CommitResult> EpochSiEngine::CommitBatch(const std::vector<Txn*>& tx
     for (size_t index = 0; index < txns.size(); ++index) {
         Txn* txn = txns[index];
         if (txn->writes_.empty()) {
-            results[index] = {CommitStatus::kCommitted, published_epoch_, 0};
+            results[index].status = CommitStatus::kCommitted;
+            accepted.push_back(txn);
             continue;
         }
         const CommitStatus status = Certify(*txn, batch_rows, batch_claims);
@@ -944,9 +973,8 @@ std::vector<CommitResult> EpochSiEngine::CommitBatch(const std::vector<Txn*>& tx
         }
     }
     if (accepted.empty()) {
-        for (Txn* txn : txns) {
+        for (Txn* txn : txns)
             txn->Finish();
-        }
         return results;
     }
     if (published_epoch_ == std::numeric_limits<Epoch>::max()) {
@@ -964,7 +992,7 @@ std::vector<CommitResult> EpochSiEngine::CommitBatch(const std::vector<Txn*>& tx
     accepted_seqs.reserve(accepted.size());
     size_t accepted_index = 0;
     for (size_t index = 0; index < txns.size(); ++index) {
-        if (results[index].status == CommitStatus::kCommitted && !txns[index]->writes_.empty()) {
+        if (results[index].status == CommitStatus::kCommitted) {
             const uint64_t seq = next_commit_seq_ + accepted_index++;
             results[index] = {CommitStatus::kCommitted, epoch, seq};
             accepted_seqs.push_back(seq);

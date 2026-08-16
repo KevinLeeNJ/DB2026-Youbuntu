@@ -506,6 +506,127 @@ TEST(DeltaDatabaseTest, MultiTableCustomerWarehouseProjection) {
     ASSERT_EQ(result.rows, (std::vector<std::vector<std::string>>{{"smith", "north"}}));
 }
 
+TEST(DeltaDatabaseTest, ParameterizedJoinBoundsStockLevelShapedInnerReads) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table facts(g int, b int, seq int, item int);");
+    RunSql(*db, session, "create table dimensions(g int, item int, quantity int);");
+    RunSql(*db, session, "insert into facts values(0, 0, -1, -1);");
+    RunSql(*db, session, "insert into dimensions values(0, -1, 99);");
+    RunSql(*db, session, "create index facts_gbs on facts(g, b, seq);");
+    RunSql(*db, session, "create index dimensions_gi on dimensions(g, item);");
+    RunSql(*db, session, "begin;");
+    for (int item = 0; item < 10000; ++item)
+        RunSql(*db, session, ("insert into dimensions values(1, " + std::to_string(item) + ", 1);").c_str());
+    for (int item = 5000; item < 5200; ++item)
+        RunSql(*db, session,
+               ("insert into facts values(1, 2, " + std::to_string(item - 5000) + ", " + std::to_string(item) + ");")
+                   .c_str());
+    RunSql(*db, session, "commit;");
+
+    EXPECT_EQ(Query(*db, session,
+                    "select count(distinct facts.item) from facts, dimensions where facts.g = 1 and facts.b = 2 "
+                    "and facts.seq >= 0 and facts.seq < 200 and dimensions.g = 1 and dimensions.item = facts.item "
+                    "and dimensions.quantity < 2;")
+                  .rows,
+              (std::vector<std::vector<std::string>>{{"200"}}));
+    EXPECT_EQ(db->JoinProbeCensusForTest(), (std::array<size_t, 5>{200, 200, 200, 0, 0}));
+}
+
+TEST(DeltaDatabaseTest, ParameterizedJoinPreservesDuplicateOuterAndNonUniqueInnerRows) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table sources(k int);");
+    RunSql(*db, session, "create table targets(k int, v int);");
+    RunSql(*db, session, "insert into targets values(-1, -1);");
+    RunSql(*db, session, "create index targets_k on targets(k);");
+    RunSql(*db, session, "insert into sources values(4);");
+    RunSql(*db, session, "insert into sources values(4);");
+    RunSql(*db, session, "insert into sources values(9);");
+    RunSql(*db, session, "insert into targets values(4, 10);");
+    RunSql(*db, session, "insert into targets values(4, 11);");
+
+    EXPECT_EQ(Query(*db, session, "select targets.v from sources, targets where sources.k = targets.k;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}, {"11"}, {"10"}, {"11"}}));
+    EXPECT_EQ(db->JoinProbeCensusForTest(), (std::array<size_t, 5>{3, 4, 4, 3, 0}));
+    EXPECT_TRUE(
+        Query(*db, session, "select targets.v from sources, targets where sources.k = targets.k and sources.k = 9;")
+            .rows.empty());
+    EXPECT_EQ(db->JoinProbeCensusForTest(), (std::array<size_t, 5>{1, 0, 0, 3, 0}));
+}
+
+TEST(DeltaDatabaseTest, ParameterizedJoinBuildsTypedCompositeKeyFromLiteralAndOuterValues) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table sources(i int, f float, label char(8));");
+    RunSql(*db, session, "create table targets(tag char(8), f float, i int, v int);");
+    RunSql(*db, session, "insert into targets values('seed', -99.0, -1, -1);");
+    RunSql(*db, session, "create index targets_tfi on targets(tag, f, i);");
+    RunSql(*db, session, "insert into sources values(1, -2.5, 'low');");
+    RunSql(*db, session, "insert into sources values(2, 0.0, 'zero');");
+    RunSql(*db, session, "insert into targets values('bucket', -2.5, 1, 10);");
+    RunSql(*db, session, "insert into targets values('bucket', -0.0, 2, 20);");
+    RunSql(*db, session, "insert into targets values('other', -2.5, 1, 99);");
+
+    EXPECT_EQ(Query(*db, session,
+                    "select sources.label, targets.v from sources, targets where targets.tag = 'bucket' and "
+                    "sources.f = targets.f and targets.i = sources.i;")
+                  .rows,
+              (std::vector<std::vector<std::string>>{{"low", "10"}, {"zero", "20"}}));
+    EXPECT_EQ(db->JoinProbeCensusForTest(), (std::array<size_t, 5>{2, 2, 2, 2, 0}));
+}
+
+TEST(DeltaDatabaseTest, ParameterizedJoinRechecksSnapshotAndPrivateKeyMoves) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_snapshot, updater, fresh, local;
+    RunSql(*db, setup, "create table sources(k int);");
+    RunSql(*db, setup, "create table targets(k int, v int);");
+    RunSql(*db, setup, "insert into targets values(0, 0);");
+    RunSql(*db, setup, "create index targets_k on targets(k);");
+    RunSql(*db, setup, "insert into sources values(1);");
+    RunSql(*db, setup, "insert into sources values(2);");
+    RunSql(*db, setup, "insert into sources values(3);");
+    RunSql(*db, setup, "insert into targets values(1, 9);");
+    RunSql(*db, old_snapshot, "begin;");
+    RunSql(*db, updater, "update targets set k = 2 where k = 1;");
+
+    EXPECT_EQ(Query(*db, old_snapshot, "select sources.k from sources, targets where sources.k = targets.k;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_EQ(Query(*db, fresh, "select sources.k from sources, targets where sources.k = targets.k;").rows,
+              (std::vector<std::vector<std::string>>{{"2"}}));
+    RunSql(*db, local, "begin;");
+    RunSql(*db, local, "update targets set k = 3 where k = 2;");
+    EXPECT_EQ(Query(*db, local, "select sources.k from sources, targets where sources.k = targets.k;").rows,
+              (std::vector<std::vector<std::string>>{{"3"}}));
+    RunSql(*db, local, "rollback;");
+    EXPECT_EQ(Query(*db, fresh, "select sources.k from sources, targets where sources.k = targets.k;").rows,
+              (std::vector<std::vector<std::string>>{{"2"}}));
+    RunSql(*db, old_snapshot, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, ParameterizedJoinFallsBackWhenFullInnerKeyIsNotProven) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table sources(k int);");
+    RunSql(*db, session, "create table targets(part int, k int);");
+    RunSql(*db, session, "insert into targets values(99, -1);");
+    RunSql(*db, session, "create index targets_pk on targets(part, k);");
+    RunSql(*db, session, "insert into sources values(1);");
+    RunSql(*db, session, "insert into sources values(2);");
+    RunSql(*db, session, "insert into targets values(7, 1);");
+    RunSql(*db, session, "insert into targets values(8, 2);");
+    RunSql(*db, session, "insert into targets values(9, 3);");
+
+    EXPECT_EQ(Query(*db, session, "select sources.k from sources, targets where targets.k = sources.k;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}, {"2"}}));
+    EXPECT_EQ(db->JoinProbeCensusForTest(), (std::array<size_t, 5>{0, 0, 8, 6, 4}));
+}
+
 TEST(DeltaDatabaseTest, GroupByCountAndMax) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
@@ -555,13 +676,17 @@ TEST(DeltaDatabaseTest, DeltaTracesNeverFallBackToLegacy) {
     EXPECT_TRUE(deltakernel::DeltaDatabase::IsDeltaDirectory(truncated.path()));
     EXPECT_THROW(deltakernel::DeltaDatabase::Open(truncated.path()), std::runtime_error);
 
-    TempDelta legacy_shape;
-    std::ofstream(legacy_shape.path() + "/MANIFEST");
-    EXPECT_FALSE(deltakernel::DeltaDatabase::IsDeltaDirectory(legacy_shape.path()));
-    std::ofstream(legacy_shape.path() + "/DELTA_CATALOG");
-    EXPECT_FALSE(deltakernel::DeltaDatabase::IsDeltaDirectory(legacy_shape.path()));
-    std::ofstream(legacy_shape.path() + "/wal.0");
-    EXPECT_TRUE(deltakernel::DeltaDatabase::IsDeltaDirectory(legacy_shape.path()));
+    TempDelta manifest_only;
+    std::ofstream(manifest_only.path() + "/MANIFEST");
+    EXPECT_TRUE(deltakernel::DeltaDatabase::IsDeltaDirectory(manifest_only.path()));
+
+    TempDelta compliant_wal;
+    std::ofstream(compliant_wal.path() + "/db.log.0");
+    EXPECT_TRUE(deltakernel::DeltaDatabase::IsDeltaDirectory(compliant_wal.path()));
+
+    TempDelta legacy_wal;
+    std::ofstream(legacy_wal.path() + "/wal.0");
+    EXPECT_TRUE(deltakernel::DeltaDatabase::IsDeltaDirectory(legacy_wal.path()));
 
     TempDelta catalog_only;
     std::ofstream(catalog_only.path() + "/DELTA_CATALOG");
@@ -971,6 +1096,123 @@ TEST(DeltaDatabaseTest, IndexedTransactionOverlayPublishesOnlyOnCommit) {
     EXPECT_TRUE(Query(*db, reader, "select v from t where k = 7;").rows.empty());
     RunSql(*db, writer, "insert into t values(7, 2);");
     EXPECT_EQ(Query(*db, reader, "select v from t where k = 7;").rows, (std::vector<std::vector<std::string>>{{"2"}}));
+}
+
+TEST(DeltaDatabaseTest, OrderedOverlayEqualityProbeIsBounded) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession load, local;
+    RunSql(*db, load, "create table t(k int, v int);");
+    RunSql(*db, load, "insert into t values(-1, -1);");
+    RunSql(*db, load, "create index t_k on t(k);");
+    RunSql(*db, load, "begin;");
+    for (int key = 0; key < 10000; ++key)
+        RunSql(*db, load, ("insert into t values(" + std::to_string(key) + ", " + std::to_string(key) + ");").c_str());
+    RunSql(*db, load, "commit;");
+    EXPECT_EQ(Query(*db, load, "select v from t where k = 5000;").rows,
+              (std::vector<std::vector<std::string>>{{"5000"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{1, 1, 1}));
+
+    RunSql(*db, local, "begin;");
+    for (int key = 10000; key < 11024; ++key)
+        RunSql(*db, local, ("insert into t values(" + std::to_string(key) + ", " + std::to_string(key) + ");").c_str());
+    EXPECT_EQ(Query(*db, local, "select v from t where k = 10512;").rows,
+              (std::vector<std::vector<std::string>>{{"10512"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{1, 1, 1}));
+    RunSql(*db, local, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedOverlayPrefixRangeProbeIsBounded) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession committed, local;
+    RunSql(*db, committed, "create table t(a int, b int, v int);");
+    RunSql(*db, committed, "insert into t values(-1, -1, -1);");
+    RunSql(*db, committed, "create index t_ab on t(a, b);");
+    RunSql(*db, committed, "begin;");
+    for (int key = 0; key < 100; ++key)
+        RunSql(*db, committed,
+               ("insert into t values(1, " + std::to_string(key) + ", " + std::to_string(key) + ");").c_str());
+    RunSql(*db, committed, "insert into t values(7, 10, 10);");
+    RunSql(*db, committed, "insert into t values(7, 11, 11);");
+    RunSql(*db, committed, "insert into t values(7, 12, 12);");
+    RunSql(*db, committed, "commit;");
+    RunSql(*db, local, "begin;");
+    RunSql(*db, local, "insert into t values(7, 11, 111);");
+    EXPECT_EQ(Query(*db, local, "select v from t where a = 7 and b >= 10 and b < 13;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}, {"11"}, {"12"}, {"111"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{4, 4, 4}));
+    RunSql(*db, local, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedOverlayKeyMoveRespectsOldNewAndPrivateSnapshots) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_snapshot, updater, fresh, local, deleter;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 9);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, old_snapshot, "begin;");
+    RunSql(*db, updater, "update t set k = 2 where k = 1;");
+    EXPECT_EQ(Query(*db, old_snapshot, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"9"}}));
+    EXPECT_TRUE(Query(*db, old_snapshot, "select v from t where k = 2;").rows.empty());
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 1;").rows.empty());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"9"}}));
+    RunSql(*db, local, "begin;");
+    RunSql(*db, local, "update t set k = 3 where k = 2;");
+    EXPECT_TRUE(Query(*db, local, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, local, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"9"}}));
+    RunSql(*db, local, "rollback;");
+    RunSql(*db, deleter, "delete from t where k = 2;");
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, old_snapshot, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"9"}}));
+    RunSql(*db, old_snapshot, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedOverlayCodecMatchesSqlOrdering) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(i int, f float, c char(8));");
+    RunSql(*db, session, "insert into t values(-99, -99.0, 'seed');");
+    RunSql(*db, session, "create index t_i on t(i);");
+    RunSql(*db, session, "create index t_f on t(f);");
+    RunSql(*db, session, "create index t_c on t(c);");
+    RunSql(*db, session, "insert into t values(-2147483648, -2.0, '');");
+    RunSql(*db, session, "insert into t values(-1, -0.0, 'a');");
+    RunSql(*db, session, "insert into t values(0, 0.0, 'aa');");
+    RunSql(*db, session, "insert into t values(2147483647, 2.0, 'b');");
+    EXPECT_EQ(Query(*db, session, "select i from t where i >= -1 and i <= 0;").rows,
+              (std::vector<std::vector<std::string>>{{"-1"}, {"0"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{2, 2, 2}));
+    EXPECT_EQ(Query(*db, session, "select i from t where f = 0.0;").rows,
+              (std::vector<std::vector<std::string>>{{"-1"}, {"0"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{2, 2, 2}));
+    EXPECT_EQ(Query(*db, session, "select i from t where c >= 'a' and c < 'b';").rows,
+              (std::vector<std::vector<std::string>>{{"-1"}, {"0"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{2, 2, 2}));
+}
+
+TEST(DeltaDatabaseTest, OrderedOverlaySurvivesWalReopenAndCheckpointFold) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "insert into t values(-1, -1);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    RunSql(*db, session, "insert into t values(4, 40);");
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"40"}}));
+    db->Checkpoint();
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"40"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(), (std::array<size_t, 3>{0, 0, 1}));
 }
 
 TEST(DeltaDatabaseTest, OpenRebuildsMissingSidecarOnce) {

@@ -85,10 +85,13 @@ public:
     size_t immutable_index_bytes() const {
         return engine_.immutable_index_bytes();
     }
+    size_t wal_open_directory_syncs_for_test() const {
+        return wal_open_directory_syncs_;
+    }
 
 private:
     CheckpointDb(std::string directory, uint64_t generation, uint64_t wal_generation, Epoch base_epoch,
-                 std::map<TableId, TableRef> tables, EpochSiEngine engine);
+                 std::map<TableId, TableRef> tables, EpochSiEngine engine, size_t wal_open_directory_syncs);
     void RequireUsable() const;
 
     std::string directory_;
@@ -97,6 +100,7 @@ private:
     Epoch base_epoch_;
     std::map<TableId, TableRef> tables_;
     EpochSiEngine engine_;
+    size_t wal_open_directory_syncs_;
     CheckpointCrashPoint crash_point_ = CheckpointCrashPoint::kNone;
     bool poisoned_ = false;
 };

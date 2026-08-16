@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
@@ -34,7 +35,8 @@ public:
     explicit DeltaTransactionAbort(const std::string& message) : std::runtime_error(message) {}
 };
 
-using DeltaOverlayKey = std::tuple<epoch_si_poc::TableId, epoch_si_poc::ConstraintId, uint64_t>;
+using EncodedKey = std::vector<uint8_t>;
+using DeltaOverlayKey = std::tuple<epoch_si_poc::TableId, epoch_si_poc::ConstraintId, EncodedKey>;
 using DeltaOverlay = std::map<DeltaOverlayKey, std::vector<uint64_t>>;
 using CommittedOverlay = std::multimap<DeltaOverlayKey, std::vector<uint64_t>>;
 
@@ -82,6 +84,13 @@ public:
     }
     size_t WalFrameCountForTest() const;
     size_t CommitQueueDepthForTest() const;
+    std::array<size_t, 3> IndexProbeCensusForTest() const {
+        return {last_overlay_nodes_probed_, last_row_ids_probed_, last_row_reads_probed_};
+    }
+    std::array<size_t, 5> JoinProbeCensusForTest() const {
+        return {last_parameterized_join_probes_, last_join_inner_rows_resolved_, last_join_pairs_rechecked_,
+                last_join_full_scan_rows_, last_join_right_rows_visited_};
+    }
     size_t SidecarValidationCountForTest() const {
         return sidecar_validation_count_;
     }
@@ -161,9 +170,6 @@ private:
                    QueryResultSink* sink) const;
     void EmitTables(QueryResultSink* sink) const;
     void LoadCsv(const ast::LoadStmt& load, DeltaSession& session);
-    uint64_t HashKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells) const;
-    bool SameKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& left,
-                 const std::vector<Cell>& right) const;
     void BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
                        uint64_t generation);
     bool ValidateSidecar(const TableSchema& schema, const Index& index);
@@ -172,12 +178,23 @@ private:
     std::vector<epoch_si_poc::RowId> IndexedCandidates(const DeltaSession& session, const TableSchema& schema,
                                                        const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                                                        bool* usable) const;
+    // Emits a forward-ordered, duplicate-free (encoded key, row id) union of the immutable sidecar and overlays.
+    // An ordered/early-stop consumer must Read its snapshot/private row and require the visible row's EncodeKey to
+    // equal the candidate key before treating the ordering as authoritative: overlay entries are add-only.
+    void VisitIndexInterval(const DeltaSession& session, const TableSchema& schema, const Index& index,
+                            const EncodedKey& first, const EncodedKey& last,
+                            const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor,
+                            bool* usable) const;
+    void VisitOverlayInterval(const DeltaSession& session, epoch_si_poc::TableId table_id,
+                              epoch_si_poc::ConstraintId constraint_id, const EncodedKey& first, const EncodedKey& last,
+                              const std::function<void(const EncodedKey&, epoch_si_poc::RowId)>& visitor) const;
     template <typename Overlay>
     void AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells, epoch_si_poc::RowId id,
                     const std::vector<Cell>* previous = nullptr);
     void VisitRows(DeltaSession& session, const TableSchema& schema,
                    const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
-                   const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor);
+                   const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor,
+                   bool* used_index = nullptr);
 
     std::string directory_;
     epoch_si_poc::CheckpointDb db_;
@@ -197,6 +214,14 @@ private:
     mutable std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> sidecars_;
     CommittedOverlay overlay_;
     size_t sidecar_validation_count_ = 0;
+    mutable size_t last_overlay_nodes_probed_ = 0;
+    mutable size_t last_row_ids_probed_ = 0;
+    mutable size_t last_row_reads_probed_ = 0;
+    size_t last_parameterized_join_probes_ = 0;
+    size_t last_join_inner_rows_resolved_ = 0;
+    size_t last_join_pairs_rechecked_ = 0;
+    size_t last_join_full_scan_rows_ = 0;
+    size_t last_join_right_rows_visited_ = 0;
     std::shared_mutex execution_gate_;
     mutable std::mutex commit_mutex_;
     std::deque<std::shared_ptr<CommitTicket>> commit_queue_;
