@@ -20,6 +20,12 @@ See the Mulan PSL v2 for more details. */
 
 #include "executor_abstract.h"
 
+/**
+ * @brief 执行 UNION、UNION ALL、INTERSECT 和 EXCEPT 集合操作。
+ *
+ * 算子先把各分支转换到统一的输出列布局，再按集合操作逐步合并；集合键
+ * 同时包含记录字节和 NULL 标记，以保持 SQL 集合语义中的值/NULL 区分。
+ */
 class UnionExecutor : public AbstractExecutor {
 private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
@@ -32,10 +38,26 @@ private:
     size_t cursor_ = 0;
     bool materialized_ = false;
 
+    /**
+     * @brief 读取定长字符串字段并去除尾部零填充。
+     * @param data 字段首地址。
+     * @param len 字段物理长度。
+     * @return 字符串内容。
+     */
     static std::string read_string_cell(const char* data, int len) {
         return std::string(data, strnlen(data, static_cast<size_t>(len)));
     }
 
+    /**
+     * @brief 将分支字段转换并复制到统一输出字段。
+     * @param dst 目标字段首地址。
+     * @param dst_col 目标列元数据。
+     * @param src 源字段首地址。
+     * @param src_col 源列元数据。
+     *
+     * 浮点目标支持 int 到 double 的提升；字符串/日期按目标列宽清零后复制，
+     * 其他兼容类型直接复制目标字段宽度。
+     */
     static void copy_cell(char* dst, const ColMeta& dst_col, const char* src, const ColMeta& src_col) {
         if (dst_col.type == TYPE_FLOAT) {
             double value = src_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(src))
@@ -58,6 +80,12 @@ private:
         std::memcpy(dst, src, static_cast<size_t>(dst_col.len));
     }
 
+    /**
+     * @brief 将一个分支记录转换到 UNION 输出布局。
+     * @param src_rec 分支记录。
+     * @param src_cols 分支列元数据。
+     * @return 按本节点列布局构造的新记录。
+     */
     RmRecord convert_record(const RmRecord& src_rec, const std::vector<ColMeta>& src_cols) const {
         RmRecord dst_rec(static_cast<int>(len_));
         for (size_t i = 0; i < cols_.size(); ++i) {
@@ -68,6 +96,12 @@ private:
         return dst_rec;
     }
 
+    /**
+     * @brief 构造集合操作使用的记录键。
+     * @param record 已转换到统一布局的记录。
+     * @param nulls 记录的 NULL 标记。
+     * @return 包含记录字节和 NULL 状态的二进制键。
+     */
     static std::string make_key(const RmRecord& record, const std::vector<bool>& nulls) {
         std::string key(record.data, static_cast<size_t>(record.size));
         for (bool is_null : nulls) {
@@ -76,6 +110,12 @@ private:
         return key;
     }
 
+    /**
+     * @brief 物化所有分支并执行集合合并。
+     *
+     * 先分别读取和类型转换各分支；UNION 根据 UNION ALL 决定是否去重，
+     * INTERSECT/EXCEPT 则先分别去重，再利用右侧键集合筛选左侧结果。
+     */
     void materialize() {
         tuples_.clear();
         tuple_nulls_.clear();
@@ -98,6 +138,7 @@ private:
             return;
         }
 
+        // 对每一步集合运算使用的输入先去重，保证 INTERSECT/EXCEPT 的集合语义。
         auto deduplicate = [&](std::vector<RmRecord> tuples, std::vector<std::vector<bool>> nulls) {
             std::unordered_set<std::string> seen;
             std::vector<RmRecord> unique_tuples;
@@ -119,6 +160,7 @@ private:
                 op = operators_[branch_idx - 1];
             }
             if (op == QuerySetOperator::UNION) {
+                // UNION ALL 保留拼接结果；普通 UNION 在每次合并后去重。
                 bool keep_duplicates = branch_idx - 1 < union_all_.size() && union_all_[branch_idx - 1];
                 for (auto& tuple : branch_tuples[branch_idx]) {
                     tuples_.push_back(std::move(tuple));
@@ -134,6 +176,7 @@ private:
                 continue;
             }
 
+            // INTERSECT/EXCEPT 都以去重后的左、右集合为输入。
             auto left = deduplicate(std::move(tuples_), std::move(tuple_nulls_));
             auto right = deduplicate(std::move(branch_tuples[branch_idx]), std::move(branch_nulls[branch_idx]));
             std::unordered_set<std::string> right_keys;
@@ -153,6 +196,13 @@ private:
     }
 
 public:
+    /**
+     * @brief 创建集合操作执行器。
+     * @param branches 各集合分支执行器，顺序与集合操作对应。
+     * @param cols 统一输出列元数据。
+     * @param union_all 每个 UNION 是否保留重复项。
+     * @param operators 分支之间的集合操作类型。
+     */
     UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols,
                   std::vector<bool> union_all = {}, std::vector<QuerySetOperator> operators = {})
         : branches_(std::move(branches)), cols_(std::move(cols)), union_all_(std::move(union_all)),
@@ -162,6 +212,9 @@ public:
         }
     }
 
+    /**
+     * @brief 首次调用时物化集合结果并重置输出游标。
+     */
     void beginTuple() override {
         if (!materialized_) {
             materialize();
@@ -169,16 +222,27 @@ public:
         cursor_ = 0;
     }
 
+    /**
+     * @brief 推进集合结果游标。
+     */
     void nextTuple() override {
         if (!is_end()) {
             ++cursor_;
         }
     }
 
+    /**
+     * @brief 判断集合结果是否耗尽。
+     * @return 游标超出物化结果时返回 true。
+     */
     bool is_end() const override {
         return cursor_ >= tuples_.size();
     }
 
+    /**
+     * @brief 返回当前集合结果记录副本。
+     * @return 当前记录副本；结果结束时返回 nullptr。
+     */
     std::unique_ptr<RmRecord> Next() override {
         if (is_end()) {
             return nullptr;
@@ -186,27 +250,53 @@ public:
         return std::make_unique<RmRecord>(tuples_[cursor_]);
     }
 
+    /**
+     * @brief 返回当前集合结果的 NULL 标记。
+     * @return 当前记录标记；执行结束时返回空数组引用。
+     */
     const std::vector<bool>& nulls() const override {
         static const std::vector<bool> no_nulls;
         return is_end() ? no_nulls : tuple_nulls_[cursor_];
     }
 
+    /**
+     * @brief 返回集合节点的抽象 RID。
+     * @return 抽象记录号引用。
+     */
     Rid& rid() override {
         return _abstract_rid;
     }
 
+    /**
+     * @brief 返回集合输出列元数据。
+     * @return 输出列元数据引用。
+     */
     const std::vector<ColMeta>& cols() const override {
         return cols_;
     }
 
+    /**
+     * @brief 返回集合输出元组长度。
+     * @return 输出字段长度总和。
+     */
     size_t tupleLen() const override {
         return len_;
     }
 
+    /**
+     * @brief 返回执行器类型名称。
+     * @return "UnionExecutor"。
+     */
     std::string getType() override {
         return "UnionExecutor";
     }
 
+    /**
+     * @brief 查找集合输出列的元数据及偏移。
+     * @param target 目标列。
+     * @return 匹配列元数据。
+     * @throws ColumnNotFoundError 找不到目标列时抛出。
+     */
     ColMeta get_col_offset(const TabCol& target) override {
         auto pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
             if (!target.tab_name.empty()) {

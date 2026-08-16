@@ -12,7 +12,17 @@ See the Mulan PSL v2 for more details. */
 
 #include "executor_index_scan.h"
 
+/**
+ * @brief 针对复合索引后缀等值条件执行多段范围扫描。
+ *
+ * 当索引前缀列缺少条件、但后缀列存在等值条件时，先枚举不同前缀，再为每个
+ * 前缀构造一个连续的索引范围；若历史索引候选不可安全利用，则回退到父类的
+ * 全表候选匹配逻辑。
+ */
 class IndexSkipScanExecutor : public IndexScanExecutor {
+    /**
+     * @brief 保存一个待打开的半开索引 RID 区间。
+     */
     struct IndexRange {
         Iid lower;
         Iid upper;
@@ -23,6 +33,10 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
     std::vector<IndexRange> ranges_;
     size_t next_range_pos_ = 0;
 
+    /**
+     * @brief 构造由所有索引列最小值组成的复合键。
+     * @return 索引字典序中的最小复合键。
+     */
     std::vector<char> make_min_key() const {
         std::vector<char> key(index_meta_.col_tot_len);
         int offset = 0;
@@ -33,6 +47,10 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         return key;
     }
 
+    /**
+     * @brief 构造由所有索引列最大值组成的复合键。
+     * @return 索引字典序中的最大复合键。
+     */
     std::vector<char> make_max_key() const {
         std::vector<char> key(index_meta_.col_tot_len);
         int offset = 0;
@@ -43,6 +61,11 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         return key;
     }
 
+    /**
+     * @brief 查找第一个位于缺失前缀之后的等值约束列。
+     * @param constraints 已从查询条件提取的索引列约束。
+     * @return 后缀等值列下标；不存在可用于跳跃扫描的后缀条件时返回 nullopt。
+     */
     std::optional<size_t> first_suffix_equality_pos(const std::map<std::string, ColumnConstraint>& constraints) const {
         bool saw_missing_prefix = false;
         for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
@@ -59,6 +82,12 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         return std::nullopt;
     }
 
+    /**
+     * @brief 将已探测索引键的前缀复制到新的复合边界键中。
+     * @param key 待修改的目标键。
+     * @param source_key 提供前缀字节的索引键。
+     * @param prefix_col_count 要复制的前缀列数量。
+     */
     void copy_prefix_from_key(std::vector<char>& key, const char* source_key, size_t prefix_col_count) const {
         int offset = 0;
         for (size_t i = 0; i < prefix_col_count; ++i) {
@@ -68,6 +97,13 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
+    /**
+     * @brief 将从 suffix_pos 开始连续出现的等值条件写入范围上下界。
+     * @param lower_key 待修改的下界键。
+     * @param upper_key 待修改的上界键。
+     * @param constraints 索引列约束。
+     * @param suffix_pos 后缀等值条件的起始列下标。
+     */
     void apply_suffix_equalities(std::vector<char>& lower_key, std::vector<char>& upper_key,
                                  const std::map<std::string, ColumnConstraint>& constraints, size_t suffix_pos) const {
         int offset = 0;
@@ -85,6 +121,14 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
+    /**
+     * @brief 枚举不同前缀并为每个前缀构造后缀等值扫描区间。
+     * @param constraints 当前索引列约束。
+     * @param suffix_pos 第一个后缀等值列的位置。
+     *
+     * 每次先读取当前前缀的代表键，再把后缀等值条件写入上下界，并把游标跳到
+     * 下一个前缀的起点；这样不会为同一前缀重复生成范围。
+     */
     void build_ranges(const std::map<std::string, ColumnConstraint>& constraints, size_t suffix_pos) {
         ranges_.clear();
         next_range_pos_ = 0;
@@ -126,6 +170,9 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
+    /**
+     * @brief 打开下一个非空索引范围，所有范围耗尽后释放索引共享锁。
+     */
     void open_next_range() {
         scan_.reset();
         while (next_range_pos_ < ranges_.size()) {
@@ -141,6 +188,12 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
+    /**
+     * @brief 在当前范围及后续范围中寻找下一条有效记录。
+     *
+     * 当前范围没有匹配记录时切换到下一个范围；具体的 MVCC 和谓词判断复用
+     * IndexScanExecutor::advance_to_match()，保证两种索引扫描的结果语义一致。
+     */
     void advance_to_match() {
         buffered_record_.reset();
         while (scan_ != nullptr) {
@@ -153,13 +206,28 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
     }
 
 public:
+    /**
+     * @brief 创建复合索引跳跃扫描执行器。
+     * @param sm_manager 系统管理器。
+     * @param tab_name 要扫描的表名。
+     * @param conds 初始扫描条件。
+     * @param index_col_names 复合索引列顺序。
+     * @param context 当前执行上下文。
+     */
     IndexSkipScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
                           std::vector<std::string> index_col_names, Context* context)
         : IndexScanExecutor(sm_manager, std::move(tab_name), std::move(conds), std::move(index_col_names), context) {}
 
+    /**
+     * @brief 初始化跳跃扫描范围并定位到第一条匹配记录。
+     *
+     * 有历史候选需求时直接回退为记录文件扫描；否则获取索引锁、寻找后缀等值
+     * 起点、构造多个范围并打开第一个非空范围。
+     */
     void beginTuple() override {
         record_predicate_read();
 
+        // 历史索引候选没有稳定的前缀顺序，直接复用父类匹配逻辑保证快照正确性。
         if (needs_historical_index_candidates()) {
             scan_ = std::make_unique<RmScan>(fh_);
             IndexScanExecutor::advance_to_match();
@@ -181,6 +249,9 @@ public:
         advance_to_match();
     }
 
+    /**
+     * @brief 推进当前范围并在必要时切换到后续范围。
+     */
     void nextTuple() override {
         if (scan_ == nullptr) {
             return;
@@ -189,10 +260,18 @@ public:
         advance_to_match();
     }
 
+    /**
+     * @brief 判断当前范围或全部跳跃范围是否已经耗尽。
+     * @return 没有活动扫描器或当前扫描器结束时返回 true。
+     */
     bool is_end() const override {
         return scan_ == nullptr || scan_->is_end();
     }
 
+    /**
+     * @brief 返回执行器类型名称。
+     * @return "IndexSkipScanExecutor"。
+     */
     std::string getType() override {
         return "IndexSkipScanExecutor";
     }

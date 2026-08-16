@@ -47,7 +47,11 @@ const char* help_info = "Supported SQL syntax:\n"
                         "selector:\n"
                         "  {* | column [, column ...]}\n";
 
-// 主要负责执行DDL语句
+/**
+ * @brief 分派并执行 DDL 计划。
+ * @param plan DDL 计划。
+ * @param context 当前执行上下文。
+ */
 void QlManager::run_mutli_query(Plan* plan, Context* context) {
     auto* x = static_cast<DDLPlan*>(plan);
     switch (plan->tag) {
@@ -73,7 +77,12 @@ void QlManager::run_mutli_query(Plan* plan, Context* context) {
     }
 }
 
-// 执行help; show tables; desc table; begin; commit; abort;语句
+/**
+ * @brief 分派帮助、元数据展示、事务控制、配置和检查点命令。
+ * @param plan 工具命令计划。
+ * @param txn_id 当前会话事务 ID 指针。
+ * @param context 当前执行上下文。
+ */
 void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) {
     switch (plan->tag) {
     case T_Help:
@@ -181,8 +190,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
     case T_SetOutputFile: {
         auto* x = static_cast<SetOutputFilePlan*>(plan);
-        // output_file is a database-global toggle shared across all connections;
-        // store it on SmManager so it persists across connection lifetimes.
+        // output_file 是数据库级开关，保存在 SmManager 中以跨连接生效。
         sm_manager_->output_file_enabled_ = x->enable_;
         break;
     }
@@ -209,7 +217,15 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
 }
 
-// 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
+/**
+ * @brief 遍历 SELECT 结果并写入客户端缓冲区及可选的 output.txt。
+ * @param executorTreeRoot SELECT 执行器树根节点所有权。
+ * @param output_names 输出列标题。
+ * @param context 当前执行上下文。
+ *
+ * 函数使用局部输出缓冲区和 SSI 读追踪保护器：执行期间发生事务中止时，
+ * 局部结果不会提交到外部缓冲区，也不会修改 output.txt。
+ */
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                             Context* context) {
     const auto& result_cols = executorTreeRoot->cols();
@@ -230,10 +246,17 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
                           context->txn_mgr_);
     print_context.isolation_level_ = context->isolation_level_;
 
+    /**
+     * @brief 在 SELECT 生命周期内临时打开 SSI 读追踪的 RAII 守卫。
+     */
     struct SsiReadTrackingGuard {
         Context* context_;
         bool old_value_;
 
+        /**
+         * @brief 保存旧开关并启用 SSI 读追踪。
+         * @param context 当前执行上下文。
+         */
         explicit SsiReadTrackingGuard(Context* context) : context_(context), old_value_(false) {
             if (context_ != nullptr) {
                 old_value_ = context_->enable_ssi_read_tracking_;
@@ -241,6 +264,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             }
         }
 
+        /**
+         * @brief 恢复构造前的 SSI 读追踪开关。
+         */
         ~SsiReadTrackingGuard() {
             if (context_ != nullptr) {
                 context_->enable_ssi_read_tracking_ = old_value_;
@@ -248,8 +274,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     } ssi_read_tracking_guard(context);
 
-    // Print header into a statement-local buffer. It is copied to the client
-    // and output.txt only after the SELECT completes without aborting.
+    // 表头先写入语句级缓冲区，SELECT 成功结束后再提交到客户端和 output.txt。
     RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(&print_context);
     rec_printer.print_record(captions, &print_context);
@@ -262,7 +287,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     }
     out_file_stream << "\n";
 
-    // 执行query_plan
+    // 遍历执行器树；每条记录根据列类型和 NULL 标记转换为展示字符串。
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
         if (Tuple == nullptr) {
@@ -289,7 +314,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             }
             columns.push_back(col_str);
         }
-        // print record into client buffer
+        // 结果同时写入客户端格式缓冲区和 output.txt 的紧凑格式流。
         rec_printer.print_record(columns, &print_context);
         // print record into output.txt (compact borderless)
         out_file_stream << "|";
@@ -299,7 +324,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         out_file_stream << "\n";
         num_rec++;
     }
-    // Print footer into client buffer
+    // 只有完整遍历成功后才追加分隔线和记录计数。
     rec_printer.print_separator(&print_context);
     // Print record count into client buffer
     RecordPrinter::print_record_count(num_rec, &print_context);
@@ -317,6 +342,12 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     }
 }
 
+/**
+ * @brief 根据 TabCol 选择项生成标题并委托到字符串标题重载。
+ * @param executorTreeRoot SELECT 执行器树根节点所有权。
+ * @param sel_cols 选择列列表。
+ * @param context 当前执行上下文。
+ */
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                             Context* context) {
     std::vector<std::string> output_names;
@@ -327,7 +358,10 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     select_from(std::move(executorTreeRoot), std::move(output_names), context);
 }
 
-// 执行DML语句
+/**
+ * @brief 执行 DML 根执行器。
+ * @param exec DML 执行器所有权。
+ */
 void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec) {
     exec->Next();
 }

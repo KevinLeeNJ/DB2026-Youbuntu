@@ -19,6 +19,12 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include <algorithm>
 
+/**
+ * @brief 更新指定 RID 集合中满足条件的记录。
+ *
+ * 更新会重新读取可见版本并验证谓词，计算新记录后检查旧/新记录的 SSI 写冲突，
+ * 再同步维护 MVCC undo、WAL 和所有受影响的索引键。
+ */
 class UpdateExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;
@@ -30,6 +36,12 @@ private:
     SmManager* sm_manager_;
     QueryExprEvaluator::SubqueryRunner subquery_runner_;
 
+    /**
+     * @brief 按索引列顺序从记录中拼接复合索引键。
+     * @param index 索引元数据。
+     * @param rec_data 记录数据首地址。
+     * @return 固定长度的索引键字节数组。
+     */
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
         int offset = 0;
@@ -41,6 +53,16 @@ private:
     }
 
 public:
+    /**
+     * @brief 创建更新执行器。
+     * @param sm_manager 系统管理器。
+     * @param tab_name 目标表名。
+     * @param set_clauses SET 子句列表。
+     * @param conds 更新前需要满足的条件。
+     * @param rids 待检查的记录 RID 列表。
+     * @param context 当前执行上下文。
+     * @param subquery_runner SET 表达式内部子查询执行回调。
+     */
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
                    std::vector<Condition> conds, std::vector<Rid> rids, Context* context,
                    QueryExprEvaluator::SubqueryRunner subquery_runner = {}) {
@@ -54,7 +76,16 @@ public:
         context_ = context;
         subquery_runner_ = std::move(subquery_runner);
     }
+    /**
+     * @brief 执行更新操作。
+     * @return DML 不产生上层数据行，始终返回 nullptr。
+     * @throws TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
+     *
+     * 流程依次为：读取可见版本并过滤、加写锁及刷新 RC 版本、计算新记录、
+     * 原子检查 SSI、预检查新索引键、记录 WAL/undo、替换索引并最终写回记录。
+     */
     std::unique_ptr<RmRecord> Next() override {
+        // 非自引用 SET 需要额外检查 RC 中语句读时间之后是否出现新提交版本。
         bool has_non_self_ref_set = std::any_of(set_clauses_.begin(), set_clauses_.end(),
                                                 [](const SetClause& clause) { return !clause.is_self_ref; });
         for (Rid& rid : rids_) {
@@ -74,7 +105,7 @@ public:
                 }
             }
             if (match) {
-                // MVCC Write-Write conflict detection
+                // 第一阶段：获取写锁；READ COMMITTED 下刷新最新版本并重新验证条件。
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     auto txn = context_->txn_;
                     timestamp_t statement_read_ts = txn->get_read_ts();
@@ -119,13 +150,11 @@ public:
                     }
                 }
 
+                // 第二阶段：在旧记录副本上计算新记录，后续索引和 SSI 检查都使用这两个版本。
                 auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
                 update_record(new_rec.get(), *rec);              // 对记录更新
 
-                // SSI: Consolidated atomic check for both old and new records.
-                // Per spec: UPDATE must check both old (pre-update) and new (post-update) records.
-                // Both are checked atomically under a single lock; the write is stored
-                // as one ssi_writes_ entry only if no danger is found.
+                // 第三阶段：在一个原子检查中同时登记旧记录和新记录的 SSI 写影响。
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
                     context_->txn_mgr_ != nullptr) {
@@ -139,6 +168,7 @@ public:
                     }
                 }
 
+                // 第四阶段：只为发生变化的索引准备旧键/新键，并预检查唯一性。
                 struct IndexUpdate {
                     const IndexMeta* index;
                     std::vector<char> old_key;
@@ -172,6 +202,7 @@ public:
                     }
                     index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }
+                // 第五阶段：WAL 先记录旧值和新值，再保存事务 undo 版本与新元数据。
                 if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
                     UpdateLogRecord log_record(context_->txn_->get_transaction_id(), *rec, *new_rec, rid, tab_name_);
                     log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
@@ -201,6 +232,7 @@ public:
                     fh_->set_tuple_meta(rid, meta);
                 }
 
+                // 第六阶段：按索引逐个替换键；任一步失败都按逆序恢复新旧键。
                 std::vector<size_t> deleted_indexes;
                 std::vector<size_t> inserted_indexes;
                 try {
@@ -238,24 +270,43 @@ public:
         return nullptr;
     }
 
+    /**
+     * @brief 返回目标表列元数据。
+     * @return 目标表列元数据引用。
+     */
     const std::vector<ColMeta>& cols() const override {
         return tab_.cols;
     }
 
+    /**
+     * @brief 返回更新节点的抽象 RID。
+     * @return 抽象记录号引用。
+     */
     Rid& rid() override {
         return _abstract_rid;
     }
+    /**
+     * @brief 返回执行器类型名称。
+     * @return "UpdateExecutor"。
+     */
     std::string getType() override {
         return "UpdateExecutor"; // 返回执行器的名称
     }
     /**
-     * @brief 更新记录
-     * @param rec 需要更新的记录
+     * @brief 按 SET 子句把旧记录更新为新记录。
+     * @param rec 待原地修改的新记录缓冲区。
+     * @param old_rec 更新前的旧记录，用于自引用和表达式求值。
+     * @throws RMDBError SET 表达式结果为 NULL 时抛出。
+     * @throws IncompatibleTypeError 目标列与赋值类型不可转换时抛出。
+     *
+     * SET 支持表达式赋值、列自引用赋值、数值自增/自减/乘除以及字面量赋值；
+     * 所有分支都在写入前完成类型检查，字符串字段按目标列宽清零并截断复制。
      */
     void update_record(RmRecord* rec, const RmRecord& old_rec) {
         for (const auto& set_clause : set_clauses_) {
             auto col_meta = get_col_offset(set_clause.lhs);
             char* data = rec->data + col_meta.offset;
+            // 优先处理完整 QueryExpr；求值使用旧记录，避免多个 SET 子句相互污染。
             if (set_clause.rhs_expr != nullptr) {
                 static const std::vector<bool> no_nulls;
                 QueryExprEvaluator evaluator(tab_.cols, no_nulls, &subquery_runner_);
@@ -286,6 +337,7 @@ public:
                 }
                 continue;
             }
+            // 列自引用分为直接赋值和数值运算两条路径。
             if (set_clause.is_self_ref) {
                 auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {
@@ -321,6 +373,7 @@ public:
                     throw IncompatibleTypeError(coltype2str(rhs_col_meta.type), coltype2str(set_clause.rhs.type));
                 }
 
+                // 先统一提升为 double 完成运算，再按目标列类型落回 int/double。
                 double base = rhs_col_meta.type == TYPE_INT
                                   ? static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
                                   : *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
@@ -361,6 +414,7 @@ public:
                 }
                 continue;
             }
+            // 最后一条路径处理普通字面量赋值。
             if (can_cast(col_meta.type, set_clause.rhs.type) == false) {
                 throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(set_clause.rhs.type));
             }
@@ -391,6 +445,12 @@ public:
             }
         }
     }
+    /**
+     * @brief 查找目标表列的元数据及偏移。
+     * @param target 目标列。
+     * @return 匹配的列元数据。
+     * @throws ColumnNotFoundError 找不到目标列时抛出。
+     */
     ColMeta get_col_offset(const TabCol& target) override {
         for (const auto& col : tab_.cols) {
             if (col.tab_name == target.tab_name && col.name == target.col_name) {

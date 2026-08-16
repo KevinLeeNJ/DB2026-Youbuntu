@@ -26,6 +26,12 @@ See the Mulan PSL v2 for more details. */
 #include "execution_scalar.h"
 #include "executor_abstract.h"
 
+/**
+ * @brief 执行 GROUP BY、聚合函数以及 HAVING 过滤。
+ *
+ * 算子会先消费子执行器并物化分组状态，再按游标逐组输出结果。无 GROUP BY
+ * 时使用单个全局分组，并针对 COUNT(*) 和有序 MIN 提供可选的快速路径。
+ */
 class AggregateExecutor : public AbstractExecutor {
 private:
     enum class LocalAggType { COUNT = 0, MAX = 1, MIN = 2, SUM = 3, AVG = 4 };
@@ -34,16 +40,32 @@ private:
     using CellValue = execution_scalar::CellValue;
     using CellValueHash = execution_scalar::CellValueHash;
 
+    /**
+     * @brief 保存分组列的值及其 NULL 状态。
+     */
     struct GroupKey {
         std::vector<CellValue> values;
         std::vector<bool> nulls;
 
+        /**
+         * @brief 判断两个分组键是否完全相同。
+         * @param other 待比较的分组键。
+         * @return 值和 NULL 标记都相同时返回 true。
+         */
         bool operator==(const GroupKey& other) const {
             return values == other.values && nulls == other.nulls;
         }
     };
 
+    /**
+     * @brief 为分组键计算哈希值。
+     */
     struct GroupKeyHash {
+        /**
+         * @brief 组合所有分组列值和 NULL 标记的哈希。
+         * @param key 待哈希的分组键。
+         * @return 分组键哈希值。
+         */
         size_t operator()(const GroupKey& key) const {
             size_t seed = 0;
             CellValueHash hash_cell;
@@ -103,6 +125,7 @@ private:
         bool negated = false;
     };
 
+    // 以下 traits 用于兼容不同分析阶段表达式结构的字段命名。
     template <typename T, typename = void> struct has_member_val : std::false_type {};
 
     template <typename T>
@@ -152,10 +175,22 @@ private:
     bool materialized_ = false;
     bool has_group_by_ = false;
 
+    /**
+     * @brief 去除定长字符串字段尾部的填充字符。
+     * @param data 字符串字段首地址。
+     * @param len 字段物理长度。
+     * @return 去除尾部填充后的字符串。
+     */
     static std::string trim_string(const char* data, int len) {
         return execution_scalar::trim_string(data, len);
     }
 
+    /**
+     * @brief 将分析阶段的聚合类型编号转换为执行器内部枚举。
+     * @param type_code 分析阶段保存的聚合类型编号。
+     * @return 内部聚合类型。
+     * @throws InternalError 类型编号未知时抛出。
+     */
     static LocalAggType normalize_agg_type(int type_code) {
         switch (type_code) {
         case 0:
@@ -173,6 +208,12 @@ private:
         }
     }
 
+    /**
+     * @brief 按列元数据从记录中读取一个执行器内部值。
+     * @param rec 输入记录。
+     * @param col 要读取的列元数据。
+     * @return 转换后的 CellValue；NULL 状态由调用方的 nulls 数组单独传递。
+     */
     CellValue read_cell(const RmRecord& rec, const ColMeta& col) const {
         CellValue value;
         value.type = col.type;
@@ -192,10 +233,23 @@ private:
         return value;
     }
 
+    /**
+     * @brief 比较两个内部值。
+     * @param lhs 左值。
+     * @param rhs 右值。
+     * @return lhs 小于、等于或大于 rhs 时分别返回负数、0 或正数。
+     */
     static int compare_cells(const CellValue& lhs, const CellValue& rhs) {
         return execution_scalar::compare_cells(lhs, rhs);
     }
 
+    /**
+     * @brief 将三路比较结果按比较操作符转换为布尔值。
+     * @param op 比较操作符。
+     * @param cmp compare_cells 的结果。
+     * @return 比较条件成立时返回 true。
+     * @throws InternalError 该函数不支持的操作符传入时抛出。
+     */
     static bool compare_with_op(CompOp op, int cmp) {
         switch (op) {
         case OP_EQ:
@@ -218,10 +272,21 @@ private:
         throw InternalError("Unexpected comparison operator");
     }
 
+    /**
+     * @brief 构造指定类型的零值。
+     * @param type 目标列类型。
+     * @return 对应类型的零值。
+     */
     static CellValue zero_value(ColType type) {
         return execution_scalar::zero_value(type);
     }
 
+    /**
+     * @brief 从不同表达式结构中提取字面量字段。
+     * @tparam ExprT 表达式类型。
+     * @param expr 可能包含 val 或 value 字段的表达式。
+     * @return 字面量引用。
+     */
     template <typename ExprT> static const Value& get_expr_literal_value(const ExprT& expr) {
         if constexpr (has_member_val<ExprT>::value) {
             return expr.val;
@@ -233,6 +298,15 @@ private:
         }
     }
 
+    /**
+     * @brief 将一个内部值写入聚合结果记录的指定列槽位。
+     * @param dest 目标记录数据首地址。
+     * @param col 目标列元数据。
+     * @param value 待写入的内部值。
+     *
+     * NULL 标记不在这里编码，而是由输出的 nulls_ 数组维护；字符串字段会按
+     * 固定列宽清零后复制，避免残留旧数据。
+     */
     void write_cell(char* dest, const ColMeta& col, const CellValue& value) const {
         switch (col.type) {
         case TYPE_INT:
@@ -249,10 +323,21 @@ private:
         }
     }
 
+    /**
+     * @brief 在子执行器输出中解析聚合输入列。
+     * @param target 聚合函数引用的表列。
+     * @return 输入列元数据。
+     * @throws ColumnNotFoundError 找不到输入列时抛出。
+     */
     ColMeta find_input_col(const TabCol& target) const {
         return prev_->get_col_offset(target);
     }
 
+    /**
+     * @brief 将一列追加到聚合输出布局并计算其物理偏移。
+     * @param col 源列或新建列元数据。
+     * @param output_name 输出列名，为空时保留原名。
+     */
     void append_output_col(ColMeta col, const std::string& output_name) {
         col.offset = static_cast<int>(len_);
         if (!output_name.empty()) {
@@ -263,6 +348,12 @@ private:
         cols_.push_back(col);
     }
 
+    /**
+     * @brief 从不同 GROUP BY 选择项表示中提取 TabCol。
+     * @tparam GroupByT 分组项类型。
+     * @param item 分组项。
+     * @return 分组列引用。
+     */
     template <typename GroupByT> static const TabCol& extract_group_col(const GroupByT& item) {
         if constexpr (std::is_same_v<GroupByT, TabCol>) {
             return item;
@@ -271,6 +362,13 @@ private:
         }
     }
 
+    /**
+     * @brief 将具体聚合表达式转换为内部 AggregateSpec。
+     * @tparam AggExprT 聚合表达式类型。
+     * @param agg_expr 聚合表达式。
+     * @return 执行器内部聚合描述。
+     * @throws ColumnNotFoundError 非 COUNT(*) 聚合的输入列不存在时抛出。
+     */
     template <typename AggExprT> AggregateSpec make_aggregate_spec_direct(const AggExprT& agg_expr) const {
         AggregateSpec spec;
         spec.type = normalize_agg_type(static_cast<int>(agg_expr.type));
@@ -289,6 +387,12 @@ private:
         return spec;
     }
 
+    /**
+     * @brief 兼容直接聚合表达式和带 agg 成员的选择项包装。
+     * @tparam AggItemT 聚合项类型。
+     * @param agg_item 聚合项。
+     * @return 内部聚合描述。
+     */
     template <typename AggItemT> AggregateSpec make_aggregate_spec(const AggItemT& agg_item) const {
         if constexpr (has_member_agg<AggItemT>::value) {
             return make_aggregate_spec_direct(agg_item.agg);
@@ -297,6 +401,13 @@ private:
         }
     }
 
+    /**
+     * @brief 将 HAVING 表达式解析为分组列、聚合结果或常量操作数。
+     * @tparam ExprT HAVING 表达式类型。
+     * @param expr 待解析表达式。
+     * @return 内部 HAVING 操作数。
+     * @throws ColumnNotFoundError 无法匹配分组列或聚合结果时抛出。
+     */
     template <typename ExprT> HavingOperand make_operand_from_expr(const ExprT& expr) const {
         HavingOperand operand;
         const int expr_type = static_cast<int>(expr.type);
@@ -349,6 +460,15 @@ private:
         throw ColumnNotFoundError(expr.display_name);
     }
 
+    /**
+     * @brief 将分析阶段 HAVING 条件转换为可执行描述。
+     * @tparam HavingCondT HAVING 条件类型。
+     * @param cond HAVING 条件。
+     * @return 内部 HAVING 条件描述。
+     *
+     * 函数同时处理普通右值、IN 列表、BETWEEN 上界以及 NOT/negated 信息，
+     * 使执行阶段不必再依赖具体的分析结构类型。
+     */
     template <typename HavingCondT> HavingSpec make_having_spec(const HavingCondT& cond) const {
         HavingSpec spec;
         spec.lhs = make_operand_from_expr(cond.lhs);
@@ -404,12 +524,27 @@ private:
         return spec;
     }
 
+    /**
+     * @brief 为一个聚合描述创建初始状态。
+     * @param spec 聚合描述。
+     * @return count/sum 清零且值初始化的聚合状态。
+     */
     AggregateState init_aggregate_state(const AggregateSpec& spec) const {
         AggregateState state;
         state.value = zero_value(spec.input_type);
         return state;
     }
 
+    /**
+     * @brief 使用一条输入记录更新聚合状态。
+     * @param state 待更新的聚合状态。
+     * @param spec 聚合描述。
+     * @param rec 当前输入记录。
+     * @param nulls 子执行器输出列的 NULL 标记。
+     *
+     * 更新顺序是：识别输入 NULL、执行 DISTINCT 去重、再按 COUNT/SUM/AVG/MIN/MAX
+     * 的语义累加。这样 NULL 不会污染数值聚合，也不会进入 DISTINCT 集合。
+     */
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec,
                                 const std::vector<bool>& nulls) const {
         CellValue current_value;
@@ -461,6 +596,11 @@ private:
         }
     }
 
+    /**
+     * @brief 将一组聚合状态批量转换为输出值。
+     * @param group_state 分组状态。
+     * @return 按聚合列顺序排列的最终值。
+     */
     std::vector<CellValue> finalize_aggregate_values(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values;
         aggregate_values.reserve(aggregates_.size());
@@ -470,6 +610,13 @@ private:
         return aggregate_values;
     }
 
+    /**
+     * @brief 计算单个聚合状态的最终结果。
+     * @param spec 聚合描述。
+     * @param state 已累积的聚合状态。
+     * @return 聚合结果值；空 MIN/MAX 使用输入类型零值。
+     * @throws InternalError 聚合类型未知时抛出。
+     */
     CellValue finalize_aggregate(const AggregateSpec& spec, const AggregateState& state) const {
         switch (spec.type) {
         case LocalAggType::COUNT: {
@@ -504,6 +651,14 @@ private:
         throw InternalError("Unexpected aggregate type");
     }
 
+    /**
+     * @brief 将 HAVING 操作数解析为当前分组中的实际值。
+     * @param operand 内部操作数描述。
+     * @param group_values 当前分组列值。
+     * @param group_nulls 当前分组列 NULL 标记。
+     * @param aggregate_values 当前分组聚合结果。
+     * @return 带 NULL 状态的实际操作数。
+     */
     ResolvedHavingOperand resolve_having_operand(const HavingOperand& operand,
                                                  const std::vector<CellValue>& group_values,
                                                  const std::vector<bool>& group_nulls,
@@ -519,6 +674,16 @@ private:
         throw InternalError("Unexpected HAVING operand kind");
     }
 
+    /**
+     * @brief 判断一组已计算结果是否通过全部 HAVING 条件。
+     * @param group_values 当前分组列值。
+     * @param group_nulls 当前分组列 NULL 标记。
+     * @param aggregate_values 当前分组聚合结果。
+     * @return 全部 HAVING 条件成立时返回 true。
+     *
+     * IN、BETWEEN 和 LIKE 在此处分别展开处理，其余比较操作使用三路比较结果；
+     * 左值或必要的右值为 NULL 时按过滤语义判为不通过。
+     */
     bool passes_having(const std::vector<CellValue>& group_values,
                        const std::vector<bool>& group_nulls,
                        const std::vector<CellValue>& aggregate_values) const {
@@ -575,19 +740,30 @@ private:
         return true;
     }
 
+    /**
+     * @brief 使用分组状态判断 HAVING 是否通过。
+     * @param group_state 待判断的分组状态。
+     * @return HAVING 条件通过时返回 true。
+     */
     bool passes_having(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
         return passes_having(group_state.group_values, group_state.group_nulls, aggregate_values);
     }
 
+    /**
+     * @brief 判断是否可以仅通过遍历游标计数 COUNT(*)。
+     * @return 满足无分组、无 HAVING、单个 COUNT(*) 且底层为表扫描时返回 true。
+     */
     bool can_count_star_by_cursor_only() const {
         return !has_group_by_ && having_conds_.empty() && aggregates_.size() == 1 &&
                aggregates_[0].type == LocalAggType::COUNT && aggregates_[0].is_star &&
                !prev_->scan_table_name().empty();
     }
 
-    // min(col) can stop at the first row if the child provides ascending order
-    // on col. Only applies to a single min() with no GROUP BY / HAVING.
+    /**
+     * @brief 判断是否可以利用子执行器的升序直接求 MIN。
+     * @return 单个无分组无 HAVING 的 MIN 且子执行器提供升序时返回 true。
+     */
     bool can_use_min_index_shortcut() const {
         if (has_group_by_ || !having_conds_.empty() || aggregates_.size() != 1) {
             return false;
@@ -599,6 +775,11 @@ private:
         return prev_->provides_min_order(agg.col);
     }
 
+    /**
+     * @brief 将一组分组值和聚合值写入新的输出记录。
+     * @param group_state 待物化的分组状态。
+     * @return 聚合结果记录。
+     */
     std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
         RmRecord rec(static_cast<int>(len_));
@@ -612,6 +793,12 @@ private:
         return std::make_unique<RmRecord>(rec);
     }
 
+    /**
+     * @brief 创建包含指定分组键并初始化全部聚合状态的 GroupState。
+     * @param group_values 分组列值。
+     * @param group_nulls 分组列 NULL 标记。
+     * @return 初始化后的分组状态。
+     */
     GroupState make_group_state(const std::vector<CellValue>& group_values, const std::vector<bool>& group_nulls = {}) const {
         GroupState state;
         state.group_values = group_values;
@@ -623,9 +810,16 @@ private:
         return state;
     }
 
+    /**
+     * @brief 消费子执行器并物化所有可输出分组。
+     *
+     * 有 GROUP BY 时通过哈希表合并相同分组键，随后应用 HAVING；无 GROUP BY
+     * 时使用单个全局状态，并依次尝试 COUNT(*) 游标计数、索引有序 MIN 和完整扫描。
+     */
     void materialize_groups() {
         groups_.clear();
         if (has_group_by_) {
+            // 分组路径：读取输入、构造包含 NULL 标记的键，并累积每个聚合状态。
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 auto rec = prev_->Next();
@@ -656,6 +850,7 @@ private:
                 }
             }
 
+            // 原地压缩掉未通过 HAVING 的分组，避免改变后续输出游标语义。
             size_t kept = 0;
             for (size_t i = 0; i < groups_.size(); ++i) {
                 if (!passes_having(groups_[i])) {
@@ -672,6 +867,7 @@ private:
 
         GroupState global_state = make_group_state({});
         if (can_count_star_by_cursor_only()) {
+            // COUNT(*) 不依赖具体字段值，只需统计子游标能够产生的记录数。
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 ++global_state.aggregate_states[0].count;
             }
@@ -679,11 +875,8 @@ private:
             return;
         }
 
-        // min(col) index-order shortcut: when the child yields rows in ascending
-        // order of the aggregated column (e.g. an index range scan whose leading
-        // column is col), the first visible matching row is the minimum, so we can
-        // stop after consuming it instead of scanning the whole range.
         if (can_use_min_index_shortcut()) {
+            // 子节点按聚合列升序输出时，第一条可见记录即为 MIN，无需扫描剩余范围。
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 auto rec = prev_->Next();
                 if (rec == nullptr) {
@@ -693,13 +886,14 @@ private:
                 groups_.push_back(std::move(global_state));
                 return;
             }
-            // No visible rows: result is the zero/empty value.
+            // 没有可见行时仍保留一个空聚合结果。
             if (passes_having(global_state)) {
                 groups_.push_back(std::move(global_state));
             }
             return;
         }
 
+        // 通用路径：完整消费所有输入记录，再统一判断全局分组是否通过 HAVING。
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = prev_->Next();
             if (rec == nullptr) {
@@ -715,6 +909,11 @@ private:
         }
     }
 
+    /**
+     * @brief 解析并建立 GROUP BY 输出列布局。
+     * @param group_by_cols 分组列列表。
+     * @throws ColumnNotFoundError 分组列不存在时抛出。
+     */
     void init_group_cols(const std::vector<TabCol>& group_by_cols) {
         has_group_by_ = !group_by_cols.empty();
         for (const auto& group_by_col : group_by_cols) {
@@ -724,6 +923,11 @@ private:
         }
     }
 
+    /**
+     * @brief 从包装类型 GROUP BY 项中提取列后建立布局。
+     * @tparam GroupByT 分组项类型。
+     * @param group_by_cols 分组项列表。
+     */
     template <typename GroupByT> void init_group_cols(const std::vector<GroupByT>& group_by_cols) {
         std::vector<TabCol> cols;
         cols.reserve(group_by_cols.size());
@@ -733,6 +937,11 @@ private:
         init_group_cols(cols);
     }
 
+    /**
+     * @brief 解析聚合表达式并建立聚合输出列布局。
+     * @tparam AggExprT 聚合表达式或选择项类型。
+     * @param aggregate_exprs 聚合表达式列表。
+     */
     template <typename AggExprT> void init_aggregate_cols(const std::vector<AggExprT>& aggregate_exprs) {
         for (const auto& aggregate_expr : aggregate_exprs) {
             AggregateSpec spec = make_aggregate_spec(aggregate_expr);
@@ -764,6 +973,11 @@ private:
         }
     }
 
+    /**
+     * @brief 预解析 HAVING 条件。
+     * @tparam HavingCondT HAVING 条件类型。
+     * @param having_conds HAVING 条件列表。
+     */
     template <typename HavingCondT> void init_having_conds(const std::vector<HavingCondT>& having_conds) {
         having_conds_.reserve(having_conds.size());
         for (const auto& having_cond : having_conds) {
@@ -772,6 +986,17 @@ private:
     }
 
 public:
+    /**
+     * @brief 创建聚合执行器并解析分组、聚合和 HAVING 定义。
+     * @tparam GroupByT 分组项类型。
+     * @tparam AggExprT 聚合项类型。
+     * @tparam HavingCondT HAVING 条件类型。
+     * @param prev 子执行器。
+     * @param group_by_cols GROUP BY 项列表。
+     * @param aggregate_exprs 聚合表达式列表。
+     * @param having_conds HAVING 条件列表。
+     * @param context 当前执行上下文。
+     */
     template <typename GroupByT, typename AggExprT, typename HavingCondT>
     AggregateExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<GroupByT>& group_by_cols,
                       const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds,
@@ -782,6 +1007,9 @@ public:
         init_having_conds(having_conds);
     }
 
+    /**
+     * @brief 首次调用时物化分组，并将输出游标置于第一组。
+     */
     void beginTuple() override {
         if (!materialized_) {
             materialize_groups();
@@ -790,12 +1018,19 @@ public:
         cursor_ = 0;
     }
 
+    /**
+     * @brief 将输出游标推进到下一组。
+     */
     void nextTuple() override {
         if (!is_end()) {
             ++cursor_;
         }
     }
 
+    /**
+     * @brief 返回当前分组的聚合结果记录。
+     * @return 当前分组记录；游标越界时返回 nullptr。
+     */
     std::unique_ptr<RmRecord> Next() override {
         if (is_end()) {
             return nullptr;
@@ -807,26 +1042,52 @@ public:
         return materialize_group_result(groups_[cursor_]);
     }
 
+    /**
+     * @brief 判断所有物化分组是否已经输出完毕。
+     * @return 游标位于分组数组末尾时返回 true。
+     */
     bool is_end() const override {
         return cursor_ >= groups_.size();
     }
 
+    /**
+     * @brief 返回聚合结果的抽象 RID。
+     * @return 聚合节点维护的 RID 引用；聚合结果通常不对应底层物理记录。
+     */
     Rid& rid() override {
         return _abstract_rid;
     }
 
+    /**
+     * @brief 返回执行器类型名称。
+     * @return "AggregateExecutor"。
+     */
     std::string getType() override {
         return "AggregateExecutor";
     }
 
+    /**
+     * @brief 返回聚合输出列元数据。
+     * @return 输出列元数据引用。
+     */
     const std::vector<ColMeta>& cols() const override {
         return cols_;
     }
 
+    /**
+     * @brief 返回聚合输出元组长度。
+     * @return 输出字段长度总和。
+     */
     size_t tupleLen() const override {
         return len_;
     }
 
+    /**
+     * @brief 查找聚合输出列的元数据及偏移。
+     * @param target 目标表列。
+     * @return 匹配的列元数据。
+     * @throws ColumnNotFoundError 找不到目标列时抛出。
+     */
     ColMeta get_col_offset(const TabCol& target) override {
         auto pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
             if (!target.tab_name.empty()) {
@@ -840,6 +1101,10 @@ public:
         return *pos;
     }
 
+    /**
+     * @brief 返回当前聚合结果的 NULL 标记。
+     * @return 当前分组的 NULL 标记；执行结束时返回空数组引用。
+     */
     const std::vector<bool>& nulls() const override {
         static const std::vector<bool> no_nulls;
         return is_end() ? no_nulls : nulls_;

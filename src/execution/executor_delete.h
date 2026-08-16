@@ -17,6 +17,12 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+/**
+ * @brief 删除指定 RID 集合中满足条件的记录。
+ *
+ * 删除会重新读取记录的可见版本并再次检查谓词；事务模式下还负责锁、MVCC
+ * 版本链、WAL、历史索引键以及 SSI 写依赖，非事务模式则直接删除物理记录。
+ */
 class DeleteExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;                  // 表的元数据
@@ -27,6 +33,14 @@ private:
     SmManager* sm_manager_;
 
 public:
+    /**
+     * @brief 创建删除执行器。
+     * @param sm_manager 系统管理器。
+     * @param tab_name 目标表名。
+     * @param conds 删除前需要满足的条件。
+     * @param rids 待检查的记录 RID 列表。
+     * @param context 当前执行上下文。
+     */
     DeleteExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Condition> conds,
                    std::vector<Rid> rids, Context* context) {
         sm_manager_ = sm_manager;
@@ -38,11 +52,19 @@ public:
         context_ = context;
     }
 
+    /**
+     * @brief 执行删除操作。
+     * @return DML 不产生上层数据行，始终返回 nullptr。
+     * @throws TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
+     *
+     * 对每个候选 RID 先取可见记录并过滤，再执行并发检查。事务模式下保存
+     * undo 版本并写入墓碑元数据；索引删除过程若失败会按逆序恢复已删除索引。
+     */
     std::unique_ptr<RmRecord> Next() override {
         if (rids_.empty()) {
             return nullptr; // 没有更多记录可以删除
         }
-        // 删除记录
+        // 先基于调用方提供的 RID 重新读取可见版本，避免直接操作过期快照。
         for (Rid rid : rids_) {
             auto rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
@@ -59,7 +81,7 @@ public:
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
             }
-            // MVCC Write-Write conflict detection
+            // 第一阶段：获取记录锁，并在 RC 下刷新到最新版本后重新验证谓词。
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 auto txn = context_->txn_;
                 if (context_->lock_mgr_ != nullptr &&
@@ -97,7 +119,7 @@ public:
                     throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
 
-                // SSI: Check if this delete conflicts with other SER transactions' reads
+                // Serializable 阶段：检查本次删除是否与其他事务的读集合形成危险结构。
                 if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr) {
                     auto* txn_mgr = context_->txn_mgr_;
                     if (txn_mgr->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, tab_name_,
@@ -106,6 +128,7 @@ public:
                     }
                 }
             }
+            // 第二阶段：WAL 记录必须先于物理删除产生。
             if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
                 DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
                 log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
@@ -115,6 +138,7 @@ public:
             auto undo_record = context_ != nullptr && context_->txn_ != nullptr
                                    ? std::make_unique<WriteRecord>(WType::DELETE_TUPLE, tab_name_, rid, *rec)
                                    : nullptr;
+            // 第三阶段：删除所有索引键，并记录已完成项以便异常时回滚。
             struct DeletedIndex {
                 const IndexMeta* index;
                 std::vector<char> key;
@@ -145,6 +169,7 @@ public:
                 // undo_record is automatically cleaned up by unique_ptr
                 throw;
             }
+            // 第四阶段：事务删除使用 undo + tombstone 保留旧版本；无事务时直接释放槽位。
             if (undo_record != nullptr) {
                 UndoLog undo;
                 undo.is_deleted_ = true;
@@ -170,16 +195,34 @@ public:
         return nullptr;
     }
 
+    /**
+     * @brief 返回目标表列元数据。
+     * @return 目标表列元数据引用。
+     */
     const std::vector<ColMeta>& cols() const override {
         return tab_.cols;
     }
 
+    /**
+     * @brief 返回执行器类型名称。
+     * @return "DeleteExecutor"。
+     */
     std::string getType() override {
         return "DeleteExecutor"; // 返回执行器的名称
     }
+    /**
+     * @brief 返回删除节点的抽象 RID。
+     * @return 抽象记录号引用。
+     */
     Rid& rid() override {
         return _abstract_rid;
     }
+    /**
+     * @brief 查找目标表列的元数据及偏移。
+     * @param target 目标列。
+     * @return 匹配的列元数据。
+     * @throws ColumnNotFoundError 找不到目标列时抛出。
+     */
     ColMeta get_col_offset(const TabCol& target) override {
         for (const auto& col : tab_.cols) {
             if (col.tab_name == tab_name_ && col.name == target.col_name) {
