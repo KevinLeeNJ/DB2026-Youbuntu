@@ -112,6 +112,7 @@ PreparedStatement inspect_prepared(DatabaseInstance& database, std::uint16_t id,
         for (deltakernel::DeltaValueType type : description.types)
             result.result_types.push_back(protocol_type(type));
         result.catalog_generation = description.catalog_generation;
+        result.delta_program = database.delta_database->CompilePrepared(std::move(bound), declared_parameters);
         return result;
     }
 

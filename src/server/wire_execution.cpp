@@ -271,18 +271,39 @@ void handle_batch(DatabaseInstance& database, int fd, Reader& reader, SessionSta
                 if (statement->catalog_generation != database.delta_database->CatalogGeneration())
                     revalidate_prepared(database, *statement, session.isolation);
                 result.begin_operation(i);
-                std::unique_ptr<ast::TreeNode> bound_tree;
-                if (database.delta_database->DiagnosticsEnabled()) {
-                    const auto clone_started = std::chrono::steady_clock::now();
-                    bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
-                    database.delta_database->RecordPreparedClone(
-                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now() - clone_started)
-                                                   .count()));
+                bool query;
+                if (statement->delta_program) {
+                    database.delta_database->RecordPreparedNative();
+                    deltakernel::DeltaParameterFrame parameters;
+                    parameters.reserve(operations[i].values.size());
+                    for (const auto& value : operations[i].values) {
+                        deltakernel::DeltaParameter parameter;
+                        parameter.present = value.present;
+                        parameter.type = value.type == Type::INT32     ? deltakernel::DeltaValueType::Int
+                                         : value.type == Type::FLOAT32 ? deltakernel::DeltaValueType::Float
+                                                                       : deltakernel::DeltaValueType::Char;
+                        parameter.integer = value.int32;
+                        parameter.float_bits = value.float_bits;
+                        parameter.text = value.text;
+                        parameters.push_back(std::move(parameter));
+                    }
+                    query = database.delta_database->ExecutePrepared(*statement->delta_program, parameters,
+                                                                     session.delta_session, &result);
                 } else {
-                    bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
+                    database.delta_database->RecordPreparedFallback();
+                    std::unique_ptr<ast::TreeNode> bound_tree;
+                    if (database.delta_database->DiagnosticsEnabled()) {
+                        const auto clone_started = std::chrono::steady_clock::now();
+                        bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
+                        database.delta_database->RecordPreparedClone(
+                            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - clone_started)
+                                                      .count()));
+                    } else {
+                        bound_tree = ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i]));
+                    }
+                    query = database.delta_database->Execute(std::move(bound_tree), session.delta_session, &result);
                 }
-                const bool query = database.delta_database->Execute(std::move(bound_tree), session.delta_session, &result);
                 result.finish_operation(query);
                 ++executed;
             }

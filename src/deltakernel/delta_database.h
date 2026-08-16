@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <shared_mutex>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -24,6 +25,36 @@
 namespace deltakernel {
 
 enum class DeltaValueType : uint8_t { Int, Float, Char };
+struct DeltaParameter {
+    DeltaValueType type = DeltaValueType::Int;
+    bool present = false;
+    int32_t integer = 0;
+    uint32_t float_bits = 0;
+    std::string text;
+};
+using DeltaParameterFrame = std::vector<DeltaParameter>;
+
+class DeltaPreparedProgram {
+public:
+    DeltaPreparedProgram(std::unique_ptr<ast::TreeNode> tree, bool query, uint64_t catalog_generation)
+        : tree_(std::move(tree)), query_(query), catalog_generation_(catalog_generation) {}
+    DeltaPreparedProgram(const DeltaPreparedProgram&) = delete;
+    DeltaPreparedProgram& operator=(const DeltaPreparedProgram&) = delete;
+
+    bool query() const noexcept {
+        return query_;
+    }
+    uint64_t catalog_generation() const noexcept {
+        return catalog_generation_;
+    }
+
+private:
+    friend class DeltaDatabase;
+    std::unique_ptr<ast::TreeNode> tree_;
+    bool query_ = false;
+    uint64_t catalog_generation_ = 0;
+};
+
 struct PreparedDescription {
     bool query = false;
     std::vector<std::string> names;
@@ -52,6 +83,8 @@ struct DeltaSession {
     std::optional<epoch_si_poc::EpochSiEngine::Txn> txn;
     bool explicit_txn = false;
     DeltaOverlay overlay;
+    DeltaOverlay removed_overlay;
+    std::set<epoch_si_poc::RowId> private_insert_ids;
     // Held for the lifetime of an explicit transaction so DDL/checkpoint/LOAD
     // cannot pass between its writes and durable commit.
     std::optional<std::shared_lock<std::shared_mutex>> admission;
@@ -63,6 +96,7 @@ private:
         size_t last_row_ids_probed = 0;
         size_t last_row_reads_probed = 0;
         size_t last_base_entries_probed = 0;
+        size_t last_live_summary_words_probed = 0;
         size_t last_overlay_refs_examined = 0;
         size_t last_overlay_refs_copied = 0;
         size_t last_overlay_order_ops = 0;
@@ -100,6 +134,10 @@ public:
     static bool IsDeltaDirectory(const std::string& directory);
 
     bool Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& session, QueryResultSink* sink);
+    bool ExecutePrepared(const DeltaPreparedProgram& program, const DeltaParameterFrame& parameters,
+                         DeltaSession& session, QueryResultSink* sink);
+    std::unique_ptr<DeltaPreparedProgram> CompilePrepared(std::unique_ptr<ast::TreeNode> tree,
+                                                          const std::vector<DeltaValueType>& declared_parameters) const;
     uint64_t CatalogGeneration() const;
     PreparedDescription DescribePrepared(const ast::TreeNode& tree,
                                          const std::vector<DeltaValueType>& declared_parameters) const;
@@ -109,6 +147,8 @@ public:
         return diagnostics_ != nullptr;
     }
     void RecordPreparedClone(uint64_t elapsed_ns) noexcept;
+    void RecordPreparedNative() noexcept;
+    void RecordPreparedFallback() noexcept;
     // Test controls are configured only while no database operation is running.
     void SetCatalogSaveFailureForTest(bool fail) {
         fail_catalog_save_for_test_ = fail;
@@ -150,8 +190,15 @@ public:
         commit_reacquire_hook_for_test_ = std::move(hook);
     }
     void CloseWalForTest();
+    std::array<uint64_t, 4> RotateWalForTest();
+    void SetWalRotationCrashPointForTest(epoch_si_poc::CheckpointCrashPoint point) {
+        rotation_crash_point_for_test_ = point;
+    }
     void EnableDiagnosticsForTest();
     std::array<uint64_t, 6> QueryDiagnosticsForTest() const;
+    std::array<uint64_t, 5> RouteDiagnosticsForTest() const;
+    std::array<uint64_t, 8> TailDiagnosticsForTest() const;
+    std::array<uint64_t, 5> InflightDiagnosticsForTest() const;
     std::array<uint64_t, 6> ConcurrencyDiagnosticsForTest() const;
     size_t WalFrameCountForTest() const;
     size_t CommitQueueDepthForTest() const;
@@ -160,11 +207,15 @@ public:
     std::array<size_t, 5> JoinOuterProbeCensusForTest(const DeltaSession& session) const;
     std::array<uint64_t, 5> JoinOuterDiagnosticsForTest() const;
     std::array<size_t, 8> OrderedProbeCensusForTest(const DeltaSession& session) const;
+    size_t LiveSummaryProbeCensusForTest(const DeltaSession& session) const;
     std::array<size_t, 4> SidecarIoCensusForTest(const DeltaSession& session) const;
+    std::array<size_t, 3> CurrentIndexCensusForTest() const;
     size_t SidecarValidationCountForTest() const;
     std::optional<uint64_t> SidecarLiveTailForTest(epoch_si_poc::ConstraintId constraint_id) const;
 
 private:
+    bool ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session, QueryResultSink* sink,
+                     uint64_t expected_catalog_generation = 0);
     enum class ColumnType : uint8_t { Int, Float, Char };
     struct Column {
         std::string name;
@@ -202,16 +253,18 @@ private:
         epoch_si_poc::Epoch snapshot_epoch = 0;
         uint64_t count = 0;
         uint64_t key_bytes = 0;
-        uint64_t row_order_bytes = 0;
+        uint64_t row_order_offset = 0;
+        uint64_t max_local_id = 0;
         size_t mapped_bytes = 0;
         void* mapping = nullptr;
         // Derived current-state state. It is intentionally not persisted with the immutable sidecar.
         std::vector<uint64_t> live_bitmap;
+        std::vector<std::vector<uint64_t>> live_summary;
 
         SidecarDescriptor() = default;
         SidecarDescriptor(epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id, uint64_t generation,
                           epoch_si_poc::Epoch snapshot_epoch, uint64_t count, uint64_t key_bytes,
-                          uint64_t row_order_bytes, size_t mapped_bytes, void* mapping);
+                          uint64_t row_order_offset, size_t mapped_bytes, void* mapping);
         ~SidecarDescriptor();
         SidecarDescriptor(const SidecarDescriptor&) = delete;
         SidecarDescriptor& operator=(const SidecarDescriptor&) = delete;
@@ -236,6 +289,8 @@ private:
     struct CommitTicket {
         std::optional<epoch_si_poc::EpochSiEngine::Txn> txn;
         CommittedOverlay overlay;
+        CommittedOverlay active_additions;
+        CommittedOverlay active_removals;
         epoch_si_poc::CommitResult result{};
         std::exception_ptr error;
         bool done = false;
@@ -268,6 +323,11 @@ private:
     static CommittedOverlay PrepareCommittedOverlay(const DeltaOverlay& overlay);
     void RunCommitInstallHookForTest() noexcept;
     void InstallCommittedOverlay(CommittedOverlay& overlay) noexcept;
+    void InstallCurrentOverlay(CommittedOverlay& additions, CommittedOverlay& removals) noexcept;
+    void ApplyCurrentBaseState(const TableSchema& schema, epoch_si_poc::ConstraintId constraint_id,
+                               const EncodedKey& key, uint64_t local_id, bool live) noexcept;
+    void ClearCurrentBaseRow(const TableSchema& schema, uint64_t local_id) noexcept;
+    void SetCurrentBaseBit(SidecarDescriptor& descriptor, uint64_t local_id, bool live) noexcept;
     epoch_si_poc::RowImage EncodeRow(const TableSchema& schema, const std::vector<Cell>& cells) const;
     std::vector<Cell> DecodeRow(const TableSchema& schema, const epoch_si_poc::RowImage& image) const;
     std::vector<uint8_t> EncodeKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells,
@@ -309,12 +369,17 @@ private:
     template <typename Overlay>
     void AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells, epoch_si_poc::RowId id,
                     const std::vector<Cell>* previous = nullptr);
+    void RemoveOverlay(DeltaOverlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
+                       epoch_si_poc::RowId id);
+    void RemoveOverlay(DeltaOverlay& overlay, const TableSchema& schema, const Index& index,
+                       const std::vector<Cell>& cells, epoch_si_poc::RowId id);
     void VisitRows(DeltaSession& session, const TableSchema& schema,
                    const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                    const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor,
                    bool* used_index = nullptr, const IndexEqualities* equalities = nullptr,
                    size_t* inferred_used = nullptr);
-    void ReportDiagnostics() const noexcept;
+    void ReportDiagnostics(bool periodic = false) const noexcept;
+    void MaybeReportDiagnostics() const noexcept;
     std::shared_lock<std::shared_mutex> LockExecutionShared();
     std::unique_lock<std::shared_mutex> LockExecutionUnique();
     std::shared_lock<std::shared_mutex> LockStateShared(bool report_blocked = false) const;
@@ -325,7 +390,10 @@ private:
     bool report_diagnostics_ = false;
     std::array<std::atomic<uint64_t>, 5> execute_calls_{};
     std::array<std::atomic<uint64_t>, 5> execute_ns_{};
+    std::array<std::atomic<uint64_t>, 5> execute_max_ns_{};
+    std::array<std::atomic<uint64_t>, 5> execute_inflight_{};
     std::atomic<uint64_t> execute_shared_wait_ns_{0};
+    std::atomic<uint64_t> execute_shared_wait_max_ns_{0};
     std::atomic<uint64_t> execute_shared_calls_{0};
     std::atomic<uint64_t> state_unique_commit_wait_ns_{0};
     std::atomic<uint64_t> state_unique_commit_batches_{0};
@@ -334,13 +402,26 @@ private:
     std::atomic<uint64_t> peak_inflight_execute_{0};
     std::atomic<uint64_t> commit_queue_wait_ns_{0};
     std::atomic<uint64_t> commit_ready_wait_ns_{0};
+    std::atomic<uint64_t> commit_ready_wait_max_ns_{0};
     std::atomic<uint64_t> commit_leader_reacquire_wait_ns_{0};
+    std::atomic<uint64_t> commit_initial_unique_wait_max_ns_{0};
+    std::atomic<uint64_t> commit_publish_unique_wait_max_ns_{0};
     std::atomic<uint64_t> commit_prepare_unique_ns_{0};
+    std::atomic<uint64_t> commit_prepare_unique_max_ns_{0};
     std::atomic<uint64_t> commit_sync_unlocked_ns_{0};
+    std::atomic<uint64_t> commit_sync_unlocked_max_ns_{0};
     std::atomic<uint64_t> commit_reacquire_ns_{0};
     std::atomic<uint64_t> commit_publish_unique_ns_{0};
+    std::atomic<uint64_t> commit_publish_unique_max_ns_{0};
+    // Diagnostics-only leader phase: 0 idle, 1 initial unique wait, 2 prepare,
+    // 3 WAL sync, 4 publish unique wait, 5 publish/install.
+    std::atomic<uint64_t> commit_phase_{0};
+    uint64_t diagnostics_period_ns_ = 0;
+    mutable std::atomic<uint64_t> diagnostics_last_report_ns_{0};
     std::atomic<uint64_t> prepared_clone_count_{0};
     std::atomic<uint64_t> prepared_clone_ns_{0};
+    std::atomic<uint64_t> prepared_native_count_{0};
+    std::atomic<uint64_t> prepared_fallback_count_{0};
     std::atomic<uint64_t> sidecar_base_entries_{0};
     std::atomic<uint64_t> sidecar_overlay_refs_{0};
     std::atomic<uint64_t> join_parameterized_probes_{0};
@@ -374,12 +455,16 @@ private:
     std::function<void()> commit_install_hook_for_test_;
     std::function<void()> commit_sync_hook_for_test_;
     std::function<void()> commit_reacquire_hook_for_test_;
+    epoch_si_poc::CheckpointCrashPoint rotation_crash_point_for_test_ = epoch_si_poc::CheckpointCrashPoint::kNone;
     mutable std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> sidecars_;
     CommittedOverlay overlay_;
+    CommittedOverlay current_overlay_;
+    std::atomic<uint64_t> current_base_row_order_comparisons_{0};
     size_t sidecar_validation_count_ = 0;
     mutable std::mutex execution_turnstile_;
     std::shared_mutex execution_gate_;
     mutable std::mutex commit_mutex_;
+    mutable std::mutex commit_epoch_gate_;
     std::deque<std::shared_ptr<CommitTicket>> commit_queue_;
     std::condition_variable commit_slot_available_;
     bool commit_leader_ = false;

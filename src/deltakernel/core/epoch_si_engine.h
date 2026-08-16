@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -91,12 +92,23 @@ struct DeltaDiagnostics {
     std::atomic<uint64_t> wal_pwrite_ns{0};
     std::atomic<uint64_t> wal_fdatasync_calls{0};
     std::atomic<uint64_t> wal_fdatasync_ns{0};
+    std::atomic<uint64_t> wal_fdatasync_max_ns{0};
     std::atomic<uint64_t> commit_encode_ns{0};
     std::atomic<uint64_t> commit_prepare_ns{0};
     std::atomic<uint64_t> commit_install_ns{0};
     std::atomic<uint64_t> commit_publish_ns{0};
     std::atomic<uint64_t> commit_frames{0};
     std::atomic<uint64_t> commit_tickets{0};
+    // These counters describe the latest-snapshot sidecar accelerator only.
+    // The immutable base and historical overlay remain the authority for old snapshots.
+    std::atomic<uint64_t> current_index_latest_routes{0};
+    std::atomic<uint64_t> current_index_historical_routes{0};
+    std::atomic<uint64_t> current_live_base_candidates{0};
+    std::atomic<uint64_t> current_live_summary_skips{0};
+    std::atomic<uint64_t> current_live_summary_words{0};
+    std::atomic<uint64_t> current_overlay_addition_ids{0};
+    std::atomic<uint64_t> current_overlay_removal_ids{0};
+    std::atomic<uint64_t> current_base_bit_flips{0};
     std::array<std::atomic<uint64_t>, 33> commit_batch_hist{};
 };
 
@@ -135,6 +147,9 @@ public:
                    std::vector<uint64_t> block_first_ids, std::vector<uint64_t> block_offsets);
 
 private:
+    friend class EpochSiEngine;
+    std::optional<bool> RecoveryContains(uint64_t local_id) const;
+
     std::string path_;
     int fd_ = -1;
     TableId table_id_ = 0;
@@ -146,6 +161,8 @@ private:
     uint64_t next_local_id_ = 0;
     std::vector<uint64_t> block_first_ids_;
     std::vector<uint64_t> block_offsets_;
+    std::vector<uint64_t> recovery_membership_;
+    bool recovery_membership_complete_ = false;
     mutable std::shared_ptr<DeltaDiagnostics> diagnostics_;
 };
 
@@ -178,6 +195,18 @@ private:
     friend class CheckpointDb;
     struct PendingCommit;
     struct OwnerState {
+        struct SnapshotSlot {
+            Epoch epoch = 0;
+            bool active = false;
+        };
+
+        size_t RegisterSnapshot(Epoch epoch);
+        void UnregisterSnapshot(size_t slot) noexcept;
+        std::optional<Epoch> OldestSnapshot() const noexcept;
+
+        mutable std::mutex snapshot_mutex;
+        std::vector<SnapshotSlot> snapshot_slots;
+        std::vector<size_t> free_snapshot_slots;
         std::atomic<size_t> active_count{0};
         std::atomic<bool> valid{true};
     };
@@ -216,6 +245,7 @@ public:
         friend class EpochSiEngine;
         void Finish() noexcept;
         std::shared_ptr<OwnerState> owner_;
+        size_t snapshot_slot_ = std::numeric_limits<size_t>::max();
         Epoch start_epoch_ = 0;
         bool active_ = false;
         bool prepared_ = false;
@@ -237,6 +267,10 @@ public:
                                   Epoch base_epoch = 0);
     static EpochSiEngine OpenFileAt(BaseImage base, ImmutableTables tables, int directory_fd,
                                     const std::string& wal_name, Epoch base_epoch = 0);
+    static EpochSiEngine OpenWalChain(BaseImage base, ImmutableTables tables, std::unique_ptr<FileWal> legacy,
+                                      std::vector<std::unique_ptr<FileWal>> segments, Epoch base_epoch,
+                                      uint64_t base_next_commit_seq,
+                                      const std::map<TableId, uint64_t>& manifest_frontiers);
     static EpochSiEngine CreateFile(BaseImage base, const std::string& wal_path, Epoch base_epoch = 0);
 
     Txn Begin();
@@ -252,7 +286,10 @@ public:
     void SyncPreparedCommit(PreparedCommit& prepared);
     void PublishPreparedCommit(PreparedCommit& prepared);
     void SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics);
-
+    uint64_t next_local_id(TableId table_id) const;
+    uint64_t next_commit_seq() const {
+        return next_commit_seq_;
+    }
     void SetCrashPointForTest(CrashPoint point, size_t position = 0);
     void SetFileMaxWriteChunkForTest(size_t bytes);
     void CloseFileForTest();
@@ -265,8 +302,11 @@ public:
     size_t version_count() const {
         return version_count_;
     }
+    size_t retained_version_count_for_test() const {
+        return OccupiedRowStateCount();
+    }
     size_t explicit_row_metadata_count() const {
-        return last_row_epoch_.size();
+        return OccupiedRowStateCount();
     }
     size_t last_publication_staged_entries_for_test() const {
         return last_publication_staged_entries_;
@@ -280,6 +320,9 @@ public:
     const std::vector<uint8_t>& recovery_wal_image_for_test() const {
         return recovery_wal_image_;
     }
+    size_t retained_recovery_wal_capacity_for_test() const {
+        return volatile_wal_.capacity() + recovery_wal_image_.capacity();
+    }
     size_t wal_frame_count() const {
         return wal_frame_count_;
     }
@@ -289,6 +332,9 @@ public:
     size_t active_transaction_count() const {
         return identity_ ? identity_->active_count.load(std::memory_order_acquire) : 0;
     }
+    std::optional<Epoch> oldest_active_snapshot_for_test() const noexcept {
+        return identity_ ? identity_->OldestSnapshot() : std::nullopt;
+    }
     BaseImage MaterializePublished() const;
     bool CanInstallPristineTable(TableId table_id) const;
     size_t resident_base_row_count() const {
@@ -296,10 +342,17 @@ public:
     }
     size_t immutable_index_bytes() const;
     size_t immutable_read_probes_for_test() const;
+    std::optional<bool> immutable_recovery_membership_for_test(RowId row_id) const {
+        const auto table = immutable_tables_.find(row_id.table_id);
+        return table == immutable_tables_.end() ? std::optional<bool>(false)
+                                                : table->second->RecoveryContains(row_id.local_id);
+    }
     size_t immutable_table_count() const {
         return immutable_tables_.size();
     }
     void VisitLatestVersions(const std::function<void(RowId, const Row&)>& visitor) const;
+    void VisitLatestVersionHeads(const std::function<void(RowId, Epoch, const Row&)>& visitor) const;
+    bool IsLatestSnapshot(const Txn& txn) const;
     std::set<TableId> DirtyTableIds() const {
         return dirty_tables_;
     }
@@ -321,14 +374,51 @@ private:
         std::unique_ptr<Version> older;
     };
 
+    // Row metadata is sparse by construction: immutable/base rows do not get a
+    // slot until a committed version is created.  Chunks are ordered, while
+    // their fixed slots make point lookup independent of the number of rows.
+    static constexpr uint64_t kRowStateChunkSize = 256;
+    struct RowState {
+        std::unique_ptr<Version> head;
+        Epoch last_epoch = 0;
+        Epoch last_pruned_watermark = 0;
+        size_t version_count = 0;
+        bool occupied = false;
+    };
+    struct RowStateChunk {
+        std::array<RowState, kRowStateChunkSize> slots;
+        size_t occupied = 0;
+    };
+    struct RowStateChunkKey {
+        TableId table_id = 0;
+        uint64_t chunk_id = 0;
+
+        bool operator<(const RowStateChunkKey& other) const {
+            return table_id != other.table_id ? table_id < other.table_id : chunk_id < other.chunk_id;
+        }
+    };
+    using RowStateDirectory = std::map<RowStateChunkKey, std::unique_ptr<RowStateChunk>>;
+
+    static RowStateChunkKey ChunkKey(RowId row_id) {
+        return {row_id.table_id, row_id.local_id / kRowStateChunkSize};
+    }
+    static size_t ChunkSlot(RowId row_id) {
+        return static_cast<size_t>(row_id.local_id % kRowStateChunkSize);
+    }
+    const RowState* FindRowState(RowId row_id) const noexcept;
+    RowState* FindRowState(RowId row_id) noexcept;
+    size_t OccupiedRowStateCount() const noexcept;
+    bool HasRowStateTable(TableId table_id) const noexcept;
+
     struct PreparedState {
-        std::map<RowId, std::unique_ptr<Version>> versions;
-        std::map<RowId, Epoch> last_row_epoch;
+        RowStateDirectory row_states;
         std::map<ConstraintClaim, Epoch> last_claim_epoch;
         std::map<ConstraintClaim, RowId> claim_owner;
         std::map<TableId, uint64_t> next_row_id;
         std::set<TableId> dirty_tables;
         std::map<ConstraintClaim, RowId> claim_owner_erases;
+        std::vector<RowId> touched_rows;
+        std::vector<std::unique_ptr<Version>> retired_versions;
         size_t version_count;
         size_t staged_entries;
         size_t staged_versions;
@@ -345,21 +435,38 @@ private:
     };
     struct PreparedTableInstall {
         ImmutableTables tables;
-        std::map<RowId, Epoch> last_row_epoch;
         std::map<ConstraintClaim, Epoch> last_claim_epoch;
         std::map<ConstraintClaim, RowId> claim_owner;
         std::map<TableId, uint64_t> next_row_id;
     };
+    struct DecodedFrameHeader {
+        uint32_t version;
+        uint32_t frame_bytes;
+        Epoch epoch;
+        uint64_t first_commit_seq;
+        uint32_t txn_count;
+        uint32_t operation_count;
+        uint32_t payload_bytes;
+    };
 
     EpochSiEngine(BaseImage base, ImmutableTables tables, Epoch base_epoch);
+    void SyncFileWalForRotation();
+    void InstallFileWalForRotation(std::unique_ptr<FileWal> file) noexcept;
+    static EpochSiEngine RecoverFile(BaseImage base, ImmutableTables tables, std::unique_ptr<FileWal> file,
+                                     Epoch base_epoch);
+    void RecoverFileFrames(FileWal& file, bool allow_torn_tail);
+    static DecodedFrameHeader DecodeFrameHeader(const std::vector<uint8_t>& wal_image, size_t frame_start);
+    void RecoverFrame(const std::vector<uint8_t>& wal_image, size_t frame_start, const DecodedFrameHeader& header);
     std::optional<Row> ReadCommitted(RowId row_id, Epoch snapshot) const;
+    bool RecoveryRowExists(RowId row_id) const;
     Epoch LastExistingRowEpoch(RowId row_id) const;
     static std::vector<uint8_t> EncodeFrame(Epoch epoch, const std::vector<Txn*>& txns,
                                             const std::vector<uint64_t>& commit_seqs);
     void RequireActive(const Txn& txn) const;
-    void Install(const std::vector<Txn*>& accepted, Epoch epoch);
+    void InstallRecoveredLatest(const std::vector<Txn*>& accepted, Epoch epoch);
     PreparedState PreparePublication(const std::vector<Txn*>& accepted, Epoch epoch) const;
     bool InstallPrepared(PreparedState&& prepared) noexcept;
+    void PruneTouchedVersions(PreparedState& prepared, Epoch low_watermark) noexcept;
     PreparedTableInstall PrepareTableInstall(std::shared_ptr<const ImmutableTable> table) const;
     void InstallTablePrepared(PreparedTableInstall&& prepared) noexcept;
     void VisitPublished(TableId table_id, const std::function<void(RowId, const Row&)>& visitor);
@@ -372,14 +479,15 @@ private:
 
     BaseImage base_;
     ImmutableTables immutable_tables_;
-    std::map<RowId, std::unique_ptr<Version>> versions_;
-    std::map<RowId, Epoch> last_row_epoch_;
+    RowStateDirectory row_states_;
     std::map<ConstraintClaim, Epoch> last_claim_epoch_;
     std::map<ConstraintClaim, RowId> claim_owner_;
+    std::map<TableId, uint64_t> recovery_persisted_frontiers_;
     // Insert execution only reserves a private RowId. Publication still owns all committed structural state.
     std::mutex row_id_allocator_mutex_;
     std::map<TableId, uint64_t> next_row_id_;
     std::shared_ptr<OwnerState> identity_;
+    Epoch base_epoch_ = 0;
     Epoch published_epoch_ = 0;
     uint64_t next_commit_seq_ = 1;
     size_t version_count_ = 0;

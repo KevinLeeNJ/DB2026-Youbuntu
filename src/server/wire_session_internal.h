@@ -114,6 +114,7 @@ struct PreparedStatement {
     std::vector<Type> parameters;
     std::vector<std::string> names;
     std::vector<Type> result_types;
+    std::unique_ptr<deltakernel::DeltaPreparedProgram> delta_program;
     std::unique_ptr<const PreparedPlanDescriptor> descriptor;
     std::string database_identity;
     std::uint64_t catalog_generation = 0;

@@ -108,6 +108,92 @@ TEST(FileWalTest, ReopenPreservesFramesAndUsesRealFdatasync) {
     reopened.Abort(view);
 }
 
+TEST(FileWalTest, StreamingRecoveryRetainsOnlyLatestHeadsAndNoWalImage) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+    auto first = engine.Begin();
+    engine.PutImage(first, {kTable, 1}, test_row::Make(kTable, "a", 11));
+    ASSERT_EQ(engine.CommitBatch({&first})[0].status, CommitStatus::kCommitted);
+    auto second = engine.Begin();
+    engine.PutImage(second, {kTable, 1}, test_row::Make(kTable, "a", 12));
+    ASSERT_EQ(engine.CommitBatch({&second})[0].status, CommitStatus::kCommitted);
+    auto erased = engine.Begin();
+    engine.Erase(erased, {kTable, 2});
+    ASSERT_EQ(engine.CommitBatch({&erased})[0].status, CommitStatus::kCommitted);
+    auto inserted = engine.Begin();
+    const RowId inserted_id = engine.InsertImage(inserted, kTable, test_row::Make(kTable, "c", 33));
+    ASSERT_EQ(engine.CommitBatch({&inserted})[0].status, CommitStatus::kCommitted);
+
+    auto reopened = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    EXPECT_EQ(reopened.published_epoch(), 4U);
+    EXPECT_EQ(reopened.version_count(), 3U);
+    EXPECT_EQ(reopened.retained_version_count_for_test(), 3U);
+    EXPECT_TRUE(reopened.recovery_wal_image_for_test().empty());
+    EXPECT_EQ(reopened.retained_recovery_wal_capacity_for_test(), 0U);
+    auto view = reopened.Begin();
+    EXPECT_EQ(test_row::Value(*reopened.Read(view, {kTable, 1})), 12);
+    EXPECT_FALSE(reopened.Read(view, {kTable, 2}).has_value());
+    EXPECT_EQ(test_row::Value(*reopened.Read(view, inserted_id)), 33);
+    reopened.Abort(view);
+
+    auto next = reopened.Begin();
+    reopened.PutImage(next, inserted_id, test_row::Make(kTable, "c", 44));
+    const auto result = reopened.CommitBatch({&next})[0];
+    EXPECT_EQ(result.epoch, 5U);
+    EXPECT_EQ(result.commit_seq, 5U);
+    EXPECT_TRUE(reopened.recovery_wal_image_for_test().empty());
+    EXPECT_EQ(reopened.retained_recovery_wal_capacity_for_test(), 0U);
+}
+
+TEST(FileWalTest, FileBackedCrashImageRemainsPhysicalWalOnly) {
+    TempWal temp;
+    {
+        auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
+        auto txn = engine.Begin();
+        engine.PutImage(txn, {kTable, 1}, test_row::Make(kTable, "a", 11));
+        ASSERT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    }
+    auto reopened = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    EXPECT_TRUE(reopened.recovery_wal_image_for_test().empty());
+    EXPECT_EQ(reopened.retained_recovery_wal_capacity_for_test(), 0U);
+    auto txn = reopened.Begin();
+    reopened.PutImage(txn, {kTable, 1}, test_row::Make(kTable, "a", 22));
+    reopened.SetCrashPointForTest(CrashPoint::kAfterSync);
+    EXPECT_THROW(reopened.CommitBatch({&txn}), SimulatedCrash);
+    EXPECT_TRUE(reopened.recovery_wal_image_for_test().empty());
+
+    auto recovered = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    auto view = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(view, {kTable, 1})), 22);
+    EXPECT_EQ(recovered.published_epoch(), 2U);
+    recovered.Abort(view);
+}
+
+TEST(FileWalTest, StreamingRecoverySplicesFrameAcrossReadBuffer) {
+    TempWal temp;
+    auto engine = EpochSiEngine::CreateFile({}, temp.path());
+    RowImage first_image;
+    first_image.bytes.assign(700U * 1024U, 0x11);
+    auto first = engine.Begin();
+    const RowId id = engine.InsertImage(first, kTable, first_image);
+    ASSERT_EQ(engine.CommitBatch({&first})[0].status, CommitStatus::kCommitted);
+    RowImage second_image;
+    second_image.bytes.assign(700U * 1024U, 0x22);
+    auto second = engine.Begin();
+    engine.PutImage(second, id, second_image);
+    ASSERT_EQ(engine.CommitBatch({&second})[0].status, CommitStatus::kCommitted);
+    ASSERT_GT(engine.durable_wal_bytes(), 1U << 20);
+
+    auto recovered = EpochSiEngine::OpenFile({}, temp.path());
+    auto view = recovered.Begin();
+    const auto visible = recovered.Read(view, id);
+    ASSERT_TRUE(visible.has_value());
+    EXPECT_EQ(visible->bytes, second_image.bytes);
+    EXPECT_EQ(recovered.retained_version_count_for_test(), 1U);
+    EXPECT_EQ(recovered.retained_recovery_wal_capacity_for_test(), 0U);
+    recovered.Abort(view);
+}
+
 TEST(FileWalTest, DiagnosticsAreOptInAndCountDurableCommitIo) {
     TempWal temp;
     auto engine = EpochSiEngine::CreateFile(FileBase(), temp.path());
@@ -210,6 +296,17 @@ TEST(FileWalTest, LegacyV2MutationFrameStillRecovers) {
     auto view = recovered.Begin();
     EXPECT_EQ(test_row::Value(*recovered.Read(view, {kTable, 1})), 66);
     recovered.Abort(view);
+
+    TempWal temp;
+    std::ofstream output(temp.path(), std::ios::binary);
+    ASSERT_TRUE(output.is_open());
+    output.write(reinterpret_cast<const char*>(legacy.data()), static_cast<std::streamsize>(legacy.size()));
+    output.close();
+    auto file_recovered = EpochSiEngine::OpenFile(FileBase(), temp.path());
+    auto file_view = file_recovered.Begin();
+    EXPECT_EQ(test_row::Value(*file_recovered.Read(file_view, {kTable, 1})), 66);
+    EXPECT_EQ(file_recovered.retained_recovery_wal_capacity_for_test(), 0U);
+    file_recovered.Abort(file_view);
 }
 
 TEST(FileWalTest, ReadOnlyAfterSyncCrashRecoversDurableCommit) {

@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <sys/stat.h>
 #include <string>
 #include <system_error>
@@ -148,6 +150,33 @@ std::string TablePath(const TempDbDirectory& temp, TableId id, uint64_t generati
     return temp.path() + "/tablebase." + std::to_string(id) + "." + std::to_string(generation);
 }
 
+std::string SegmentPath(const TempDbDirectory& temp, uint64_t lineage, uint64_t id) {
+    return temp.path() + "/db.log.s." + std::to_string(lineage) + "." + std::to_string(id);
+}
+
+void ConvertFreshSegmentedManifestToLegacy(const TempDbDirectory& temp) {
+    constexpr size_t kManifestHeaderBytes = 44;
+    constexpr size_t kTableRefBytes = 40;
+    constexpr size_t kSegmentHeaderBytes = 72;
+    auto manifest = ReadFile(temp.path() + "/MANIFEST");
+    const uint32_t count = static_cast<uint32_t>(manifest.at(36)) | (static_cast<uint32_t>(manifest.at(37)) << 8) |
+                           (static_cast<uint32_t>(manifest.at(38)) << 16) |
+                           (static_cast<uint32_t>(manifest.at(39)) << 24);
+    std::vector<uint8_t> legacy(kManifestHeaderBytes + static_cast<size_t>(count) * kTableRefBytes + 4);
+    std::copy(manifest.begin(), manifest.begin() + kManifestHeaderBytes, legacy.begin());
+    std::copy(manifest.begin() + kManifestHeaderBytes,
+              manifest.begin() + kManifestHeaderBytes + static_cast<size_t>(count) * kTableRefBytes,
+              legacy.begin() + kManifestHeaderBytes);
+    PutLe32(legacy, 8, static_cast<uint32_t>(legacy.size()));
+    PutLe32(legacy, 40, 0);
+    PutLe32(legacy, legacy.size() - 4, CheckpointCrc32(legacy.data(), legacy.size() - 4));
+    auto segment = ReadFile(SegmentPath(temp, 0, 0));
+    ASSERT_GE(segment.size(), kSegmentHeaderBytes);
+    WriteFile(temp.path() + "/db.log.0", std::vector<uint8_t>(segment.begin() + kSegmentHeaderBytes, segment.end()));
+    ASSERT_TRUE(std::filesystem::remove(SegmentPath(temp, 0, 0)));
+    WriteFile(temp.path() + "/MANIFEST", legacy);
+}
+
 TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     TempDbDirectory temp;
     auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
@@ -162,7 +191,7 @@ TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     EXPECT_EQ(db.engine().wal_frame_count(), 0U);
     EXPECT_TRUE(std::filesystem::exists(temp.path() + "/tablebase.1.1"));
     EXPECT_TRUE(std::filesystem::exists(temp.path() + "/tablebase.2.1"));
-    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 1, 0)));
     ExpectPopulatedState(db);
 
     auto post_cut = db.engine().Begin();
@@ -199,6 +228,38 @@ TEST(CheckpointDbTest, DiagnosticsContinueAcrossOfflineCheckpoint) {
     EXPECT_GT(diagnostics->wal_fdatasync_calls.load(), 1U);
 }
 
+TEST(CheckpointDbTest, SegmentedManifestHasExactBoundedSize) {
+    TempDbDirectory empty;
+    { auto db = CheckpointDb::Create(empty.path(), {}); }
+    EXPECT_EQ(std::filesystem::file_size(empty.path() + "/MANIFEST"), 112U);
+
+    TempDbDirectory populated;
+    { auto db = CheckpointDb::Create(populated.path(), CheckpointBase()); }
+    EXPECT_EQ(std::filesystem::file_size(populated.path() + "/MANIFEST"), 112U + 2U * 56U);
+}
+
+TEST(CheckpointDbTest, SegmentedManifestRejectsImpossibleCountsReservedBytesAndAuthorityMismatch) {
+    for (const int corruption : {0, 1, 2, 3}) {
+        TempDbDirectory temp;
+        { auto db = CheckpointDb::Create(temp.path(), {}); }
+        auto manifest = ReadFile(temp.path() + "/MANIFEST");
+        ASSERT_EQ(manifest.size(), 112U);
+        if (corruption == 0) {
+            PutLe32(manifest, 36, std::numeric_limits<uint32_t>::max());
+        } else if (corruption == 1) {
+            PutLe<uint64_t>(manifest, 84, 4096);
+            PutLe<uint64_t>(manifest, 92, 4097);
+        } else if (corruption == 2) {
+            PutLe<uint64_t>(manifest, 100, 1);
+        } else {
+            PutLe<uint64_t>(manifest, 20, 1);
+        }
+        PutLe32(manifest, manifest.size() - 4, CheckpointCrc32(manifest.data(), manifest.size() - 4));
+        WriteFile(temp.path() + "/MANIFEST", manifest);
+        EXPECT_THROW(CheckpointDb::Open(temp.path()), std::runtime_error) << corruption;
+    }
+}
+
 TEST(CheckpointDbTest, MigratesLegacyWalBeforeServingCommits) {
     TempDbDirectory temp;
     {
@@ -207,6 +268,7 @@ TEST(CheckpointDbTest, MigratesLegacyWalBeforeServingCommits) {
         db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 77)));
         ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
     }
+    ConvertFreshSegmentedManifestToLegacy(temp);
     ASSERT_EQ(rename((temp.path() + "/db.log.0").c_str(), (temp.path() + "/wal.0").c_str()), 0);
 
     auto legacy = CheckpointDb::Open(temp.path());
@@ -221,7 +283,7 @@ TEST(CheckpointDbTest, MigratesLegacyWalBeforeServingCommits) {
     legacy.OfflineCheckpoint();
 
     EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.0"));
-    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 1, 0)));
     EXPECT_EQ(CheckpointDb::Open(temp.path()).engine().published_epoch(), 2U);
 }
 
@@ -229,6 +291,7 @@ TEST(CheckpointDbTest, RejectsAmbiguousAndNonRegularWalAuthorities) {
     {
         TempDbDirectory temp;
         auto db = CheckpointDb::Create(temp.path(), {});
+        ConvertFreshSegmentedManifestToLegacy(temp);
         std::filesystem::copy_file(temp.path() + "/db.log.0", temp.path() + "/wal.0");
         EXPECT_THROW(CheckpointDb::Open(temp.path()), std::runtime_error);
     }
@@ -236,6 +299,7 @@ TEST(CheckpointDbTest, RejectsAmbiguousAndNonRegularWalAuthorities) {
         TempDbDirectory temp;
         TempDbDirectory external;
         { auto db = CheckpointDb::Create(temp.path(), {}); }
+        ConvertFreshSegmentedManifestToLegacy(temp);
         ASSERT_TRUE(std::filesystem::remove(temp.path() + "/db.log.0"));
         const std::string target = external.path() + "/outside.log";
         WriteFile(target, {});
@@ -253,6 +317,7 @@ TEST(CheckpointDbTest, ReopenCompletesAlreadyRenamedLegacyMigration) {
         db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 88)));
         ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
     }
+    ConvertFreshSegmentedManifestToLegacy(temp);
     ASSERT_EQ(rename((temp.path() + "/db.log.0").c_str(), (temp.path() + "/wal.0").c_str()), 0);
     // Models a crash after renameat but before the migration directory fsync.
     ASSERT_EQ(rename((temp.path() + "/wal.0").c_str(), (temp.path() + "/db.log.0").c_str()), 0);
@@ -264,37 +329,102 @@ TEST(CheckpointDbTest, ReopenCompletesAlreadyRenamedLegacyMigration) {
     ASSERT_EQ(reopened.engine().CommitBatch({&view})[0].status, CommitStatus::kCommitted);
 }
 
+TEST(CheckpointDbTest, LegacyLoadThenCheckpointCrashKeepsMigratedWalAuthority) {
+    TempDbDirectory temp;
+    { auto db = CheckpointDb::Create(temp.path(), {}); }
+    ConvertFreshSegmentedManifestToLegacy(temp);
+    {
+        auto db = CheckpointDb::Open(temp.path());
+        auto writer = db.BeginTableBase(kAccounts);
+        writer.Append(Plain(7));
+        db.PublishTableBase(std::move(writer));
+        ASSERT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 1, 0)));
+        db.SetCrashPointForTest(CheckpointCrashPoint::kAfterWalCreate);
+        EXPECT_THROW(db.OfflineCheckpoint(), SimulatedCrash);
+        EXPECT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 1, 0)));
+        EXPECT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 2, 0)));
+    }
+    {
+        auto reopened = CheckpointDb::Open(temp.path());
+        auto view = reopened.engine().Begin();
+        ASSERT_EQ(reopened.engine().Read(view, {kAccounts, 0})->bytes, Plain(7).bytes);
+        reopened.engine().Abort(view);
+        reopened.OfflineCheckpoint();
+    }
+    EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 2U);
+}
+
+TEST(CheckpointDbTest, LegacyPostBaseInsertSurvivesSegmentedManifestMigration) {
+    TempDbDirectory temp;
+    { auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 0}, Plain(1)}}); }
+    ConvertFreshSegmentedManifestToLegacy(temp);
+    {
+        auto db = CheckpointDb::Open(temp.path());
+        auto insert = db.engine().Begin();
+        const RowId id = db.engine().InsertImage(insert, kAccounts, Plain(2));
+        ASSERT_EQ(id.local_id, 1U);
+        ASSERT_EQ(db.engine().CommitBatch({&insert})[0].status, CommitStatus::kCommitted);
+        auto writer = db.BeginTableBase(kOrders);
+        writer.Append(Plain(3));
+        db.PublishTableBase(std::move(writer));
+    }
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto view = reopened.engine().Begin();
+    EXPECT_EQ(reopened.engine().Read(view, {kAccounts, 0})->bytes, Plain(1).bytes);
+    EXPECT_EQ(reopened.engine().Read(view, {kAccounts, 1})->bytes, Plain(2).bytes);
+    EXPECT_EQ(reopened.engine().Read(view, {kOrders, 0})->bytes, Plain(3).bytes);
+    reopened.engine().Abort(view);
+}
+
+TEST(CheckpointDbTest, SegmentHeaderRejectsIdentityBoundaryReservedAndCrcCorruption) {
+    for (const size_t offset : {size_t{0}, size_t{8}, size_t{12}, size_t{16}, size_t{24}, size_t{32}, size_t{40},
+                                size_t{48}, size_t{56}, size_t{60}, size_t{68}}) {
+        TempDbDirectory temp;
+        { auto db = CheckpointDb::Create(temp.path(), {}); }
+        const std::string path = SegmentPath(temp, 0, 0);
+        auto header = ReadFile(path);
+        ASSERT_EQ(header.size(), 72U);
+        header.at(offset) ^= 1;
+        if (offset != 68)
+            PutLe32(header, 68, CheckpointCrc32(header.data(), 68));
+        WriteFile(path, header);
+        EXPECT_THROW(CheckpointDb::Open(temp.path()), std::runtime_error) << offset;
+    }
+}
+
 TEST(CheckpointDbTest, CheckpointReplacesLegacyFutureWalOrphan) {
     TempDbDirectory temp;
     auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
     WriteFile(temp.path() + "/wal.1", {});
 
     EXPECT_NO_THROW(db.OfflineCheckpoint());
-    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.1"));
-    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 1, 0)));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/wal.1"));
     EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 1U);
 }
 
 TEST(CheckpointDbTest, CheckpointRejectsNonRegularFutureWalOrphans) {
-    for (const std::string name : {"db.log.1", "wal.1"}) {
+    for (const std::string& suffix : {std::string("db.log.s.1.0")}) {
         TempDbDirectory temp;
         TempDbDirectory external;
         auto db = CheckpointDb::Create(temp.path(), {});
         const std::string target = external.path() + "/outside.log";
         WriteFile(target, {});
-        ASSERT_EQ(symlink(target.c_str(), (temp.path() + "/" + name).c_str()), 0);
+        const std::string name = temp.path() + "/" + suffix;
+        ASSERT_EQ(symlink(target.c_str(), name.c_str()), 0);
 
-        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << name;
-        EXPECT_TRUE(std::filesystem::is_symlink(temp.path() + "/" + name));
+        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << suffix;
+        EXPECT_TRUE(std::filesystem::is_symlink(name));
         EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 0U);
     }
-    for (const std::string name : {"db.log.1", "wal.1"}) {
+    for (const std::string& suffix : {std::string("db.log.s.1.0")}) {
         TempDbDirectory temp;
         auto db = CheckpointDb::Create(temp.path(), {});
-        ASSERT_TRUE(std::filesystem::create_directory(temp.path() + "/" + name));
+        const std::string name = temp.path() + "/" + suffix;
+        ASSERT_TRUE(std::filesystem::create_directory(name));
 
-        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << name;
-        EXPECT_TRUE(std::filesystem::is_directory(temp.path() + "/" + name));
+        EXPECT_THROW(db.OfflineCheckpoint(), std::runtime_error) << suffix;
+        EXPECT_TRUE(std::filesystem::is_directory(name));
         EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 0U);
     }
 }
@@ -304,13 +434,12 @@ TEST(CheckpointDbTest, RetryAfterPreManifestWalCrashCleansBothFutureNames) {
     auto db = CheckpointDb::Create(temp.path(), {});
     db.SetCrashPointForTest(CheckpointCrashPoint::kAfterWalCreate);
     EXPECT_THROW(db.OfflineCheckpoint(), SimulatedCrash);
-    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 1, 0)));
     WriteFile(temp.path() + "/wal.1", {});
 
     auto reopened = CheckpointDb::Open(temp.path());
     EXPECT_NO_THROW(reopened.OfflineCheckpoint());
-    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/wal.1"));
-    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(SegmentPath(temp, 1, 0)));
     EXPECT_EQ(CheckpointDb::Open(temp.path()).generation(), 1U);
 }
 
@@ -421,7 +550,7 @@ TEST(CheckpointDbTest, MissingAuthoritativeWalFailsWithoutRecreation) {
         db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 88)));
         ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
     }
-    const std::string wal = temp.path() + "/db.log.1";
+    const std::string wal = SegmentPath(temp, 1, 0);
     ASSERT_TRUE(std::filesystem::remove(wal));
     EXPECT_THROW(CheckpointDb::Open(temp.path()), std::system_error);
     EXPECT_FALSE(std::filesystem::exists(wal));
@@ -508,12 +637,28 @@ TEST(CheckpointDbTest, ImmutableTableOpenPreservesNextIdAfterHoles) {
     ASSERT_EQ(reopened.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
 }
 
+TEST(CheckpointDbTest, CheckpointPreservesAllocatorAfterDeletingHighestAndAllRows) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 0}, Plain(1)}, {{kAccounts, 1}, Plain(2)}});
+    auto txn = db.engine().Begin();
+    db.engine().Erase(txn, {kAccounts, 0});
+    db.engine().Erase(txn, {kAccounts, 1});
+    ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    db.OfflineCheckpoint();
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto next = reopened.engine().Begin();
+    const RowId id = reopened.engine().InsertImage(next, kAccounts, Plain(3));
+    EXPECT_EQ(id.local_id, 2U);
+    ASSERT_EQ(reopened.engine().CommitBatch({&next})[0].status, CommitStatus::kCommitted);
+}
+
 TEST(CheckpointDbTest, ImmutablePointReadsCrossSparseBlocksAndMisses) {
     TempDbDirectory temp;
     BaseImage initial;
     for (uint64_t i = 0; i < 97; ++i)
         initial.emplace(RowId{kAccounts, i * 2}, Plain(i * 2));
     auto db = CheckpointDb::Create(temp.path(), std::move(initial));
+    db.engine().SetDiagnostics(std::make_shared<DeltaDiagnostics>());
 
     auto snapshot = db.engine().Begin();
     for (uint64_t id : {62, 64, 126, 128, 192}) {
@@ -521,9 +666,30 @@ TEST(CheckpointDbTest, ImmutablePointReadsCrossSparseBlocksAndMisses) {
         ASSERT_TRUE(row.has_value());
         EXPECT_EQ(row->bytes, Plain(id).bytes);
     }
+    const size_t probes_before_sparse_miss = db.engine().immutable_read_probes_for_test();
     EXPECT_FALSE(db.engine().Read(snapshot, {kAccounts, 63}).has_value());
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), probes_before_sparse_miss + 1);
+    const size_t probes_before_frontier_miss = db.engine().immutable_read_probes_for_test();
     EXPECT_FALSE(db.engine().Read(snapshot, {kAccounts, 193}).has_value());
+    EXPECT_EQ(db.engine().immutable_read_probes_for_test(), probes_before_frontier_miss);
     db.engine().Abort(snapshot);
+}
+
+TEST(CheckpointDbTest, RecoveryMembershipIsBoundedForDenseSparseAndEmptyTables) {
+    TempDbDirectory temp;
+    constexpr TableId kEmpty = 3;
+    BaseImage initial{
+        {{kAccounts, 0}, Plain(1)}, {{kAccounts, 2}, Plain(2)}, {{kOrders, 0}, Plain(3)}, {{kOrders, 128}, Plain(4)}};
+    auto db = CheckpointDb::Create(temp.path(), std::move(initial));
+    auto empty = db.BeginTableBase(kEmpty);
+    db.PublishTableBase(std::move(empty));
+
+    EXPECT_EQ(db.engine().immutable_recovery_membership_for_test({kAccounts, 0}), std::optional<bool>(true));
+    EXPECT_EQ(db.engine().immutable_recovery_membership_for_test({kAccounts, 1}), std::optional<bool>(false));
+    EXPECT_EQ(db.engine().immutable_recovery_membership_for_test({kAccounts, 2}), std::optional<bool>(true));
+    EXPECT_FALSE(db.engine().immutable_recovery_membership_for_test({kOrders, 0}).has_value());
+    EXPECT_FALSE(db.engine().immutable_recovery_membership_for_test({kOrders, 128}).has_value());
+    EXPECT_EQ(db.engine().immutable_recovery_membership_for_test({kEmpty, 0}), std::optional<bool>(false));
 }
 
 TEST(CheckpointDbTest, ImmutableTableRejectsCrcValidDisorderedPayloadIds) {
@@ -603,8 +769,8 @@ TEST(CheckpointDbTest, CheckpointReusesCleanTableAndPreservesBaseSnapshot) {
     struct stat after {};
     ASSERT_EQ(stat(clean_path.c_str(), &after), 0);
     EXPECT_EQ(before.st_ino, after.st_ino);
-    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/db.log.0"));
-    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/db.log.1"));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 0)));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 1, 0)));
     EXPECT_EQ(db.engine().durable_wal_bytes(), 0U);
     EXPECT_FALSE(std::filesystem::exists(TablePath(temp, kAccounts, 1)));
 }

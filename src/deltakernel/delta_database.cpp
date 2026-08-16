@@ -24,6 +24,18 @@
 
 namespace deltakernel {
 namespace {
+thread_local const DeltaParameterFrame* active_prepared_parameters = nullptr;
+
+struct PreparedParameterScope {
+    const DeltaParameterFrame* previous;
+    explicit PreparedParameterScope(const DeltaParameterFrame& parameters) : previous(active_prepared_parameters) {
+        active_prepared_parameters = &parameters;
+    }
+    ~PreparedParameterScope() {
+        active_prepared_parameters = previous;
+    }
+};
+
 constexpr const char* kCatalog = "DELTA_CATALOG";
 constexpr const char* kCatalogMagic = "DELTAKERNEL";
 constexpr size_t kMaxRowBytes = 1U << 20;
@@ -66,6 +78,13 @@ DiagnosticOperation ClassifyDiagnosticOperation(ast::AstType type) {
 uint64_t NsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+void RecordMax(std::atomic<uint64_t>& maximum, uint64_t value) noexcept {
+    uint64_t observed = maximum.load(std::memory_order_relaxed);
+    while (observed < value &&
+           !maximum.compare_exchange_weak(observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
 }
 
 struct SidecarHeader {
@@ -452,13 +471,30 @@ private:
 DeltaDatabase::SidecarDescriptor::SidecarDescriptor(epoch_si_poc::TableId table_id,
                                                     epoch_si_poc::ConstraintId constraint_id, uint64_t generation,
                                                     epoch_si_poc::Epoch snapshot_epoch, uint64_t count,
-                                                    uint64_t key_bytes, uint64_t row_order_bytes, size_t mapped_bytes,
+                                                    uint64_t key_bytes, uint64_t row_order_offset, size_t mapped_bytes,
                                                     void* mapping)
     : table_id(table_id), constraint_id(constraint_id), generation(generation), snapshot_epoch(snapshot_epoch),
-      count(count), key_bytes(key_bytes), row_order_bytes(row_order_bytes), mapped_bytes(mapped_bytes),
+      count(count), key_bytes(key_bytes), row_order_offset(row_order_offset), mapped_bytes(mapped_bytes),
       mapping(mapping), live_bitmap(static_cast<size_t>((count + 63) / 64), ~uint64_t{0}) {
+    if (mapping && count != 0) {
+        const auto* mapped = static_cast<const uint8_t*>(mapping);
+        const uint32_t ordinal =
+            GetLeAt<uint32_t>(mapped + row_order_offset + (count - 1) * kSidecarRowOrderEntryBytes);
+        max_local_id =
+            GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+    }
     if (!live_bitmap.empty() && count % 64 != 0)
         live_bitmap.back() = (uint64_t{1} << (count % 64)) - 1;
+    for (size_t words = live_bitmap.size(); words > 1; words = (words + 63) / 64)
+        live_summary.emplace_back((words + 63) / 64, ~uint64_t{0});
+    for (size_t level = 0; level < live_summary.size(); ++level) {
+        const size_t child_words = level == 0 ? live_bitmap.size() : live_summary[level - 1].size();
+        auto& summary = live_summary[level];
+        for (size_t word = 0; word < summary.size(); ++word) {
+            const size_t remaining = child_words > word * 64 ? child_words - word * 64 : 0;
+            summary[word] = remaining >= 64 ? ~uint64_t{0} : (remaining == 0 ? 0 : (uint64_t{1} << remaining) - 1);
+        }
+    }
 }
 
 DeltaDatabase::SidecarDescriptor::~SidecarDescriptor() {
@@ -469,8 +505,8 @@ DeltaDatabase::SidecarDescriptor::~SidecarDescriptor() {
 DeltaDatabase::SidecarDescriptor::SidecarDescriptor(SidecarDescriptor&& other) noexcept
     : table_id(other.table_id), constraint_id(other.constraint_id), generation(other.generation),
       snapshot_epoch(other.snapshot_epoch), count(other.count), key_bytes(other.key_bytes),
-      row_order_bytes(other.row_order_bytes), mapped_bytes(other.mapped_bytes), mapping(other.mapping),
-      live_bitmap(std::move(other.live_bitmap)) {
+      row_order_offset(other.row_order_offset), max_local_id(other.max_local_id), mapped_bytes(other.mapped_bytes),
+      mapping(other.mapping), live_bitmap(std::move(other.live_bitmap)), live_summary(std::move(other.live_summary)) {
     other.mapping = nullptr;
     other.mapped_bytes = 0;
 }
@@ -486,10 +522,12 @@ DeltaDatabase::SidecarDescriptor& DeltaDatabase::SidecarDescriptor::operator=(Si
     snapshot_epoch = other.snapshot_epoch;
     count = other.count;
     key_bytes = other.key_bytes;
-    row_order_bytes = other.row_order_bytes;
+    row_order_offset = other.row_order_offset;
+    max_local_id = other.max_local_id;
     mapped_bytes = other.mapped_bytes;
     mapping = other.mapping;
     live_bitmap = std::move(other.live_bitmap);
+    live_summary = std::move(other.live_summary);
     other.mapping = nullptr;
     other.mapped_bytes = 0;
     return *this;
@@ -501,6 +539,17 @@ DeltaDatabase::DeltaDatabase(epoch_si_poc::CheckpointDb db) : db_(std::move(db))
         diagnostics_ = std::make_shared<epoch_si_poc::DeltaDiagnostics>();
         report_diagnostics_ = true;
         db_.engine().SetDiagnostics(diagnostics_);
+        // Opportunistic snapshots: emitted by a completed Execute at most once per interval.
+        // This deliberately avoids a background diagnostics thread.
+        const char* period = std::getenv("RMDB_DELTA_DIAGNOSTICS_MIN_REPORT_INTERVAL_MS");
+        if (period != nullptr) {
+            char* end = nullptr;
+            const unsigned long long milliseconds = std::strtoull(period, &end, 10);
+            if (end != period && *end == '\0' && milliseconds != 0 &&
+                milliseconds <= std::numeric_limits<uint64_t>::max() / 1000000ULL) {
+                diagnostics_period_ns_ = milliseconds * 1000000ULL;
+            }
+        }
     }
 }
 
@@ -565,6 +614,16 @@ void DeltaDatabase::RecordPreparedClone(uint64_t elapsed_ns) noexcept {
     prepared_clone_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
 }
 
+void DeltaDatabase::RecordPreparedNative() noexcept {
+    if (diagnostics_)
+        prepared_native_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DeltaDatabase::RecordPreparedFallback() noexcept {
+    if (diagnostics_)
+        prepared_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void DeltaDatabase::EnableDiagnosticsForTest() {
     auto state_lock = LockStateUnique();
     if (!diagnostics_) {
@@ -580,7 +639,50 @@ std::array<uint64_t, 6> DeltaDatabase::QueryDiagnosticsForTest() const {
             ordered_stream_.load(std::memory_order_relaxed), ordered_materialize_.load(std::memory_order_relaxed)};
 }
 
-void DeltaDatabase::ReportDiagnostics() const noexcept {
+std::array<uint64_t, 5> DeltaDatabase::RouteDiagnosticsForTest() const {
+    if (!diagnostics_)
+        return {};
+    return {diagnostics_->current_index_latest_routes.load(std::memory_order_relaxed),
+            diagnostics_->current_index_historical_routes.load(std::memory_order_relaxed),
+            diagnostics_->current_live_base_candidates.load(std::memory_order_relaxed),
+            diagnostics_->current_live_summary_skips.load(std::memory_order_relaxed),
+            diagnostics_->current_live_summary_words.load(std::memory_order_relaxed)};
+}
+
+std::array<uint64_t, 8> DeltaDatabase::TailDiagnosticsForTest() const {
+    if (!diagnostics_)
+        return {};
+    return {execute_shared_wait_max_ns_.load(std::memory_order_relaxed),
+            commit_ready_wait_max_ns_.load(std::memory_order_relaxed),
+            commit_initial_unique_wait_max_ns_.load(std::memory_order_relaxed),
+            commit_publish_unique_wait_max_ns_.load(std::memory_order_relaxed),
+            commit_prepare_unique_max_ns_.load(std::memory_order_relaxed),
+            commit_sync_unlocked_max_ns_.load(std::memory_order_relaxed),
+            commit_publish_unique_max_ns_.load(std::memory_order_relaxed),
+            diagnostics_->wal_fdatasync_max_ns.load(std::memory_order_relaxed)};
+}
+
+std::array<uint64_t, 5> DeltaDatabase::InflightDiagnosticsForTest() const {
+    return {execute_inflight_[0].load(std::memory_order_relaxed), execute_inflight_[1].load(std::memory_order_relaxed),
+            execute_inflight_[2].load(std::memory_order_relaxed), execute_inflight_[3].load(std::memory_order_relaxed),
+            commit_phase_.load(std::memory_order_relaxed)};
+}
+
+void DeltaDatabase::MaybeReportDiagnostics() const noexcept {
+    if (diagnostics_period_ns_ == 0)
+        return;
+    const uint64_t now = NsSince(std::chrono::steady_clock::time_point{});
+    uint64_t previous = diagnostics_last_report_ns_.load(std::memory_order_relaxed);
+    while (now - previous >= diagnostics_period_ns_) {
+        if (diagnostics_last_report_ns_.compare_exchange_weak(previous, now, std::memory_order_relaxed,
+                                                              std::memory_order_relaxed)) {
+            ReportDiagnostics(true);
+            return;
+        }
+    }
+}
+
+void DeltaDatabase::ReportDiagnostics(bool periodic) const noexcept {
     if (!report_diagnostics_)
         return;
     struct rusage usage {};
@@ -598,8 +700,15 @@ void DeltaDatabase::ReportDiagnostics() const noexcept {
         used += static_cast<size_t>(written);
     }
     const auto load = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    const uint64_t phase_code = load(commit_phase_);
+    constexpr std::array<const char*, 6> kCommitPhaseNames = {"idle", "initial_wait", "prepare", "sync",
+                                                               "publish_wait", "publish"};
+    const char* phase_name = phase_code < kCommitPhaseNames.size() ? kCommitPhaseNames[phase_code] : "unknown";
+    std::fprintf(stderr, "DELTA_PREPARED_DIAGNOSTICS prepared_native_count=%llu prepared_fallback_count=%llu\n",
+                 static_cast<unsigned long long>(load(prepared_native_count_)),
+                 static_cast<unsigned long long>(load(prepared_fallback_count_)));
     std::fprintf(stderr,
-                 "DELTA_DIAGNOSTICS prepared_clone_count=%llu prepared_clone_ns=%llu "
+                 "DELTA_DIAGNOSTICS report=%s prepared_clone_count=%llu prepared_clone_ns=%llu "
                  "execute_txn_calls=%llu execute_point_dml_calls=%llu execute_scan_join_aggregate_calls=%llu "
                  "execute_other_calls=%llu execute_txn_wall_ns=%llu execute_point_dml_wall_ns=%llu "
                  "execute_scan_join_aggregate_wall_ns=%llu execute_other_wall_ns=%llu execute_shared_wait_ns=%llu "
@@ -616,7 +725,19 @@ void DeltaDatabase::ReportDiagnostics() const noexcept {
                  "commit_frames=%llu commit_tickets=%llu commit_batch_hist=%s commit_encode_ns=%llu "
                  "commit_prepare_ns=%llu wal_pwrite_calls=%llu wal_pwrite_bytes=%llu wal_pwrite_ns=%llu "
                  "wal_fdatasync_calls=%llu wal_fdatasync_ns=%llu commit_install_ns=%llu commit_publish_ns=%llu "
+                 "execute_txn_max_ns=%llu execute_point_dml_max_ns=%llu execute_scan_join_aggregate_max_ns=%llu "
+                 "execute_other_max_ns=%llu execute_shared_wait_max_ns=%llu commit_ready_wait_max_ns=%llu "
+                 "initial_unique_wait_max_ns=%llu publish_unique_wait_max_ns=%llu prepare_unique_max_ns=%llu "
+                 "sync_unlocked_max_ns=%llu publish_unique_max_ns=%llu wal_fdatasync_max_ns=%llu "
+                 "current_index_latest_routes=%llu current_index_historical_routes=%llu "
+                 "current_live_base_candidates=%llu current_live_summary_skips=%llu current_live_summary_words=%llu "
+                 "current_overlay_addition_ids=%llu current_overlay_removal_ids=%llu current_base_bit_flips=%llu "
+                 "current_base_row_order_comparisons=%llu "
+                 "execute_txn_inflight=%llu execute_point_dml_inflight=%llu "
+                 "execute_scan_join_aggregate_inflight=%llu execute_other_inflight=%llu "
+                 "commit_phase_code=%llu commit_phase=%s "
                  "minor_faults=%ld major_faults=%ld max_rss_kb=%ld\n",
+                 periodic ? "periodic" : "final",
                  static_cast<unsigned long long>(load(prepared_clone_count_)),
                  static_cast<unsigned long long>(load(prepared_clone_ns_)),
                  static_cast<unsigned long long>(load(execute_calls_[0])),
@@ -669,7 +790,33 @@ void DeltaDatabase::ReportDiagnostics() const noexcept {
                  static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_calls)),
                  static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_ns)),
                  static_cast<unsigned long long>(load(diagnostics_->commit_install_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_publish_ns)), usage.ru_minflt, usage.ru_majflt,
+                 static_cast<unsigned long long>(load(diagnostics_->commit_publish_ns)),
+                 static_cast<unsigned long long>(load(execute_max_ns_[0])),
+                 static_cast<unsigned long long>(load(execute_max_ns_[1])),
+                 static_cast<unsigned long long>(load(execute_max_ns_[2])),
+                 static_cast<unsigned long long>(load(execute_max_ns_[3])),
+                 static_cast<unsigned long long>(load(execute_shared_wait_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_ready_wait_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_initial_unique_wait_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_publish_unique_wait_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_prepare_unique_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_sync_unlocked_max_ns_)),
+                 static_cast<unsigned long long>(load(commit_publish_unique_max_ns_)),
+                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_max_ns)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_index_latest_routes)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_index_historical_routes)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_live_base_candidates)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_live_summary_skips)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_live_summary_words)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_overlay_addition_ids)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_overlay_removal_ids)),
+                 static_cast<unsigned long long>(load(diagnostics_->current_base_bit_flips)),
+                 static_cast<unsigned long long>(load(current_base_row_order_comparisons_)),
+                 static_cast<unsigned long long>(load(execute_inflight_[0])),
+                 static_cast<unsigned long long>(load(execute_inflight_[1])),
+                 static_cast<unsigned long long>(load(execute_inflight_[2])),
+                 static_cast<unsigned long long>(load(execute_inflight_[3])),
+                 static_cast<unsigned long long>(phase_code), phase_name, usage.ru_minflt, usage.ru_majflt,
                  usage.ru_maxrss);
 }
 
@@ -718,6 +865,11 @@ std::array<size_t, 8> DeltaDatabase::OrderedProbeCensusForTest(const DeltaSessio
             session.census.last_overlay_refs_copied,         session.census.last_overlay_order_ops};
 }
 
+size_t DeltaDatabase::LiveSummaryProbeCensusForTest(const DeltaSession& session) const {
+    std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    return session.census.last_live_summary_words_probed;
+}
+
 std::array<size_t, 4> DeltaDatabase::SidecarIoCensusForTest(const DeltaSession& session) const {
     std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
     auto state_lock = LockStateShared();
@@ -726,6 +878,17 @@ std::array<size_t, 4> DeltaDatabase::SidecarIoCensusForTest(const DeltaSession& 
         mapped_bytes += descriptor.mapped_bytes;
     return {session.census.last_sidecar_query_opens, session.census.last_sidecar_query_preads,
             session.census.last_sidecar_binary_comparisons, mapped_bytes};
+}
+
+std::array<size_t, 3> DeltaDatabase::CurrentIndexCensusForTest() const {
+    auto state_lock = LockStateShared();
+    const auto refs = [](const CommittedOverlay& overlay) {
+        size_t count = 0;
+        for (const auto& [key, ids] : overlay)
+            count += ids.size();
+        return count;
+    };
+    return {current_base_row_order_comparisons_.load(std::memory_order_relaxed), refs(overlay_), refs(current_overlay_)};
 }
 
 size_t DeltaDatabase::SidecarValidationCountForTest() const {
@@ -786,6 +949,53 @@ std::unique_ptr<DeltaDatabase> DeltaDatabase::Open(const std::string& directory)
         if (const TableSchema* schema = result->TableById(id.table_id))
             result->AddOverlay(result->overlay_, *schema, result->DecodeRow(*schema, image), id);
     });
+    result->db_.engine().VisitLatestVersionHeads(
+        [&](epoch_si_poc::RowId id, epoch_si_poc::Epoch, const epoch_si_poc::RowImage& image) {
+            const TableSchema* schema = result->TableById(id.table_id);
+            if (!schema)
+                return;
+            result->ClearCurrentBaseRow(*schema, id.local_id);
+            if (image.deleted)
+                return;
+            const auto cells = result->DecodeRow(*schema, image);
+            for (const auto& index : schema->indexes) {
+                const auto key = result->EncodeKey(*schema, index, cells);
+                result->ApplyCurrentBaseState(*schema, index.constraint_id, key, id.local_id, true);
+                auto sidecar = result->sidecars_.find(index.constraint_id);
+                bool is_base = false;
+                if (sidecar != result->sidecars_.end()) {
+                    const auto* mapped = static_cast<const uint8_t*>(sidecar->second.mapping);
+                    uint64_t ordinal = 0;
+                    uint64_t first = 0, last = sidecar->second.count;
+                    while (first < last) {
+                        const uint64_t middle = first + (last - first) / 2;
+                        const uint32_t candidate = GetLeAt<uint32_t>(
+                            mapped + sidecar->second.row_order_offset +
+                            middle * kSidecarRowOrderEntryBytes);
+                        const uint64_t candidate_id = GetLeAt<uint64_t>(
+                            mapped + kSidecarHeaderBytes + static_cast<uint64_t>(candidate) * kSidecarEntryBytes + 8);
+                        if (candidate_id < id.local_id)
+                            first = middle + 1;
+                        else
+                            last = middle;
+                    }
+                    if (first < sidecar->second.count) {
+                        ordinal = GetLeAt<uint32_t>(mapped + sidecar->second.row_order_offset +
+                                                   first * kSidecarRowOrderEntryBytes);
+                        const uint64_t begin = GetLeAt<uint64_t>(
+                            mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes);
+                        const uint64_t end = ordinal + 1 == sidecar->second.count
+                                                 ? sidecar->second.key_bytes
+                                                 : GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
+                                                                     (ordinal + 1) * kSidecarEntryBytes);
+                        const uint8_t* keys = mapped + kSidecarHeaderBytes + sidecar->second.count * kSidecarEntryBytes;
+                        is_base = end - begin == key.size() && std::memcmp(keys + begin, key.data(), key.size()) == 0;
+                    }
+                }
+                if (!is_base)
+                    AppendOverlay(result->current_overlay_, {schema->id, index.constraint_id, key}, id.local_id);
+            }
+        });
     return result;
 }
 
@@ -976,15 +1186,134 @@ epoch_si_poc::EpochSiEngine::Txn& DeltaDatabase::Txn(DeltaSession& session) {
 
 CommittedOverlay DeltaDatabase::PrepareCommittedOverlay(const DeltaOverlay& overlay) {
     CommittedOverlay prepared;
-    for (const auto& [key, ids] : overlay) {
-        // Canonicalize while the ticket still owns every allocation, before CommitBatch can make the transaction
-        // durable. InstallCommittedOverlay remains a node-only, allocation-free merge.
-        std::vector<uint64_t> canonical = ids;
-        std::sort(canonical.begin(), canonical.end());
-        canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
-        prepared.emplace(key, std::move(canonical));
-    }
+    // AppendOverlay maintains each DeltaOverlay bucket sorted and unique.
+    for (const auto& [key, ids] : overlay)
+        prepared.emplace(key, ids);
     return prepared;
+}
+
+void DeltaDatabase::SetCurrentBaseBit(SidecarDescriptor& descriptor, uint64_t local_id, bool live) noexcept {
+    if (!descriptor.mapping || descriptor.count == 0)
+        return;
+    const auto* mapped = static_cast<const uint8_t*>(descriptor.mapping);
+    uint64_t first = 0;
+    uint64_t last = descriptor.count;
+    while (first < last) {
+        const uint64_t middle = first + (last - first) / 2;
+        const uint32_t candidate =
+            GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + middle * kSidecarRowOrderEntryBytes);
+        const uint64_t candidate_id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
+                                                         static_cast<uint64_t>(candidate) * kSidecarEntryBytes + 8);
+        if (candidate_id < local_id)
+            first = middle + 1;
+        else
+            last = middle;
+    }
+    if (first == descriptor.count)
+        return;
+    const uint32_t ordinal = GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
+    const uint64_t found_id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
+                                                static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+    if (found_id != local_id)
+        return;
+    const size_t word = ordinal / 64;
+    const uint64_t mask = uint64_t{1} << (ordinal % 64);
+    const bool was_live = (descriptor.live_bitmap[word] & mask) != 0;
+    if (was_live == live)
+        return;
+    if (live)
+        descriptor.live_bitmap[word] |= mask;
+    else
+        descriptor.live_bitmap[word] &= ~mask;
+    if (diagnostics_)
+        diagnostics_->current_base_bit_flips.fetch_add(1, std::memory_order_relaxed);
+    for (size_t level = 0, child = word; level < descriptor.live_summary.size(); ++level) {
+        const size_t parent = child / 64;
+        const uint64_t child_mask = uint64_t{1} << (child % 64);
+        const auto& source = level == 0 ? descriptor.live_bitmap : descriptor.live_summary[level - 1];
+        const bool child_nonzero = child < source.size() && source[child] != 0;
+        auto& summary_word = descriptor.live_summary[level][parent];
+        if (child_nonzero)
+            summary_word |= child_mask;
+        else
+            summary_word &= ~child_mask;
+        child = parent;
+    }
+}
+
+void DeltaDatabase::ApplyCurrentBaseState(const TableSchema& schema, epoch_si_poc::ConstraintId constraint_id,
+                                          const EncodedKey& key, uint64_t local_id, bool live) noexcept {
+    const auto found = sidecars_.find(constraint_id);
+    if (found == sidecars_.end())
+        return;
+    auto& descriptor = found->second;
+    if (descriptor.table_id != schema.id || descriptor.constraint_id != constraint_id || !descriptor.mapping)
+        return;
+    if (descriptor.count == 0 || local_id > descriptor.max_local_id)
+        return;
+    const auto* mapped = static_cast<const uint8_t*>(descriptor.mapping);
+    uint64_t first = 0, last = descriptor.count;
+    while (first < last) {
+        const uint64_t middle = first + (last - first) / 2;
+        const uint32_t ordinal =
+            GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + middle * kSidecarRowOrderEntryBytes);
+        const uint64_t id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
+                                              static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+        if (diagnostics_)
+            ++current_base_row_order_comparisons_;
+        if (id < local_id)
+            first = middle + 1;
+        else
+            last = middle;
+    }
+    if (first == descriptor.count)
+        return;
+    const uint32_t ordinal = GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
+    const uint64_t id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
+                                          static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+    if (id != local_id)
+        return;
+    const uint64_t begin = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes);
+    const uint64_t end = ordinal + 1 == descriptor.count
+                             ? descriptor.key_bytes
+                             : GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + (ordinal + 1) * kSidecarEntryBytes);
+    const uint8_t* keys = mapped + kSidecarHeaderBytes + descriptor.count * kSidecarEntryBytes;
+    if (end - begin == key.size() && std::memcmp(keys + begin, key.data(), key.size()) == 0)
+        SetCurrentBaseBit(descriptor, local_id, live);
+}
+
+void DeltaDatabase::ClearCurrentBaseRow(const TableSchema& schema, uint64_t local_id) noexcept {
+    for (const auto& index : schema.indexes) {
+        auto found = sidecars_.find(index.constraint_id);
+        if (found != sidecars_.end())
+            SetCurrentBaseBit(found->second, local_id, false);
+    }
+}
+
+void DeltaDatabase::InstallCurrentOverlay(CommittedOverlay& additions, CommittedOverlay& removals) noexcept {
+    try {
+        if (diagnostics_) {
+            for (const auto& [key, ids] : additions)
+                diagnostics_->current_overlay_addition_ids.fetch_add(ids.size(), std::memory_order_relaxed);
+            for (const auto& [key, ids] : removals)
+                diagnostics_->current_overlay_removal_ids.fetch_add(ids.size(), std::memory_order_relaxed);
+        }
+        for (auto it = removals.begin(); it != removals.end(); ++it) {
+            auto range = current_overlay_.equal_range(it->first);
+            for (auto current = range.first; current != range.second;) {
+                auto& ids = current->second;
+                for (uint64_t id : it->second)
+                    ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
+                if (ids.empty())
+                    current = current_overlay_.erase(current);
+                else
+                    ++current;
+            }
+        }
+        current_overlay_.merge(additions);
+    } catch (...) {
+        std::terminate();
+    }
 }
 
 void DeltaDatabase::RunCommitInstallHookForTest() noexcept {
@@ -1030,7 +1359,9 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
     if (census != nullptr)
         CaptureQueryCensus(session, *census);
     auto ticket = std::make_shared<CommitTicket>();
-    ticket->overlay = PrepareCommittedOverlay(session.overlay);
+    ticket->active_additions = PrepareCommittedOverlay(session.overlay);
+    ticket->overlay.merge(session.overlay);
+    ticket->active_removals.merge(session.removed_overlay);
     ticket->txn.emplace(std::move(*session.txn));
     state_lock.unlock();
     bool leader = false;
@@ -1052,6 +1383,8 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
         ticket->txn.reset();
         session.txn.reset();
         session.overlay.clear();
+        session.removed_overlay.clear();
+        session.private_insert_ids.clear();
         session.explicit_txn = false;
         session.admission.reset();
         throw;
@@ -1063,11 +1396,16 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
         const auto ready_wait_started = diagnostics_ ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
         ticket->ready.wait(queue_lock, [&] { return ticket->done; });
-        if (diagnostics_)
-            commit_ready_wait_ns_.fetch_add(NsSince(ready_wait_started), std::memory_order_relaxed);
+        if (diagnostics_) {
+            const uint64_t elapsed = NsSince(ready_wait_started);
+            commit_ready_wait_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+            RecordMax(commit_ready_wait_max_ns_, elapsed);
+        }
     }
     session.txn.reset();
     session.overlay.clear();
+    session.removed_overlay.clear();
+    session.private_insert_ids.clear();
     session.explicit_txn = false;
     session.admission.reset();
     if (ticket->error)
@@ -1110,22 +1448,36 @@ void DeltaDatabase::DrainCommitQueue() {
         std::vector<epoch_si_poc::CommitResult> results;
         if (!error && batch_count != 0) {
             try {
+                std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
                 std::vector<epoch_si_poc::EpochSiEngine::Txn*> txns;
                 txns.reserve(batch_count);
                 for (size_t n = 0; n < batch_count; ++n)
                     txns.push_back(&*batch[n]->txn);
+                const auto initial_unique_wait_started =
+                    diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (diagnostics_)
+                    commit_phase_.store(1, std::memory_order_relaxed);
                 auto prepare_lock = LockStateUnique();
+                if (diagnostics_)
+                    RecordMax(commit_initial_unique_wait_max_ns_, NsSince(initial_unique_wait_started));
+                if (diagnostics_)
+                    commit_phase_.store(2, std::memory_order_relaxed);
                 const auto prepare_started =
                     diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 engine_called = true;
                 auto prepared = db_.engine().PrepareCommitBatch(txns);
                 prepare_lock.unlock();
-                if (diagnostics_)
-                    commit_prepare_unique_ns_.fetch_add(NsSince(prepare_started), std::memory_order_relaxed);
+                if (diagnostics_) {
+                    const uint64_t elapsed = NsSince(prepare_started);
+                    commit_prepare_unique_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+                    RecordMax(commit_prepare_unique_max_ns_, elapsed);
+                }
                 results = prepared.results(); // All ticket-result allocation stays before WAL durability.
                 if (commit_sync_hook_for_test_)
                     commit_sync_hook_for_test_();
                 if (prepared.needs_sync()) {
+                    if (diagnostics_)
+                        commit_phase_.store(3, std::memory_order_relaxed);
                     const auto sync_started =
                         diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     try {
@@ -1134,20 +1486,28 @@ void DeltaDatabase::DrainCommitQueue() {
                         poisoned_.store(true, std::memory_order_release);
                         throw;
                     }
-                    if (diagnostics_)
-                        commit_sync_unlocked_ns_.fetch_add(NsSince(sync_started), std::memory_order_relaxed);
+                    if (diagnostics_) {
+                        const uint64_t elapsed = NsSince(sync_started);
+                        commit_sync_unlocked_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+                        RecordMax(commit_sync_unlocked_max_ns_, elapsed);
+                    }
                 }
                 if (commit_reacquire_hook_for_test_)
                     commit_reacquire_hook_for_test_();
-                const auto reacquire_started = diagnostics_ ? std::chrono::steady_clock::now()
-                                                            : std::chrono::steady_clock::time_point{};
+                const auto reacquire_started =
+                    diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (diagnostics_)
+                    commit_phase_.store(4, std::memory_order_relaxed);
                 auto state_lock = LockStateUnique();
+                if (diagnostics_)
+                    commit_phase_.store(5, std::memory_order_relaxed);
                 if (diagnostics_) {
                     const uint64_t waited = NsSince(reacquire_started);
                     commit_leader_reacquire_wait_ns_.fetch_add(waited, std::memory_order_relaxed);
                     commit_reacquire_ns_.fetch_add(waited, std::memory_order_relaxed);
                     state_unique_commit_wait_ns_.fetch_add(waited, std::memory_order_relaxed);
                     state_unique_commit_batches_.fetch_add(1, std::memory_order_relaxed);
+                    RecordMax(commit_publish_unique_wait_max_ns_, waited);
                 }
                 try {
                     const auto publish_started =
@@ -1158,10 +1518,29 @@ void DeltaDatabase::DrainCommitQueue() {
                         std::terminate();
                     RunCommitInstallHookForTest();
                     for (size_t n = 0; n < batch_count; ++n)
-                        if (results[n].status == epoch_si_poc::CommitStatus::kCommitted)
+                        if (results[n].status == epoch_si_poc::CommitStatus::kCommitted) {
+                            for (const auto& [key, ids] : batch[n]->active_removals) {
+                                const auto* schema = TableById(std::get<0>(key));
+                                if (!schema)
+                                    continue;
+                                for (uint64_t id : ids)
+                                    ApplyCurrentBaseState(*schema, std::get<1>(key), std::get<2>(key), id, false);
+                            }
+                            for (const auto& [key, ids] : batch[n]->active_additions) {
+                                const auto* schema = TableById(std::get<0>(key));
+                                if (!schema)
+                                    continue;
+                                for (uint64_t id : ids)
+                                    ApplyCurrentBaseState(*schema, std::get<1>(key), std::get<2>(key), id, true);
+                            }
+                            InstallCurrentOverlay(batch[n]->active_additions, batch[n]->active_removals);
                             InstallCommittedOverlay(batch[n]->overlay);
-                    if (diagnostics_)
-                        commit_publish_unique_ns_.fetch_add(NsSince(publish_started), std::memory_order_relaxed);
+                        }
+                    if (diagnostics_) {
+                        const uint64_t elapsed = NsSince(publish_started);
+                        commit_publish_unique_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+                        RecordMax(commit_publish_unique_max_ns_, elapsed);
+                    }
                 } catch (...) {
                     if (engine_called)
                         poisoned_.store(true, std::memory_order_release);
@@ -1170,6 +1549,8 @@ void DeltaDatabase::DrainCommitQueue() {
             } catch (...) {
                 error = std::current_exception();
             }
+            if (diagnostics_)
+                commit_phase_.store(0, std::memory_order_relaxed);
         }
         {
             std::lock_guard<std::mutex> queue_lock(commit_mutex_);
@@ -1209,14 +1590,26 @@ void DeltaDatabase::AbortLocked(DeltaSession& session) noexcept {
     session.txn.reset();
     session.explicit_txn = false;
     session.overlay.clear();
+    session.removed_overlay.clear();
+    session.private_insert_ids.clear();
     session.admission.reset();
 }
 
 void DeltaDatabase::Checkpoint() {
     auto admission = LockExecutionUnique();
+    std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
     auto state_lock = LockStateUnique();
     RequireUsable();
     CheckpointSidecars();
+}
+
+std::array<uint64_t, 4> DeltaDatabase::RotateWalForTest() {
+    auto admission = LockExecutionUnique();
+    std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+    auto state_lock = LockStateUnique();
+    RequireUsable();
+    const auto boundary = db_.RotateWalAtGate(rotation_crash_point_for_test_);
+    return {boundary.epoch, boundary.next_commit_seq, boundary.wal_lineage, boundary.new_active_segment_id};
 }
 
 uint64_t DeltaDatabase::CatalogGeneration() const {
@@ -1236,6 +1629,35 @@ size_t DeltaDatabase::CommitQueueDepthForTest() const {
 }
 
 DeltaDatabase::Cell DeltaDatabase::Literal(const Column& column, const ast::Value& value) const {
+    if (value.type == ast::AstType::Parameter) {
+        if (active_prepared_parameters == nullptr)
+            throw std::runtime_error("Delta parameter outside prepared execution");
+        const auto ordinal = static_cast<const ast::Parameter&>(value).ordinal;
+        if (ordinal == 0 || ordinal > active_prepared_parameters->size())
+            throw std::runtime_error("Delta prepared parameter out of range");
+        const DeltaParameter& parameter = (*active_prepared_parameters)[ordinal - 1];
+        if (!parameter.present) {
+            if (!column.nullable)
+                throw std::runtime_error("NULL in non-nullable Delta column");
+            return {};
+        }
+        Cell cell;
+        cell.is_null = false;
+        if (column.type == ColumnType::Int && parameter.type == DeltaValueType::Int) {
+            cell.integer = parameter.integer;
+        } else if (column.type == ColumnType::Float && parameter.type == DeltaValueType::Float) {
+            std::memcpy(&cell.floating, &parameter.float_bits, sizeof(cell.floating));
+        } else if (column.type == ColumnType::Float && parameter.type == DeltaValueType::Int) {
+            cell.floating = static_cast<float>(parameter.integer);
+        } else if (column.type == ColumnType::Char && parameter.type == DeltaValueType::Char) {
+            if (parameter.text.size() > column.length)
+                throw std::runtime_error("Delta CHAR value too long");
+            cell.text = parameter.text;
+        } else {
+            throw std::runtime_error("Delta value type mismatch");
+        }
+        return cell;
+    }
     Cell cell;
     if (value.type == ast::AstType::NullLit) {
         if (!column.nullable)
@@ -1557,7 +1979,7 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
     }
     sidecars_.insert_or_assign(index.constraint_id,
                                SidecarDescriptor{schema.id, index.constraint_id, *generation, header.snapshot_epoch,
-                                                 header.count, header.key_bytes, row_order_bytes,
+                                                 header.count, header.key_bytes, header.row_order_offset,
                                                  static_cast<size_t>(header.total_bytes), mapping});
     return true;
 }
@@ -1594,6 +2016,13 @@ void DeltaDatabase::CheckpointSidecars() {
         for (auto it = overlay_.begin(); it != overlay_.end();) {
             if (std::get<0>(it->first) == id)
                 it = overlay_.erase(it);
+            else
+                ++it;
+        }
+        for (auto it = current_overlay_.begin(); it != current_overlay_.end();) {
+            const auto sidecar = sidecars_.find(std::get<1>(it->first));
+            if (std::get<0>(it->first) == id && sidecar != sidecars_.end() && sidecar->second.table_id == id)
+                it = current_overlay_.erase(it);
             else
                 ++it;
         }
@@ -1797,6 +2226,7 @@ void DeltaDatabase::VisitOrderedIndexInterval(
     const std::function<bool(const EncodedKey&, epoch_si_poc::RowId)>& visitor, bool* usable) const {
     *usable = false;
     session.census.last_base_entries_probed = 0;
+    session.census.last_live_summary_words_probed = 0;
     session.census.last_overlay_nodes_probed = 0;
     session.census.last_row_ids_probed = 0;
     session.census.last_overlay_refs_examined = 0;
@@ -1850,13 +2280,120 @@ void DeltaDatabase::VisitOrderedIndexInterval(
     uint64_t base_position = reverse ? base_last : base_first;
     bool base_valid = false;
     std::pair<EncodedKey, epoch_si_poc::RowId> base_current;
+    const bool latest_snapshot = session.txn && db_.engine().IsLatestSnapshot(*session.txn);
+    if (diagnostics_) {
+        (latest_snapshot ? diagnostics_->current_index_latest_routes : diagnostics_->current_index_historical_routes)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto find_next_set = [&](auto&& self, size_t level, size_t start) -> std::optional<size_t> {
+        const auto& words = sidecar.live_summary[level];
+        if (start >= words.size() * 64)
+            return std::nullopt;
+        size_t word = start / 64;
+        ++session.census.last_live_summary_words_probed;
+        if (diagnostics_)
+            diagnostics_->current_live_summary_words.fetch_add(1, std::memory_order_relaxed);
+        uint64_t bits = words[word] & (~uint64_t{0} << (start % 64));
+        while (bits == 0) {
+            if (level + 1 >= sidecar.live_summary.size())
+                return std::nullopt;
+            const auto parent = self(self, level + 1, word + 1);
+            if (!parent)
+                return std::nullopt;
+            word = *parent;
+            ++session.census.last_live_summary_words_probed;
+            if (diagnostics_)
+                diagnostics_->current_live_summary_words.fetch_add(1, std::memory_order_relaxed);
+            bits = words[word];
+        }
+        return word * 64 + static_cast<size_t>(__builtin_ctzll(bits));
+    };
+    const auto find_previous_set = [&](auto&& self, size_t level, size_t start) -> std::optional<size_t> {
+        const auto& words = sidecar.live_summary[level];
+        if (words.empty())
+            return std::nullopt;
+        start = std::min(start, words.size() * 64 - 1);
+        size_t word = start / 64;
+        ++session.census.last_live_summary_words_probed;
+        if (diagnostics_)
+            diagnostics_->current_live_summary_words.fetch_add(1, std::memory_order_relaxed);
+        uint64_t bits = words[word] & (start % 64 == 63 ? ~uint64_t{0} : (uint64_t{1} << ((start % 64) + 1)) - 1);
+        while (bits == 0) {
+            if (level + 1 >= sidecar.live_summary.size() || word == 0)
+                return std::nullopt;
+            const auto parent = self(self, level + 1, word - 1);
+            if (!parent)
+                return std::nullopt;
+            word = *parent;
+            ++session.census.last_live_summary_words_probed;
+            if (diagnostics_)
+                diagnostics_->current_live_summary_words.fetch_add(1, std::memory_order_relaxed);
+            bits = words[word];
+        }
+        return word * 64 + static_cast<size_t>(63 - __builtin_clzll(bits));
+    };
+    const auto next_live = [&](uint64_t position, bool backwards) -> std::optional<uint64_t> {
+        if (!latest_snapshot)
+            return backwards ? (position > base_first ? std::optional<uint64_t>{position - 1} : std::nullopt)
+                             : (position < base_last ? std::optional<uint64_t>{position} : std::nullopt);
+        if (!backwards) {
+            while (position < base_last) {
+                const size_t word = static_cast<size_t>(position / 64);
+                uint64_t bits = sidecar.live_bitmap[word] & (~uint64_t{0} << (position % 64));
+                if (word == (base_last - 1) / 64)
+                    bits &= base_last % 64 == 0 ? ~uint64_t{0} : ((uint64_t{1} << (base_last % 64)) - 1);
+                if (bits != 0)
+                    return static_cast<uint64_t>(word * 64 + __builtin_ctzll(bits));
+                if (sidecar.live_summary.empty())
+                    return std::nullopt;
+                if (diagnostics_)
+                    diagnostics_->current_live_summary_skips.fetch_add(1, std::memory_order_relaxed);
+                const auto next_word = find_next_set(find_next_set, 0, word + 1);
+                if (!next_word)
+                    return std::nullopt;
+                position = static_cast<uint64_t>(*next_word * 64);
+            }
+            return std::nullopt;
+        }
+        while (position > base_first) {
+            const uint64_t candidate = position - 1;
+            const size_t word = static_cast<size_t>(candidate / 64);
+            const uint64_t mask = candidate % 64 == 63 ? ~uint64_t{0} : ((uint64_t{1} << ((candidate % 64) + 1)) - 1);
+            uint64_t bits = sidecar.live_bitmap[word] & mask;
+            if (word == base_first / 64)
+                bits &= ~uint64_t{0} << (base_first % 64);
+            if (bits != 0)
+                return static_cast<uint64_t>(word * 64 + 63 - __builtin_clzll(bits));
+            if (sidecar.live_summary.empty() || word == 0 || word == base_first / 64)
+                return std::nullopt;
+            if (diagnostics_)
+                diagnostics_->current_live_summary_skips.fetch_add(1, std::memory_order_relaxed);
+            const auto previous_word = find_previous_set(find_previous_set, 0, word - 1);
+            if (!previous_word)
+                return std::nullopt;
+            if (*previous_word > (std::numeric_limits<uint64_t>::max() - 64) / 64)
+                return std::nullopt;
+            position = static_cast<uint64_t>(*previous_word * 64 + 64);
+            if (position > sidecar.count)
+                return std::nullopt;
+        }
+        return std::nullopt;
+    };
     const auto advance_base = [&]() {
-        if ((!reverse && base_position == base_last) || (reverse && base_position == base_first)) {
+        if (base_first == base_last) {
             base_valid = false;
             return true;
         }
-        const uint64_t position = reverse ? --base_position : base_position++;
+        const auto next = next_live(base_position, reverse);
+        if (!next) {
+            base_valid = false;
+            return true;
+        }
+        const uint64_t position = *next;
+        base_position = reverse ? position : position + 1;
         ++session.census.last_base_entries_probed;
+        if (diagnostics_ && latest_snapshot)
+            diagnostics_->current_live_base_candidates.fetch_add(1, std::memory_order_relaxed);
         const KeySpan span = key_at(position);
         base_current = {
             EncodedKey(span.data, span.data + span.size),
@@ -1865,7 +2402,8 @@ void DeltaDatabase::VisitOrderedIndexInterval(
         return true;
     };
     advance_base();
-    OverlayRangeCursor<CommittedOverlay> committed(overlay_, schema.id, index.constraint_id, first_key, last_key,
+    const auto& committed_overlay = latest_snapshot ? current_overlay_ : overlay_;
+    OverlayRangeCursor<CommittedOverlay> committed(committed_overlay, schema.id, index.constraint_id, first_key, last_key,
                                                    reverse, session.census.last_overlay_nodes_probed,
                                                    session.census.last_row_ids_probed,
                                                    session.census.last_overlay_refs_examined);
@@ -1919,6 +2457,25 @@ void DeltaDatabase::AddOverlay(Overlay& overlay, const TableSchema& schema, cons
         if (!previous || key != EncodeKey(schema, index, *previous))
             AppendOverlay(overlay, {schema.id, index.constraint_id, std::move(key)}, id.local_id);
     }
+}
+
+void DeltaDatabase::RemoveOverlay(DeltaOverlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
+                                  epoch_si_poc::RowId id) {
+    for (const Index& index : schema.indexes) {
+        RemoveOverlay(overlay, schema, index, cells, id);
+    }
+}
+
+void DeltaDatabase::RemoveOverlay(DeltaOverlay& overlay, const TableSchema& schema, const Index& index,
+                                  const std::vector<Cell>& cells, epoch_si_poc::RowId id) {
+    auto key = EncodeKey(schema, index, cells);
+    auto found = overlay.find({schema.id, index.constraint_id, std::move(key)});
+    if (found == overlay.end())
+        return;
+    auto& ids = found->second;
+    ids.erase(std::remove(ids.begin(), ids.end(), id.local_id), ids.end());
+    if (ids.empty())
+        overlay.erase(found);
 }
 
 void DeltaDatabase::VisitRows(DeltaSession& session, const TableSchema& schema,
@@ -2655,21 +3212,74 @@ PreparedDescription DeltaDatabase::DescribePrepared(const ast::TreeNode& tree,
     return result;
 }
 
+std::unique_ptr<DeltaPreparedProgram>
+DeltaDatabase::CompilePrepared(std::unique_ptr<ast::TreeNode> tree,
+                               const std::vector<DeltaValueType>& declared_parameters) const {
+    if (!tree)
+        throw std::invalid_argument("null Delta prepared tree");
+    const auto description = DescribePrepared(*tree, declared_parameters);
+    const auto* select = dynamic_cast<const ast::SelectStmt*>(tree.get());
+    if (select != nullptr && (select->tabs.size() > 1 || select->limit_is_parameter || select->offset_is_parameter))
+        return nullptr;
+    return std::make_unique<DeltaPreparedProgram>(std::move(tree), description.query, description.catalog_generation);
+}
+
 bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& session, QueryResultSink* sink) {
+    return ExecuteImpl(tree.get(), session, sink);
+}
+
+bool DeltaDatabase::ExecutePrepared(const DeltaPreparedProgram& program, const DeltaParameterFrame& parameters,
+                                    DeltaSession& session, QueryResultSink* sink) {
+    if (!program.tree_ || program.catalog_generation_ != CatalogGeneration())
+        throw std::runtime_error("stale Delta prepared statement");
+    PreparedParameterScope parameter_scope(parameters);
+    return ExecuteImpl(program.tree_.get(), session, sink, program.catalog_generation_);
+}
+
+bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session, QueryResultSink* sink,
+                                uint64_t expected_catalog_generation) {
     if (!tree)
         return false;
     std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
+    if (expected_catalog_generation != 0 && expected_catalog_generation != CatalogGeneration())
+        throw std::runtime_error("stale Delta prepared statement");
     const DiagnosticOperation diagnostic_operation = ClassifyDiagnosticOperation(tree->type);
+    const bool counted_execution = diagnostics_ != nullptr;
+    const auto execute_started =
+        counted_execution ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct ExecutionInflightScope {
+        DeltaDatabase* database;
+        size_t index;
+        bool enabled;
+        ~ExecutionInflightScope() {
+            if (!enabled)
+                return;
+            database->execute_inflight_[index].fetch_sub(1, std::memory_order_relaxed);
+            database->inflight_execute_.fetch_sub(1, std::memory_order_relaxed);
+            database->MaybeReportDiagnostics();
+        }
+    } inflight_scope{this, static_cast<size_t>(diagnostic_operation), counted_execution};
+    if (counted_execution) {
+        const uint64_t active = inflight_execute_.fetch_add(1, std::memory_order_relaxed) + 1;
+        execute_inflight_[static_cast<size_t>(diagnostic_operation)].fetch_add(1, std::memory_order_relaxed);
+        uint64_t peak = peak_inflight_execute_.load(std::memory_order_relaxed);
+        while (peak < active && !peak_inflight_execute_.compare_exchange_weak(peak, active, std::memory_order_relaxed,
+                                                                              std::memory_order_relaxed)) {
+        }
+    }
     const bool exclusive = tree->type == ast::AstType::StaticCheckpoint || tree->type == ast::AstType::CreateTable ||
                            tree->type == ast::AstType::CreateIndex || tree->type == ast::AstType::LoadStmt;
     if (exclusive && session.admission)
         throw std::runtime_error("Delta schema/checkpoint operation inside transaction");
     std::unique_lock<std::shared_mutex> exclusive_admission;
     std::shared_lock<std::shared_mutex> statement_admission;
+    std::unique_lock<std::mutex> exclusive_commit_epoch_gate;
     if (exclusive)
         exclusive_admission = LockExecutionUnique();
     else if (!session.admission)
         statement_admission = LockExecutionShared();
+    if (exclusive)
+        exclusive_commit_epoch_gate = std::unique_lock<std::mutex>(commit_epoch_gate_);
     std::unique_lock<std::shared_mutex> unique_state_lock;
     std::shared_lock<std::shared_mutex> lock;
     const auto shared_wait_started =
@@ -2679,16 +3289,10 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
     else {
         lock = LockStateShared(true);
         if (diagnostics_) {
-            execute_shared_wait_ns_.fetch_add(NsSince(shared_wait_started), std::memory_order_relaxed);
+            const uint64_t elapsed = NsSince(shared_wait_started);
+            execute_shared_wait_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+            RecordMax(execute_shared_wait_max_ns_, elapsed);
             execute_shared_calls_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    const bool counted_execution = diagnostics_ != nullptr;
-    if (counted_execution) {
-        const uint64_t active = inflight_execute_.fetch_add(1, std::memory_order_relaxed) + 1;
-        uint64_t peak = peak_inflight_execute_.load(std::memory_order_relaxed);
-        while (peak < active && !peak_inflight_execute_.compare_exchange_weak(peak, active, std::memory_order_relaxed,
-                                                                              std::memory_order_relaxed)) {
         }
     }
     ExecutionCensus census;
@@ -2704,8 +3308,10 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 return;
             database->CaptureQueryCensus(*session, *census);
             const size_t index = static_cast<size_t>(operation);
+            const uint64_t elapsed = NsSince(started);
             database->execute_calls_[index].fetch_add(1, std::memory_order_relaxed);
-            database->execute_ns_[index].fetch_add(NsSince(started), std::memory_order_relaxed);
+            database->execute_ns_[index].fetch_add(elapsed, std::memory_order_relaxed);
+            RecordMax(database->execute_max_ns_[index], elapsed);
             database->sidecar_base_entries_.fetch_add(census->base_entries, std::memory_order_relaxed);
             database->sidecar_overlay_refs_.fetch_add(census->overlay_refs, std::memory_order_relaxed);
             database->join_parameterized_probes_.fetch_add(census->parameterized_join_probes,
@@ -2728,13 +3334,12 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 database->ordered_stream_.fetch_add(1, std::memory_order_relaxed);
             if (census->ordered_materialize)
                 database->ordered_materialize_.fetch_add(1, std::memory_order_relaxed);
-            database->inflight_execute_.fetch_sub(1, std::memory_order_relaxed);
         }
     } diagnostics_scope{this,
                         &session,
                         diagnostic_operation,
                         &census,
-                        diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{},
+                        execute_started,
                         counted_execution};
     session.census = {};
     RequireUsable();
@@ -2868,6 +3473,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 cells.push_back(Literal(schema.columns[i], *insert.vals[i]));
             const auto id = db_.engine().InsertImage(Txn(session), schema.id, EncodeRow(schema, cells));
             AddOverlay(session.overlay, schema, cells, id);
+            session.private_insert_ids.insert(id);
         } else if (tree->type == ast::AstType::SelectStmt) {
             const auto& select = static_cast<const ast::SelectStmt&>(*tree);
             if (select.tabs.empty() || !select.jointree.empty() || !select.having_conds.empty())
@@ -3840,6 +4446,13 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 if (!Matches(schema, cells, conditions))
                     continue;
                 if (deleting) {
+                    const bool private_insert = session.private_insert_ids.erase(row_id) != 0;
+                    RemoveOverlay(session.overlay, schema, cells, row_id);
+                    if (!private_insert) {
+                        for (const auto& index : schema.indexes)
+                            AppendOverlay(session.removed_overlay,
+                                          {schema.id, index.constraint_id, EncodeKey(schema, index, cells)}, row_id.local_id);
+                    }
                     db_.engine().Erase(txn, row_id);
                     continue;
                 }
@@ -3904,8 +4517,19 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                         apply(term.op, *term.val);
                     next[target_pos] = std::move(value);
                 }
+                const bool private_insert = session.private_insert_ids.count(row_id) != 0;
+                for (const auto& index : schema.indexes) {
+                    const auto old_key = EncodeKey(schema, index, cells);
+                    const auto new_key = EncodeKey(schema, index, next);
+                    if (old_key == new_key)
+                        continue;
+                    RemoveOverlay(session.overlay, schema, index, cells, row_id);
+                    if (!private_insert)
+                        AppendOverlay(session.removed_overlay,
+                                      {schema.id, index.constraint_id, old_key}, row_id.local_id);
+                    AppendOverlay(session.overlay, {schema.id, index.constraint_id, new_key}, row_id.local_id);
+                }
                 db_.engine().PutImage(txn, row_id, EncodeRow(schema, next));
-                AddOverlay(session.overlay, schema, next, row_id, &cells);
             }
         } else
             throw std::runtime_error("unsupported SQL for DeltaKernel");

@@ -7,6 +7,10 @@
 #include <optional>
 #include <string>
 
+namespace deltakernel {
+class DeltaDatabase;
+}
+
 namespace epoch_si_poc {
 
 enum class CheckpointCrashPoint {
@@ -17,7 +21,13 @@ enum class CheckpointCrashPoint {
     kBeforeNextEngineOpen,
     kDuringManifestTemp,
     kAfterManifestRenameBeforeDirSync,
-    kAfterSuccess
+    kAfterSuccess,
+    kRotationAfterHeaderWrite,
+    kRotationAfterHeaderSync,
+    kRotationAfterDirSync,
+    kRotationDuringManifestTemp,
+    kRotationAfterManifestRenameBeforeDirSync,
+    kRotationAfterSwitch
 };
 
 class TableBaseWriter {
@@ -39,12 +49,18 @@ private:
 
 class CheckpointDb {
 public:
+    ~CheckpointDb();
+    CheckpointDb(CheckpointDb&&) noexcept;
+    CheckpointDb& operator=(CheckpointDb&&) noexcept;
+    CheckpointDb(const CheckpointDb&) = delete;
+    CheckpointDb& operator=(const CheckpointDb&) = delete;
     struct TableRef {
         TableId table_id = 0;
         uint64_t file_generation = 0;
         Epoch visible_from = 0;
         uint64_t row_count = 0;
         uint64_t file_bytes = 0;
+        uint64_t next_local_id = 0;
     };
 
     static CheckpointDb Create(const std::string& directory, BaseImage initial_rows);
@@ -95,13 +111,23 @@ public:
     }
 
 private:
+    struct WalChain;
+    struct SnapshotCutBoundary {
+        Epoch epoch;
+        uint64_t next_commit_seq;
+        uint64_t wal_lineage;
+        uint64_t new_active_segment_id;
+    };
+    friend class deltakernel::DeltaDatabase;
     CheckpointDb(std::string directory, uint64_t generation, uint64_t wal_generation, Epoch base_epoch,
                  std::map<TableId, TableRef> tables, EpochSiEngine engine, size_t wal_open_directory_syncs);
+    SnapshotCutBoundary RotateWalAtGate(CheckpointCrashPoint point);
     void RequireUsable() const;
 
     std::string directory_;
     uint64_t generation_;
     uint64_t wal_generation_;
+    std::unique_ptr<WalChain> wal_chain_;
     Epoch base_epoch_;
     std::map<TableId, TableRef> tables_;
     EpochSiEngine engine_;

@@ -276,13 +276,20 @@ class WireClient:
 
 
 class Server:
-    def __init__(self, binary, env_overrides=None, require_sql_readiness=True):
+    def __init__(
+        self,
+        binary,
+        env_overrides=None,
+        require_sql_readiness=True,
+        stderr=subprocess.DEVNULL,
+    ):
         self.binary = os.path.abspath(binary)
         self.root = tempfile.mkdtemp(prefix="rmdb-live-wire-")
         self.port = find_free_port()
         self.process = None
         self.env_overrides = env_overrides or {}
         self.require_sql_readiness = require_sql_readiness
+        self.stderr = stderr
 
     def start(self):
         env = os.environ.copy()
@@ -297,7 +304,7 @@ class Server:
             cwd=self.root,
             env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=self.stderr,
             start_new_session=True,
         )
         deadline = time.monotonic() + 20

@@ -3,6 +3,7 @@
 
 import os
 import struct
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "protocol"))
@@ -88,6 +89,68 @@ def test_typed_insert_select_batch(binary):
         server.cleanup()
 
 
+def test_parameterized_limit_offset_uses_bound_fallback(binary):
+    server = wire.Server(
+        binary,
+        {"RMDB_STORAGE_ENGINE": None, "RMDB_DELTA_DIAGNOSTICS": "1"},
+        require_sql_readiness=False,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        server.start()
+        client = wire.WireClient(server.port)
+        client.command("CREATE TABLE limits(k INT);")
+        for value in range(1, 6):
+            client.command(f"INSERT INTO limits VALUES({value});")
+        statements = [
+            (
+                31,
+                True,
+                [wire.INT32, wire.INT32],
+                "SELECT k FROM limits ORDER BY k LIMIT $1 OFFSET $2;",
+            ),
+            (32, True, [], "SELECT k FROM limits ORDER BY k LIMIT 2 OFFSET 1;"),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {31: [wire.INT32, wire.INT32], 32: []}
+        result = client.batch([(31, [2, 1]), (32, [])], parameter_types, schemas)
+        require(
+            result == (2, 0, 0xFFFF, "", [(0, [[2], [3]]), (1, [[2], [3]])]),
+            "Delta parameterized LIMIT/OFFSET did not match constant execution",
+        )
+
+        executed, status, failed, diagnostic, rows = client.batch(
+            [(31, [-1, 0])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, rows) == (0, 2, 0, []) and diagnostic,
+            "negative Delta LIMIT bypassed generic validation",
+        )
+        executed, status, failed, diagnostic, rows = client.batch(
+            [(31, [1, None])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, rows) == (0, 2, 0, []) and diagnostic,
+            "NULL Delta OFFSET bypassed generic validation",
+        )
+        result = client.batch([(31, [1, 3])], parameter_types, schemas)
+        require(
+            result == (1, 0, 0xFFFF, "", [(0, [[4]])]),
+            "Delta LIMIT/OFFSET failure left the connection unusable",
+        )
+        client.close()
+        server.stop()
+        diagnostics = server.process.stderr.read().decode("utf-8", "replace")
+        require(
+            "prepared_native_count=1" in diagnostics
+            and "prepared_fallback_count=4" in diagnostics
+            and "prepared_clone_count=2" in diagnostics,
+            "Delta prepared native/fallback diagnostics did not match executed routes",
+        )
+    finally:
+        server.cleanup()
+
+
 def test_batch_error_discards_private_delta(binary):
     server = wire.Server(binary, {"RMDB_STORAGE_ENGINE": None}, require_sql_readiness=False)
     try:
@@ -147,6 +210,7 @@ def main():
         test_durable_checkpoint_restart,
         test_failed_prepare_preserves_dictionary,
         test_typed_insert_select_batch,
+        test_parameterized_limit_offset_uses_bound_fallback,
         test_batch_error_discards_private_delta,
         test_si_conflict_reuse_checkpoint_restart,
     ):

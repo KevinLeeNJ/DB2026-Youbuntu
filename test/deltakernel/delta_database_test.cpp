@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
@@ -78,6 +79,84 @@ public:
 private:
     std::string path_;
 };
+
+uint32_t DeltaTestCrc32(const uint8_t* data, size_t size) {
+    uint32_t crc = 0xffffffffU;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+    return ~crc;
+}
+
+template <typename T> void PutDeltaLe(std::vector<uint8_t>& bytes, size_t offset, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bytes.at(offset + i) = static_cast<uint8_t>(value >> (8 * i));
+}
+
+template <typename T> T GetDeltaLe(const std::vector<uint8_t>& bytes, size_t offset) {
+    T value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i)
+        value |= static_cast<T>(bytes.at(offset + i)) << (8 * i);
+    return value;
+}
+
+std::vector<uint8_t> ReadDeltaFile(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void WriteDeltaFile(const std::string& path, const std::vector<uint8_t>& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+void RebaseDeltaWalSegment(const TempDelta& temp, uint64_t new_id) {
+    const std::string old_path = temp.path() + "/db.log.s.0.0";
+    const std::string new_path = temp.path() + "/db.log.s.0." + std::to_string(new_id);
+    auto segment = ReadDeltaFile(old_path);
+    ASSERT_EQ(segment.size(), 72U);
+    PutDeltaLe<uint64_t>(segment, 24, new_id);
+    PutDeltaLe<uint64_t>(segment, 32, new_id - 1);
+    PutDeltaLe<uint32_t>(segment, 68, DeltaTestCrc32(segment.data(), 68));
+    WriteDeltaFile(old_path, segment);
+    std::filesystem::rename(old_path, new_path);
+
+    auto manifest = ReadDeltaFile(temp.path() + "/MANIFEST");
+    const uint32_t count = GetDeltaLe<uint32_t>(manifest, 36);
+    const size_t chain = 44 + static_cast<size_t>(count) * 40;
+    PutDeltaLe<uint64_t>(manifest, chain + 32, new_id);
+    PutDeltaLe<uint64_t>(manifest, chain + 40, new_id);
+    PutDeltaLe<uint64_t>(manifest, chain + 48, 1);
+    PutDeltaLe<uint32_t>(manifest, manifest.size() - 4, DeltaTestCrc32(manifest.data(), manifest.size() - 4));
+    WriteDeltaFile(temp.path() + "/MANIFEST", manifest);
+}
+
+void ConvertSegmentedManifestToLegacy(const TempDelta& temp) {
+    constexpr size_t kManifestHeaderBytes = 44;
+    constexpr size_t kTableRefBytes = 40;
+    constexpr size_t kSegmentHeaderBytes = 72;
+    auto manifest = ReadDeltaFile(temp.path() + "/MANIFEST");
+    const uint32_t count = GetDeltaLe<uint32_t>(manifest, 36);
+    const size_t chain = kManifestHeaderBytes + static_cast<size_t>(count) * kTableRefBytes;
+    ASSERT_EQ(manifest.size(), 112U + static_cast<size_t>(count) * 56U);
+    ASSERT_EQ(GetDeltaLe<uint64_t>(manifest, chain + 32), 0U);
+    ASSERT_EQ(GetDeltaLe<uint64_t>(manifest, chain + 40), 0U);
+    const uint64_t lineage = GetDeltaLe<uint64_t>(manifest, 20);
+    auto segment = ReadDeltaFile(temp.path() + "/db.log.s." + std::to_string(lineage) + ".0");
+    ASSERT_GE(segment.size(), kSegmentHeaderBytes);
+
+    std::vector<uint8_t> legacy(kManifestHeaderBytes + static_cast<size_t>(count) * kTableRefBytes + 4);
+    std::copy(manifest.begin(), manifest.begin() + chain, legacy.begin());
+    PutDeltaLe<uint32_t>(legacy, 8, static_cast<uint32_t>(legacy.size()));
+    PutDeltaLe<uint32_t>(legacy, 40, 0);
+    PutDeltaLe<uint32_t>(legacy, legacy.size() - 4, DeltaTestCrc32(legacy.data(), legacy.size() - 4));
+    WriteDeltaFile(temp.path() + "/db.log." + std::to_string(lineage),
+                   std::vector<uint8_t>(segment.begin() + kSegmentHeaderBytes, segment.end()));
+    ASSERT_TRUE(std::filesystem::remove(temp.path() + "/db.log.s." + std::to_string(lineage) + ".0"));
+    WriteDeltaFile(temp.path() + "/MANIFEST", legacy);
+}
 
 class ScopedStorageEngine {
 public:
@@ -206,6 +285,154 @@ TEST(DeltaDatabaseTest, StaleSameKeyCommitAborts) {
     RunSql(*db, stale, "update t set v = 3 where k = 1;");
     RunSql(*db, first, "commit;");
     EXPECT_THROW(RunSql(*db, stale, "commit;"), deltakernel::DeltaTransactionAbort);
+}
+
+TEST(DeltaDatabaseTest, ManualWalRotationReopensAndContinues) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "insert into t values(1, 7);");
+    db->RotateWalForTest();
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    auto result = Query(*db, session, "select v from t where k = 1;");
+    ASSERT_EQ(result.rows.size(), 1U);
+    EXPECT_EQ(result.rows[0][0], "7");
+    db->RotateWalForTest();
+    RunSql(*db, session, "insert into t values(2, 8);");
+}
+
+TEST(DeltaDatabaseTest, ConsecutiveHeaderOnlyRotationsKeepExactCutBoundary) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    const auto first = db->RotateWalForTest();
+    const std::string first_path =
+        temp.path() + "/db.log.s." + std::to_string(first[2]) + "." + std::to_string(first[3]);
+    EXPECT_EQ(std::filesystem::file_size(first_path), 72U);
+    const auto second = db->RotateWalForTest();
+    EXPECT_EQ(second[0], first[0]);
+    EXPECT_EQ(second[1], first[1]);
+    EXPECT_EQ(second[2], first[2]);
+    EXPECT_EQ(second[3], first[3] + 1);
+    EXPECT_EQ(std::filesystem::file_size(first_path), 72U);
+    const std::string second_path =
+        temp.path() + "/db.log.s." + std::to_string(second[2]) + "." + std::to_string(second[3]);
+    EXPECT_EQ(std::filesystem::file_size(second_path), 72U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int);");
+    RunSql(*db, session, "insert into t values(1);");
+    EXPECT_GT(std::filesystem::file_size(second_path), 72U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, session, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
+}
+
+TEST(DeltaDatabaseTest, RotationRetainsCheckpointFrontierForPriorSegmentInsert) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int);");
+    RunSql(*db, session, "insert into t values(0);");
+    db->Checkpoint();
+    RunSql(*db, session, "insert into t values(1);");
+    db->RotateWalForTest();
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, session, "select k from t order by k;").rows,
+              (std::vector<std::vector<std::string>>{{"0"}, {"1"}}));
+}
+
+TEST(DeltaDatabaseTest, FirstRotationRefreshesLegacyReplayBoundaryFrontier) {
+    TempDelta temp;
+    {
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession session;
+        RunSql(*db, session, "create table t(k int);");
+        RunSql(*db, session, "insert into t values(0);");
+        db->Checkpoint();
+    }
+    ConvertSegmentedManifestToLegacy(temp);
+    {
+        auto db = deltakernel::DeltaDatabase::Open(temp.path());
+        deltakernel::DeltaSession session;
+        RunSql(*db, session, "insert into t values(1);");
+        db->RotateWalForTest();
+    }
+    auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession session;
+    EXPECT_EQ(Query(*reopened, session, "select k from t order by k;").rows,
+              (std::vector<std::vector<std::string>>{{"0"}, {"1"}}));
+}
+
+TEST(DeltaDatabaseTest, RetainedHighSegmentRangeCanRotate) {
+    TempDelta temp;
+    { auto db = deltakernel::DeltaDatabase::Create(temp.path()); }
+    RebaseDeltaWalSegment(temp, 5000);
+    auto db = deltakernel::DeltaDatabase::Open(temp.path());
+    const auto boundary = db->RotateWalForTest();
+    EXPECT_EQ(boundary[3], 5001U);
+    EXPECT_TRUE(std::filesystem::is_regular_file(temp.path() + "/db.log.s.0.5001"));
+    db.reset();
+    EXPECT_NO_THROW(db = deltakernel::DeltaDatabase::Open(temp.path()));
+}
+
+TEST(DeltaDatabaseTest, RotationRejectsNonRegularFutureResidue) {
+    {
+        TempDelta temp;
+        TempDelta external;
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        const std::string future = temp.path() + "/db.log.s.0.1";
+        ASSERT_EQ(symlink(external.path().c_str(), future.c_str()), 0);
+        EXPECT_THROW(db->RotateWalForTest(), std::runtime_error);
+        EXPECT_TRUE(std::filesystem::is_symlink(future));
+        db.reset();
+        EXPECT_NO_THROW(db = deltakernel::DeltaDatabase::Open(temp.path()));
+    }
+    {
+        TempDelta temp;
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        const std::string future = temp.path() + "/db.log.s.0.1";
+        ASSERT_TRUE(std::filesystem::create_directory(future));
+        EXPECT_THROW(db->RotateWalForTest(), std::runtime_error);
+        EXPECT_TRUE(std::filesystem::is_directory(future));
+        db.reset();
+        EXPECT_NO_THROW(db = deltakernel::DeltaDatabase::Open(temp.path()));
+    }
+}
+
+TEST(DeltaDatabaseTest, ManualWalRotationCrashPointsLeaveAnAuthoritativeGeneration) {
+    for (const auto point : {epoch_si_poc::CheckpointCrashPoint::kRotationAfterHeaderWrite,
+                             epoch_si_poc::CheckpointCrashPoint::kRotationAfterHeaderSync,
+                             epoch_si_poc::CheckpointCrashPoint::kRotationAfterDirSync,
+                             epoch_si_poc::CheckpointCrashPoint::kRotationDuringManifestTemp,
+                             epoch_si_poc::CheckpointCrashPoint::kRotationAfterManifestRenameBeforeDirSync,
+                             epoch_si_poc::CheckpointCrashPoint::kRotationAfterSwitch}) {
+        TempDelta temp;
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession session;
+        RunSql(*db, session, "create table t(k int, v int);");
+        RunSql(*db, session, "insert into t values(1, 7);");
+        db->SetWalRotationCrashPointForTest(point);
+        EXPECT_THROW(db->RotateWalForTest(), epoch_si_poc::SimulatedCrash);
+        db.reset();
+        db = deltakernel::DeltaDatabase::Open(temp.path());
+        auto result = Query(*db, session, "select v from t where k = 1;");
+        ASSERT_EQ(result.rows.size(), 1U);
+        EXPECT_EQ(result.rows[0][0], "7");
+        if (point == epoch_si_poc::CheckpointCrashPoint::kRotationAfterHeaderWrite ||
+            point == epoch_si_poc::CheckpointCrashPoint::kRotationAfterHeaderSync ||
+            point == epoch_si_poc::CheckpointCrashPoint::kRotationAfterDirSync ||
+            point == epoch_si_poc::CheckpointCrashPoint::kRotationDuringManifestTemp) {
+            EXPECT_NO_THROW(db->RotateWalForTest());
+            db.reset();
+            db = deltakernel::DeltaDatabase::Open(temp.path());
+            EXPECT_EQ(Query(*db, session, "select v from t where k = 1;").rows,
+                      (std::vector<std::vector<std::string>>{{"7"}}));
+        }
+    }
 }
 
 TEST(DeltaDatabaseTest, ConcurrentCommitsShareOneWalFrame) {
@@ -2009,6 +2236,24 @@ TEST(DeltaDatabaseTest, OrderedOverlaySurvivesWalReopenAndCheckpointFold) {
     EXPECT_EQ(db->IndexProbeCensusForTest(session), (std::array<size_t, 3>{0, 0, 1}));
 }
 
+TEST(DeltaDatabaseTest, CheckpointFoldsCurrentOverlayWithoutLatestDuplicateProbe) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "insert into t values(-1, -1);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    RunSql(*db, session, "insert into t values(4, 40);");
+
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"40"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(session), (std::array<size_t, 3>{1, 1, 1}));
+    db->Checkpoint();
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"40"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(session), (std::array<size_t, 3>{0, 0, 1}));
+}
+
 TEST(DeltaDatabaseTest, OrderedMinStopsAfterDeletedPrefixAndPreservesOldSnapshot) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
@@ -2027,8 +2272,257 @@ TEST(DeltaDatabaseTest, OrderedMinStopsAfterDeletedPrefixAndPreservesOldSnapshot
     EXPECT_EQ(db->OrderedProbeCensusForTest(old_snapshot), (std::array<size_t, 8>{1, 1, 0, 1}));
     EXPECT_EQ(Query(*db, fresh, "select min(o) from queue where w = 1 and d = 1;").rows,
               (std::vector<std::vector<std::string>>{{"100"}}));
-    EXPECT_EQ(db->OrderedProbeCensusForTest(fresh), (std::array<size_t, 8>{101, 1, 0, 1}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(fresh), (std::array<size_t, 8>{1, 1, 0, 1}));
     RunSql(*db, old_snapshot, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedLatestBitmapKeepsOldSnapshotAndReverseBounds) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_snapshot, fresh;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(1);");
+    RunSql(*db, setup, "insert into t values(2);");
+    RunSql(*db, setup, "insert into t values(3);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, old_snapshot, "begin;");
+    RunSql(*db, setup, "delete from t where k = 1;");
+    db->EnableDiagnosticsForTest();
+    const auto before_routes = db->RouteDiagnosticsForTest();
+
+    EXPECT_EQ(Query(*db, old_snapshot, "select min(k) from t;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_EQ(Query(*db, fresh, "select k from t order by k desc limit 3;").rows,
+              (std::vector<std::vector<std::string>>{{"3"}, {"2"}}));
+    EXPECT_TRUE(Query(*db, fresh, "select k from t where k < 0 order by k desc limit 1;").rows.empty());
+    const auto after_routes = db->RouteDiagnosticsForTest();
+    EXPECT_EQ(after_routes[0] - before_routes[0], 2U); // fresh ordered probes use current state.
+    EXPECT_EQ(after_routes[1] - before_routes[1], 1U); // pinned old snapshot uses historical state.
+    EXPECT_EQ(after_routes[2] - before_routes[2], 2U);
+    RunSql(*db, old_snapshot, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedLatestBitmapSkipsDeadPrefixWithSummary) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, latest;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "begin;");
+    for (int key = 0; key <= 10000; ++key)
+        RunSql(*db, setup, ("insert into t values(" + std::to_string(key) + ");").c_str());
+    RunSql(*db, setup, "commit;");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "delete from t where k < 10000;");
+    db->EnableDiagnosticsForTest();
+    const auto before_routes = db->RouteDiagnosticsForTest();
+
+    EXPECT_EQ(Query(*db, latest, "select min(k) from t;").rows,
+              (std::vector<std::vector<std::string>>{{"10000"}}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(latest)[0], 1U);
+    EXPECT_LT(db->LiveSummaryProbeCensusForTest(latest), 16U);
+    const auto after_routes = db->RouteDiagnosticsForTest();
+    EXPECT_EQ(after_routes[0] - before_routes[0], 1U);
+    EXPECT_EQ(after_routes[2] - before_routes[2], 1U);
+    EXPECT_GE(after_routes[3] - before_routes[3], 1U);
+    EXPECT_GE(after_routes[4] - before_routes[4], 1U);
+    const auto tail = db->TailDiagnosticsForTest();
+    EXPECT_GT(tail[0], 0U);
+}
+
+TEST(DeltaDatabaseTest, OrderedReverseSummaryRetainsPreviousWordBit63Once) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, latest;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "begin;");
+    for (int key = 0; key < 130; ++key)
+        RunSql(*db, setup, ("insert into t values(" + std::to_string(key) + ");").c_str());
+    RunSql(*db, setup, "commit;");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "delete from t where k < 63;");
+    RunSql(*db, setup, "delete from t where k >= 64 and k < 128;");
+
+    EXPECT_EQ(Query(*db, latest, "select k from t where k < 128 order by k desc limit 2;").rows,
+              (std::vector<std::vector<std::string>>{{"63"}}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(latest)[0], 1U);
+}
+
+TEST(DeltaDatabaseTest, PrivateInsertKeyMovesAndDeleteLeaveNoCurrentGhosts) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession writer, fresh;
+    RunSql(*db, writer, "create table t(k int);");
+    RunSql(*db, writer, "create index t_k on t(k);");
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "insert into t values(1);");
+    RunSql(*db, writer, "update t set k = 2 where k = 1;");
+    EXPECT_TRUE(Query(*db, writer, "select k from t where k = 1;").rows.empty());
+    EXPECT_EQ(db->IndexProbeCensusForTest(writer), (std::array<size_t, 3>{0, 0, 0}));
+    EXPECT_EQ(Query(*db, writer, "select k from t where k = 2;").rows,
+              (std::vector<std::vector<std::string>>{{"2"}}));
+    RunSql(*db, writer, "update t set k = 3 where k = 2;");
+    EXPECT_TRUE(Query(*db, writer, "select k from t where k = 2;").rows.empty());
+    EXPECT_EQ(db->IndexProbeCensusForTest(writer), (std::array<size_t, 3>{0, 0, 0}));
+    EXPECT_EQ(Query(*db, writer, "select k from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"3"}}));
+    RunSql(*db, writer, "delete from t where k = 3;");
+    RunSql(*db, writer, "commit;");
+
+    for (int key = 1; key <= 3; ++key) {
+        EXPECT_TRUE(Query(*db, fresh, ("select k from t where k = " + std::to_string(key) + ";").c_str()).rows.empty());
+        EXPECT_EQ(db->IndexProbeCensusForTest(fresh), (std::array<size_t, 3>{0, 0, 0}));
+    }
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_TRUE(Query(*db, fresh, "select k from t where k >= 1 and k <= 3;").rows.empty());
+}
+
+TEST(DeltaDatabaseTest, ExistingKeyMovesCoalesceCurrentOverlay) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, writer, fresh;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "update t set k = 2 where k = 1;");
+    RunSql(*db, writer, "update t set k = 3 where k = 2;");
+    RunSql(*db, writer, "commit;");
+
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(db->IndexProbeCensusForTest(fresh), (std::array<size_t, 3>{0, 0, 0}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "update t set v = 11 where k = 3;");
+    RunSql(*db, writer, "commit;");
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+    db->Checkpoint();
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+}
+
+TEST(DeltaDatabaseTest, ExistingKeyMoveThenDeleteLeavesNoCurrentGhost) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, writer, fresh;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(1);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "update t set k = 2 where k = 1;");
+    RunSql(*db, writer, "delete from t where k = 2;");
+    RunSql(*db, writer, "commit;");
+
+    EXPECT_TRUE(Query(*db, fresh, "select k from t where k = 2;").rows.empty());
+    EXPECT_EQ(db->IndexProbeCensusForTest(fresh), (std::array<size_t, 3>{0, 0, 0}));
+}
+
+TEST(DeltaDatabaseTest, CurrentBaseKeepsUnchangedIndexKeys) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, fresh;
+    RunSql(*db, setup, "create table t(a int, b int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 2, 10);");
+    RunSql(*db, setup, "create index t_a on t(a);");
+    RunSql(*db, setup, "create index t_b on t(b);");
+    RunSql(*db, setup, "update t set v = 11 where a = 1;");
+    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select min(a) from t;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}}));
+
+    RunSql(*db, setup, "update t set a = 4 where b = 2;");
+    EXPECT_EQ(Query(*db, fresh, "select v from t where b = 2;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where a = 1;").rows.empty());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+}
+
+TEST(DeltaDatabaseTest, CommitTransfersNonuniqueCandidatesAndSkipsNewIdsInBaseLookup) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_snapshot, writer, fresh;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(0, 1);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, old_snapshot, "begin;");
+    db->EnableDiagnosticsForTest();
+
+    const auto before = db->CurrentIndexCensusForTest();
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "insert into t values(7, 10);");
+    RunSql(*db, writer, "insert into t values(7, 20);");
+    RunSql(*db, writer, "commit;");
+    const auto inserted = db->CurrentIndexCensusForTest();
+    EXPECT_EQ(inserted[0], before[0]);
+    EXPECT_EQ(inserted[1] - before[1], 2U);
+    EXPECT_EQ(inserted[2] - before[2], 2U);
+
+    EXPECT_TRUE(Query(*db, old_snapshot, "select v from t where k = 7;").rows.empty());
+    EXPECT_EQ(db->IndexProbeCensusForTest(old_snapshot), (std::array<size_t, 3>{1, 2, 2}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 7;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}, {"20"}}));
+    EXPECT_EQ(db->IndexProbeCensusForTest(fresh), (std::array<size_t, 3>{1, 2, 2}));
+
+    RunSql(*db, writer, "update t set k = 1 where k = 0;");
+    EXPECT_GT(db->CurrentIndexCensusForTest()[0], inserted[0]);
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 0;").rows.empty());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}}));
+    RunSql(*db, old_snapshot, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, OrderedReverseBitmapHonorsSameWordLowerBound) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, fresh;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "begin;");
+    for (int key = 0; key < 70; ++key)
+        RunSql(*db, setup, ("insert into t values(" + std::to_string(key) + ");").c_str());
+    RunSql(*db, setup, "commit;");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "delete from t where k >= 66;");
+
+    EXPECT_TRUE(Query(*db, fresh, "select k from t where k >= 66 and k < 70 order by k desc limit 1;").rows.empty());
+    EXPECT_EQ(db->OrderedProbeCensusForTest(fresh)[0], 0U);
+}
+
+TEST(DeltaDatabaseTest, OrderedCurrentStateSurvivesReopenAndPrivateKeyMoveAbort) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, local, fresh;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, setup, "insert into t values(2, 20);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, local, "begin;");
+    RunSql(*db, local, "update t set k = 3 where k = 1;");
+    EXPECT_TRUE(Query(*db, local, "select v from t where k = 1;").rows.empty());
+    EXPECT_EQ(Query(*db, local, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    RunSql(*db, local, "rollback;");
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 3;").rows.empty());
+
+    RunSql(*db, setup, "update t set k = 3 where k = 1;");
+    RunSql(*db, setup, "delete from t where k = 2;");
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 1;").rows.empty());
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
 TEST(DeltaDatabaseTest, OrderedDescLimitStreamsReverseAndSurvivesDuplicateFold) {
@@ -2053,7 +2547,7 @@ TEST(DeltaDatabaseTest, OrderedDescLimitStreamsReverseAndSurvivesDuplicateFold) 
     RunSql(*db, session, "update orders set o = 1000 where w = 1 and d = 1 and c = 7 and o = 999;");
     RunSql(*db, session, "update orders set o = 999 where w = 1 and d = 1 and c = 7 and o = 1000;");
     EXPECT_EQ(Query(*db, session, latest).rows, (std::vector<std::vector<std::string>>{{"999"}}));
-    EXPECT_EQ(db->OrderedProbeCensusForTest(session), (std::array<size_t, 8>{2, 2, 0, 1, 2, 2, 0, 0}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(session), (std::array<size_t, 8>{1, 1, 0, 1, 1, 1, 0, 0}));
 
     db->Checkpoint();
     db.reset();
@@ -2199,6 +2693,49 @@ TEST(DeltaDatabaseTest, DiagnosticsReportRoutesRatherThanQueryResults) {
     db->SetExecuteLockHookForTest({});
 }
 
+TEST(DeltaDatabaseTest, DiagnosticsExposeBlockedExecuteBeforeCompletion) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, blocked;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(1);");
+    db->EnableDiagnosticsForTest();
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool release = false;
+    db->SetExecuteLockHookForTest([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        condition.notify_all();
+        ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2), [&] { return release; }));
+    });
+    std::exception_ptr error;
+    std::thread worker([&] {
+        try {
+            Query(*db, blocked, "select k from t;");
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+    }
+    EXPECT_EQ(db->InflightDiagnosticsForTest(), (std::array<uint64_t, 5>{0, 0, 1, 0, 0}));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_all();
+    worker.join();
+    EXPECT_FALSE(error);
+    EXPECT_EQ(db->InflightDiagnosticsForTest()[2], 0U);
+    EXPECT_GT(db->TailDiagnosticsForTest()[0], 0U);
+    db->SetExecuteLockHookForTest({});
+}
+
 TEST(DeltaDatabaseTest, OrderedMinMaxRecheckSnapshotAndPrivateKeyMoves) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
@@ -2217,7 +2754,7 @@ TEST(DeltaDatabaseTest, OrderedMinMaxRecheckSnapshotAndPrivateKeyMoves) {
     EXPECT_EQ(db->OrderedProbeCensusForTest(old_snapshot), (std::array<size_t, 8>{2, 2, 0, 1, 1, 1, 0, 0}));
     EXPECT_EQ(Query(*db, fresh, "select min(k) from valueset where g = 1;").rows,
               (std::vector<std::vector<std::string>>{{"20"}}));
-    EXPECT_EQ(db->OrderedProbeCensusForTest(fresh), (std::array<size_t, 8>{2, 2, 0, 1, 1, 1, 0, 0}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(fresh), (std::array<size_t, 8>{1, 1, 0, 1, 1, 1, 0, 0}));
     EXPECT_EQ(Query(*db, fresh, "select max(k) from valueset where g = 1;").rows,
               (std::vector<std::vector<std::string>>{{"20"}}));
     EXPECT_EQ(db->OrderedProbeCensusForTest(fresh), (std::array<size_t, 8>{1, 1, 0, 1, 1, 1, 0, 0}));
@@ -2229,7 +2766,7 @@ TEST(DeltaDatabaseTest, OrderedMinMaxRecheckSnapshotAndPrivateKeyMoves) {
     EXPECT_EQ(db->OrderedProbeCensusForTest(local), (std::array<size_t, 8>{1, 1, 0, 1, 2, 2, 0, 0}));
     EXPECT_EQ(Query(*db, local, "select max(k) from valueset where g = 1;").rows,
               (std::vector<std::vector<std::string>>{{"5"}}));
-    EXPECT_EQ(db->OrderedProbeCensusForTest(local), (std::array<size_t, 8>{3, 3, 0, 1, 2, 2, 0, 0}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(local), (std::array<size_t, 8>{2, 2, 0, 1, 2, 2, 0, 0}));
     RunSql(*db, local, "rollback;");
     RunSql(*db, old_snapshot, "rollback;");
 }
@@ -2247,7 +2784,7 @@ TEST(DeltaDatabaseTest, OrderedMergeDeduplicatesBaseAndOverlayBeforePredicateRec
 
     EXPECT_EQ(Query(*db, session, "select k from ranked where wanted = 1 order by k desc limit 1;").rows,
               (std::vector<std::vector<std::string>>{{"1"}}));
-    EXPECT_EQ(db->OrderedProbeCensusForTest(session), (std::array<size_t, 8>{3, 3, 0, 1, 2, 2, 0, 0}));
+    EXPECT_EQ(db->OrderedProbeCensusForTest(session), (std::array<size_t, 8>{2, 2, 0, 1, 1, 1, 0, 0}));
 }
 
 TEST(DeltaDatabaseTest, OrderedEarlyStopDoesNotMaterializeSameKeyOverlayBuckets) {
@@ -2757,6 +3294,43 @@ TEST(DeltaDatabaseTest, PreparedDescriptionDryValidatesSchemaAndParameters) {
     auto insert = ast::parse_sql("insert into typed values($1, $2, $3);");
     EXPECT_NO_THROW(db->DescribePrepared(*insert, {deltakernel::DeltaValueType::Int, deltakernel::DeltaValueType::Float,
                                                    deltakernel::DeltaValueType::Char}));
+}
+
+TEST(DeltaDatabaseTest, PreparedProgramExecutesTypedParametersWithoutTreeClone) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table typed(id int, amount float, note char(8));");
+    RunSql(*db, session, "insert into typed values(7, 1.5, 'old');");
+
+    auto program = db->CompilePrepared(ast::parse_sql("update typed set amount = amount + $1 where id = $2;"),
+                                       {deltakernel::DeltaValueType::Float, deltakernel::DeltaValueType::Int});
+    ASSERT_TRUE(program);
+    EXPECT_FALSE(program->query());
+    deltakernel::DeltaParameterFrame parameters(2);
+    parameters[0].type = deltakernel::DeltaValueType::Float;
+    parameters[0].present = true;
+    parameters[0].float_bits = 0x3f000000U; // 0.5f
+    parameters[1].type = deltakernel::DeltaValueType::Int;
+    parameters[1].present = true;
+    parameters[1].integer = 7;
+    EXPECT_FALSE(db->ExecutePrepared(*program, parameters, session, nullptr));
+    EXPECT_EQ(Query(*db, session, "select amount from typed where id = 7;").rows,
+              (std::vector<std::vector<std::string>>{{"1073741824"}})); // 2.0f bits
+}
+
+TEST(DeltaDatabaseTest, PreparedProgramRejectsRuntimeLimitAndOffset) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table typed(id int);");
+
+    EXPECT_EQ(db->CompilePrepared(ast::parse_sql("select id from typed limit $1;"), {deltakernel::DeltaValueType::Int}),
+              nullptr);
+    EXPECT_EQ(db->CompilePrepared(ast::parse_sql("select id from typed limit 1 offset $1;"),
+                                  {deltakernel::DeltaValueType::Int}),
+              nullptr);
+    EXPECT_NE(db->CompilePrepared(ast::parse_sql("select id from typed limit 1 offset 2;"), {}), nullptr);
 }
 
 TEST(DeltaDatabaseTest, PreparedDescriptionResolvesNewOrderMultiTableColumns) {
