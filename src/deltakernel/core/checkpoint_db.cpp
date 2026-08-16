@@ -5,17 +5,23 @@
 #include <algorithm>
 #include <chrono>
 #include <array>
+#include <charconv>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <limits>
 #include <set>
+#include <string_view>
 #include <stdexcept>
 #include <system_error>
+#include <type_traits>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
+#include <linux/fs.h>
+#include <dirent.h>
 
 namespace epoch_si_poc {
 namespace {
@@ -36,6 +42,7 @@ constexpr uint64_t kMaxManifestBytes = 16ULL << 20;
 constexpr uint64_t kMaxTableBytes = 64ULL << 30;
 constexpr uint64_t kRowsPerBlock = 32;
 constexpr size_t kTableWriteBufferBytes = 1U << 20;
+constexpr size_t kPointReadScratchBytes = 1U << 20;
 
 struct ManifestState {
     uint32_t manifest_format = kLegacyManifestFormat;
@@ -110,32 +117,45 @@ void EncodeRow(std::vector<uint8_t>& out, const RowImage& row) {
     }
 }
 
-RowImage DecodeRow(const std::vector<uint8_t>& bytes) {
+RowImage DecodeRow(const uint8_t* bytes, size_t size) {
     size_t pos = 0;
-    const uint32_t image_bytes = GetLe<uint32_t>(bytes, pos, bytes.size());
-    const uint16_t claim_count = GetLe<uint16_t>(bytes, pos, bytes.size());
-    if (image_bytes > bytes.size() - pos || claim_count > (bytes.size() - pos - image_bytes) / 8)
+    const auto get = [&](auto* value) {
+        using T = std::remove_pointer_t<decltype(value)>;
+        if (pos > size || size - pos < sizeof(T))
+            throw std::runtime_error("truncated immutable row image");
+        *value = 0;
+        for (size_t i = 0; i < sizeof(T); ++i)
+            *value |= static_cast<T>(bytes[pos++]) << (8 * i);
+    };
+    uint32_t image_bytes = 0;
+    uint16_t claim_count = 0;
+    get(&image_bytes);
+    get(&claim_count);
+    if (image_bytes > size - pos || claim_count > (size - pos - image_bytes) / 8)
         throw std::runtime_error("invalid immutable row image");
     RowImage row;
-    row.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(pos),
-                     bytes.begin() + static_cast<std::ptrdiff_t>(pos + image_bytes));
+    row.bytes.assign(bytes + pos, bytes + pos + image_bytes);
     pos += image_bytes;
     for (uint16_t i = 0; i < claim_count; ++i) {
         ConstraintClaim claim;
-        claim.constraint_id = GetLe<uint32_t>(bytes, pos, bytes.size());
-        const uint32_t claim_bytes = GetLe<uint32_t>(bytes, pos, bytes.size());
-        if (claim_bytes > bytes.size() - pos)
+        uint32_t claim_bytes = 0;
+        get(&claim.constraint_id);
+        get(&claim_bytes);
+        if (claim_bytes > size - pos)
             throw std::runtime_error("invalid immutable row claim");
-        claim.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(pos),
-                           bytes.begin() + static_cast<std::ptrdiff_t>(pos + claim_bytes));
+        claim.bytes.assign(bytes + pos, bytes + pos + claim_bytes);
         pos += claim_bytes;
         if (!row.claims.empty() && !(row.claims.back() < claim))
             throw std::runtime_error("invalid immutable row claim ordering");
         row.claims.push_back(std::move(claim));
     }
-    if (pos != bytes.size())
+    if (pos != size)
         throw std::runtime_error("immutable row trailing bytes");
     return row;
+}
+
+RowImage DecodeRow(const std::vector<uint8_t>& bytes) {
+    return DecodeRow(bytes.data(), bytes.size());
 }
 
 std::string Join(const std::string& directory, const std::string& name) {
@@ -150,8 +170,49 @@ std::string LegacyWalName(uint64_t generation) {
 std::string SegmentName(uint64_t lineage, uint64_t segment_id) {
     return "db.log.s." + std::to_string(lineage) + "." + std::to_string(segment_id);
 }
+
+bool ParseCanonicalUnsigned(std::string_view text, uint64_t* value) {
+    if (text.empty())
+        return false;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), *value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && std::to_string(*value) == text;
+}
+
+bool ParseSegmentName(std::string_view name, uint64_t* lineage, uint64_t* segment_id) {
+    constexpr std::string_view prefix = "db.log.s.";
+    if (name.substr(0, prefix.size()) != prefix)
+        return false;
+    name.remove_prefix(prefix.size());
+    const size_t separator = name.find('.');
+    return separator != std::string_view::npos && name.find('.', separator + 1) == std::string_view::npos &&
+           ParseCanonicalUnsigned(name.substr(0, separator), lineage) &&
+           ParseCanonicalUnsigned(name.substr(separator + 1), segment_id);
+}
+
+bool ParseWalName(std::string_view name, std::string_view prefix) {
+    if (name.substr(0, prefix.size()) != prefix)
+        return false;
+    uint64_t generation = 0;
+    return ParseCanonicalUnsigned(name.substr(prefix.size()), &generation);
+}
 std::string TableName(TableId table_id, uint64_t generation) {
     return "tablebase." + std::to_string(table_id) + "." + std::to_string(generation);
+}
+
+bool ParseTableName(std::string_view name, TableId* table_id, uint64_t* generation) {
+    constexpr std::string_view prefix = "tablebase.";
+    if (name.substr(0, prefix.size()) != prefix)
+        return false;
+    name.remove_prefix(prefix.size());
+    const size_t separator = name.find('.');
+    uint64_t parsed_table = 0;
+    if (separator == std::string_view::npos || name.find('.', separator + 1) != std::string_view::npos ||
+        !ParseCanonicalUnsigned(name.substr(0, separator), &parsed_table) ||
+        parsed_table > std::numeric_limits<TableId>::max() ||
+        !ParseCanonicalUnsigned(name.substr(separator + 1), generation))
+        return false;
+    *table_id = static_cast<TableId>(parsed_table);
+    return true;
 }
 
 void WriteLoop(int fd, const uint8_t* bytes, size_t size) {
@@ -484,6 +545,18 @@ void PublishManifest(const std::string& directory, const ManifestState& state, C
     SyncDirectory(directory);
 }
 
+void PublishManifestBytes(const std::string& directory, const std::vector<uint8_t>& bytes, CheckpointCrashPoint crash,
+                          bool& renamed) {
+    renamed = false;
+    const std::string temp = Join(directory, "MANIFEST.tmp");
+    WriteFile(temp, bytes, crash == CheckpointCrashPoint::kDuringManifestTemp);
+    RenameFile(temp, Join(directory, "MANIFEST"));
+    renamed = true;
+    if (crash == CheckpointCrashPoint::kAfterManifestRenameBeforeDirSync)
+        throw SimulatedCrash();
+    SyncDirectory(directory);
+}
+
 std::shared_ptr<const ImmutableTable> OpenTable(const std::string& directory, const CheckpointDb::TableRef& ref);
 
 } // namespace
@@ -501,9 +574,14 @@ struct CheckpointDb::WalChain {
 
 struct TableBaseWriter::Impl {
     std::string directory;
+    std::string temp_name;
+    std::string final_name;
     std::string temp;
     std::string final;
+    int directory_fd = -1;
     int fd = -1;
+    dev_t device = 0;
+    ino_t inode = 0;
     TableId table_id = 0;
     uint64_t generation = 0;
     Epoch visible_from = 0;
@@ -515,24 +593,58 @@ struct TableBaseWriter::Impl {
     std::vector<uint64_t> offsets;
     std::vector<uint64_t> first_local_ids;
     bool renamed = false;
+    bool keep_final = false;
 
-    Impl(std::string directory_, TableId table_id_, uint64_t generation_, Epoch visible_from_)
-        : directory(std::move(directory_)), temp(Join(directory, TableName(table_id_, generation_) + ".tmp")),
-          final(Join(directory, TableName(table_id_, generation_))), table_id(table_id_), generation(generation_),
-          visible_from(visible_from_) {
-        fd = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0)
-            ThrowSystemError("open immutable table temp");
-        std::vector<uint8_t> header(kTableHeaderBytes, 0);
-        WriteLoop(fd, header.data(), header.size());
-        output.reserve(kTableWriteBufferBytes);
+    void RemoveOwned(const std::string& name) noexcept {
+        if (directory_fd < 0)
+            return;
+        struct stat state {};
+        if (fstatat(directory_fd, name.c_str(), &state, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(state.st_mode) &&
+            state.st_dev == device && state.st_ino == inode)
+            unlinkat(directory_fd, name.c_str(), 0);
     }
 
     ~Impl() {
         if (fd >= 0)
             close(fd);
         if (!renamed)
-            unlink(temp.c_str());
+            RemoveOwned(temp_name);
+        else if (!keep_final)
+            RemoveOwned(final_name);
+        if (directory_fd >= 0)
+            close(directory_fd);
+    }
+
+    Impl(std::string directory_, TableId table_id_, uint64_t generation_, Epoch visible_from_)
+        : directory(std::move(directory_)), temp_name(TableName(table_id_, generation_) + ".tmp"),
+          final_name(TableName(table_id_, generation_)), temp(Join(directory, temp_name)),
+          final(Join(directory, final_name)), table_id(table_id_), generation(generation_),
+          visible_from(visible_from_) {
+        directory_fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory_fd < 0)
+            ThrowSystemError("open immutable table directory");
+        try {
+            fd = openat(directory_fd, temp_name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (fd < 0)
+                ThrowSystemError("create immutable table temp");
+            struct stat state {};
+            if (fstat(fd, &state) != 0 || !S_ISREG(state.st_mode))
+                throw std::runtime_error("immutable table temp is not a regular file");
+            device = state.st_dev;
+            inode = state.st_ino;
+            std::vector<uint8_t> header(kTableHeaderBytes, 0);
+            WriteLoop(fd, header.data(), header.size());
+            output.reserve(kTableWriteBufferBytes);
+        } catch (...) {
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
+            RemoveOwned(temp_name);
+            close(directory_fd);
+            directory_fd = -1;
+            throw;
+        }
     }
 
     void FlushOutput() {
@@ -614,14 +726,91 @@ struct TableBaseWriter::Impl {
             ThrowSystemError("close immutable table temp");
         }
         fd = -1;
-        RenameFile(temp, final);
+        if (syscall(SYS_renameat2, directory_fd, temp_name.c_str(), directory_fd, final_name.c_str(),
+                    RENAME_NOREPLACE) != 0)
+            ThrowSystemError("rename immutable table");
         renamed = true;
         if (crash == CheckpointCrashPoint::kAfterBaseRename)
             throw SimulatedCrash();
-        SyncDirectory(directory);
+        while (fsync(directory_fd) != 0)
+            if (errno != EINTR)
+                ThrowSystemError("sync immutable table directory");
         return {table_id, generation, visible_from, rows, total};
     }
 };
+
+CheckpointDb::SnapshotArtifact::~SnapshotArtifact() {}
+
+CheckpointDb::SnapshotArtifact::SnapshotArtifact(SnapshotArtifact&& other) noexcept
+    : tables_(std::move(other.tables_)), writers_(std::move(other.writers_)) {}
+
+CheckpointDb::SnapshotArtifact& CheckpointDb::SnapshotArtifact::operator=(SnapshotArtifact&& other) noexcept {
+    if (this == &other)
+        return *this;
+    tables_ = std::move(other.tables_);
+    writers_ = std::move(other.writers_);
+    return *this;
+}
+
+CheckpointDb::PreparedSnapshotArtifacts::PreparedSnapshotArtifacts(PreparedSnapshotArtifacts&& other) noexcept
+    : tables_(std::move(other.tables_)), writers_(std::move(other.writers_)), readers_(std::move(other.readers_)) {}
+
+CheckpointDb::PreparedSnapshotArtifacts&
+CheckpointDb::PreparedSnapshotArtifacts::operator=(PreparedSnapshotArtifacts&& other) noexcept {
+    if (this == &other)
+        return *this;
+    tables_ = std::move(other.tables_);
+    writers_ = std::move(other.writers_);
+    readers_ = std::move(other.readers_);
+    return *this;
+}
+
+CheckpointDb::PreparedSnapshotPublication::PreparedSnapshotPublication(PreparedSnapshotPublication&& other) noexcept
+    : artifacts_(std::move(other.artifacts_)), source_(std::move(other.source_)), tables_(std::move(other.tables_)),
+      manifest_bytes_(std::move(other.manifest_bytes_)), generation_(other.generation_), base_epoch_(other.base_epoch_),
+      base_next_commit_seq_(other.base_next_commit_seq_), wal_lineage_(other.wal_lineage_),
+      first_segment_id_(other.first_segment_id_), active_segment_id_(other.active_segment_id_) {}
+
+CheckpointDb::PreparedSnapshotPublication&
+CheckpointDb::PreparedSnapshotPublication::operator=(PreparedSnapshotPublication&& other) noexcept {
+    if (this == &other)
+        return *this;
+    artifacts_ = std::move(other.artifacts_);
+    source_ = std::move(other.source_);
+    tables_ = std::move(other.tables_);
+    manifest_bytes_ = std::move(other.manifest_bytes_);
+    generation_ = other.generation_;
+    base_epoch_ = other.base_epoch_;
+    base_next_commit_seq_ = other.base_next_commit_seq_;
+    wal_lineage_ = other.wal_lineage_;
+    first_segment_id_ = other.first_segment_id_;
+    active_segment_id_ = other.active_segment_id_;
+    return *this;
+}
+
+void CheckpointDb::PreparedSnapshotArtifacts::KeepPublishedFiles() noexcept {
+    for (auto& writer : writers_) {
+        if (writer.impl_)
+            writer.impl_->keep_final = true;
+    }
+}
+
+void CheckpointDb::PreparedSnapshotArtifacts::UnkeepPublishedFiles() noexcept {
+    for (auto& writer : writers_) {
+        if (writer.impl_)
+            writer.impl_->keep_final = false;
+    }
+}
+
+void CheckpointDb::PreparedSnapshotArtifacts::MarkPublished() noexcept {
+    for (auto& writer : writers_) {
+        if (writer.impl_) {
+            writer.impl_->keep_final = true;
+            writer.impl_.reset();
+        }
+    }
+    writers_.clear();
+}
 
 TableBaseWriter::TableBaseWriter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 TableBaseWriter::~TableBaseWriter() = default;
@@ -655,7 +844,7 @@ std::optional<bool> ImmutableTable::RecoveryContains(uint64_t local_id) const {
     return word < recovery_membership_.size() && (recovery_membership_[word] & (uint64_t{1} << (local_id % 64))) != 0;
 }
 
-std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
+std::optional<Row> ImmutableTable::Read(uint64_t local_id, std::vector<uint8_t>* scratch) const {
     if (local_id >= next_local_id_)
         return std::nullopt;
     const auto diagnostics = diagnostics_;
@@ -669,7 +858,10 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
     if (offset >= stop || stop > kTableHeaderBytes + payload_bytes_ ||
         stop - offset > std::vector<uint8_t>().max_size())
         throw std::runtime_error("invalid immutable table block range");
-    std::vector<uint8_t> bytes(static_cast<size_t>(stop - offset));
+    const size_t block_bytes = static_cast<size_t>(stop - offset);
+    std::vector<uint8_t> local;
+    std::vector<uint8_t>& bytes = scratch != nullptr && block_bytes <= kPointReadScratchBytes ? *scratch : local;
+    bytes.resize(block_bytes);
     const auto pread_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     PreadLoop(fd_, bytes.data(), bytes.size(), offset);
     if (diagnostics) {
@@ -692,7 +884,7 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
         if (id == local_id) {
             const auto decode_started =
                 diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const auto decoded = DecodeRow(std::vector<uint8_t>(bytes.begin() + pos, bytes.begin() + pos + length));
+            const auto decoded = DecodeRow(bytes.data() + pos, length);
             if (diagnostics) {
                 diagnostics->immutable_decode_ns.fetch_add(
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -703,6 +895,34 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
             return decoded;
         }
         pos += length;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<uint64_t, Row>> ImmutableTable::ReadAtOrAfter(uint64_t local_id) const {
+    if (local_id >= next_local_id_)
+        return std::nullopt;
+    const auto diagnostics = diagnostics_;
+    auto upper = std::upper_bound(block_first_ids_.begin(), block_first_ids_.end(), local_id);
+    size_t block = upper == block_first_ids_.begin() ? 0 : static_cast<size_t>(upper - block_first_ids_.begin() - 1);
+    for (; block < block_offsets_.size(); ++block) {
+        const uint64_t offset = kTableHeaderBytes + block_offsets_[block];
+        const uint64_t stop = block + 1 < block_offsets_.size() ? kTableHeaderBytes + block_offsets_[block + 1]
+                                                                : kTableHeaderBytes + payload_bytes_;
+        if (offset >= stop || stop > kTableHeaderBytes + payload_bytes_)
+            throw std::runtime_error("invalid immutable table block range");
+        std::vector<uint8_t> bytes(static_cast<size_t>(stop - offset));
+        PreadLoop(fd_, bytes.data(), bytes.size(), offset);
+        size_t pos = 0;
+        while (pos < bytes.size()) {
+            const uint64_t id = GetLe<uint64_t>(bytes, pos, bytes.size());
+            const uint32_t length = GetLe<uint32_t>(bytes, pos, bytes.size());
+            if (length > bytes.size() - pos)
+                throw std::runtime_error("invalid immutable row length");
+            if (id >= local_id)
+                return std::make_pair(id, DecodeRow(bytes.data() + pos, length));
+            pos += length;
+        }
     }
     return std::nullopt;
 }
@@ -899,20 +1119,50 @@ std::shared_ptr<const ImmutableTable> OpenTable(const std::string& directory, co
     }
 }
 
-void GarbageCollectTables(const std::string& directory, const std::map<TableId, CheckpointDb::TableRef>& refs) {
-    std::set<std::string> keep;
-    for (const auto& [id, ref] : refs)
-        keep.insert(TableName(id, ref.file_generation));
-    bool removed = false;
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("tablebase.", 0) == 0 && !keep.count(name)) {
-            std::error_code error;
-            removed = std::filesystem::remove(entry.path(), error) || removed;
+void GarbageCollectTables(const std::string& directory_name,
+                          const std::map<TableId, CheckpointDb::TableRef>& refs) noexcept {
+    try {
+        std::set<std::string> keep;
+        for (const auto& [id, ref] : refs)
+            keep.insert(TableName(id, ref.file_generation));
+        DirectoryFd directory(directory_name);
+        const int scan_fd = dup(directory.get());
+        if (scan_fd < 0)
+            return;
+        DIR* entries = fdopendir(scan_fd);
+        if (!entries) {
+            close(scan_fd);
+            return;
         }
+        bool removed = false;
+        while (dirent* entry = readdir(entries)) {
+            const std::string_view name(entry->d_name);
+            TableId table_id = 0;
+            uint64_t generation = 0;
+            if (!ParseTableName(name, &table_id, &generation) || keep.count(std::string(name)))
+                continue;
+            struct stat before {};
+            if (fstatat(directory.get(), entry->d_name, &before, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(before.st_mode))
+                continue;
+            const int fd = openat(directory.get(), entry->d_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (fd < 0)
+                continue;
+            struct stat opened {};
+            struct stat current {};
+            const bool owned = fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) &&
+                               fstatat(directory.get(), entry->d_name, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+                               S_ISREG(current.st_mode) && opened.st_dev == current.st_dev &&
+                               opened.st_ino == current.st_ino && opened.st_dev == before.st_dev &&
+                               opened.st_ino == before.st_ino;
+            close(fd);
+            if (owned && unlinkat(directory.get(), entry->d_name, 0) == 0)
+                removed = true;
+        }
+        closedir(entries);
+        if (removed)
+            directory.Sync();
+    } catch (...) {
     }
-    if (removed)
-        SyncDirectory(directory);
 }
 
 void RefreshMigrationFrontiersAtReplayBoundary(std::map<TableId, CheckpointDb::TableRef>& tables,
@@ -935,7 +1185,7 @@ CheckpointDb::CheckpointDb(CheckpointDb&& other) noexcept
     : directory_(std::move(other.directory_)), generation_(other.generation_), wal_generation_(other.wal_generation_),
       wal_chain_(std::move(other.wal_chain_)), base_epoch_(other.base_epoch_), tables_(std::move(other.tables_)),
       engine_(std::move(other.engine_)), wal_open_directory_syncs_(other.wal_open_directory_syncs_),
-      crash_point_(other.crash_point_), poisoned_(other.poisoned_) {}
+      sealed_wal_bytes_(other.sealed_wal_bytes_), crash_point_(other.crash_point_), poisoned_(other.poisoned_) {}
 
 CheckpointDb& CheckpointDb::operator=(CheckpointDb&& other) noexcept {
     if (this == &other)
@@ -949,6 +1199,7 @@ CheckpointDb& CheckpointDb::operator=(CheckpointDb&& other) noexcept {
     wal_open_directory_syncs_ = other.wal_open_directory_syncs_;
     crash_point_ = other.crash_point_;
     poisoned_ = other.poisoned_;
+    sealed_wal_bytes_ = other.sealed_wal_bytes_;
     wal_chain_ = std::move(other.wal_chain_);
     return *this;
 }
@@ -972,6 +1223,7 @@ CheckpointDb CheckpointDb::Create(const std::string& directory, BaseImage initia
         auto ref = writer.impl_->Finish(CheckpointCrashPoint::kNone);
         ref.next_local_id = writer.impl_->next_local_id;
         tables.emplace(table_id, ref);
+        writer.impl_->keep_final = true;
         writer.impl_.reset();
     }
     DirectoryFd directory_fd(directory);
@@ -1002,6 +1254,7 @@ CheckpointDb CheckpointDb::Open(const std::string& directory) {
     std::optional<EpochSiEngine> opened;
     std::unique_ptr<FileWal> legacy;
     std::vector<std::unique_ptr<FileWal>> segments;
+    size_t sealed_wal_bytes = 0;
     if (manifest.manifest_format == kLegacyManifestFormat) {
         const std::string wal_name = ResolveAndMigrateWal(directory_fd, manifest.wal_generation);
         opened.emplace(
@@ -1010,6 +1263,10 @@ CheckpointDb CheckpointDb::Open(const std::string& directory) {
         if (manifest.has_legacy_prefix) {
             const std::string wal_name = ResolveAndMigrateWal(directory_fd, manifest.legacy_prefix_generation);
             legacy = std::make_unique<FileWal>(directory_fd.get(), wal_name, FileWal::OpenMode::kExisting);
+            const size_t size = legacy->size();
+            if (size > std::numeric_limits<size_t>::max() - sealed_wal_bytes)
+                throw std::overflow_error("sealed WAL byte count exhausted");
+            sealed_wal_bytes += size;
         }
         segments.reserve(static_cast<size_t>(manifest.segment_count));
         for (uint64_t offset = 0; offset < manifest.segment_count; ++offset) {
@@ -1017,6 +1274,12 @@ CheckpointDb CheckpointDb::Open(const std::string& directory) {
             segments.push_back(std::make_unique<FileWal>(FileWal::OpenSegmentAt(
                 directory_fd.get(), SegmentName(manifest.wal_lineage_generation, id),
                 {manifest.wal_lineage_generation, id, id == 0 ? std::numeric_limits<uint64_t>::max() : id - 1, 0, 0})));
+            if (id < manifest.active_segment_id) {
+                const size_t size = segments.back()->size();
+                if (size > std::numeric_limits<size_t>::max() - sealed_wal_bytes)
+                    throw std::overflow_error("sealed WAL byte count exhausted");
+                sealed_wal_bytes += size;
+            }
         }
         std::map<TableId, uint64_t> frontiers;
         for (const auto& [id, ref] : manifest.tables)
@@ -1047,7 +1310,17 @@ CheckpointDb CheckpointDb::Open(const std::string& directory) {
     result.wal_chain_->base_epoch = manifest.wal_base_epoch;
     result.wal_chain_->base_next_commit_seq =
         manifest.manifest_format == kLegacyManifestFormat ? 1 : manifest.base_next_commit_seq;
+    result.sealed_wal_bytes_ = sealed_wal_bytes;
+    result.GarbageCollectExcludedWal();
     return result;
+}
+
+size_t CheckpointDb::durable_wal_bytes() const {
+    RequireUsable();
+    const size_t active = engine_.durable_wal_bytes();
+    if (active > std::numeric_limits<size_t>::max() - sealed_wal_bytes_)
+        throw std::overflow_error("WAL byte count exhausted");
+    return sealed_wal_bytes_ + active;
 }
 
 TableBaseWriter CheckpointDb::BeginTableBase(TableId table_id) {
@@ -1087,10 +1360,14 @@ void CheckpointDb::PublishTableBase(TableBaseWriter&& writer) {
     next.tables = tables_;
     next.tables[persisted_ref.table_id] = persisted_ref;
     std::unique_ptr<FileWal> migration_candidate;
+    size_t migrated_active_wal = 0;
     if (!wal_chain_->has_segment_chain) {
         RefreshMigrationFrontiersAtReplayBoundary(next.tables, engine_);
         if (wal_chain_->legacy_prefix_generation == std::numeric_limits<uint64_t>::max())
             throw std::overflow_error("WAL lineage exhausted");
+        migrated_active_wal = engine_.durable_wal_bytes();
+        if (migrated_active_wal > std::numeric_limits<size_t>::max() - sealed_wal_bytes_)
+            throw std::overflow_error("sealed WAL byte count exhausted");
         const uint64_t lineage = wal_chain_->legacy_prefix_generation + 1;
         DirectoryFd directory_fd(directory_);
         const std::string segment_name = SegmentName(lineage, 0);
@@ -1114,6 +1391,7 @@ void CheckpointDb::PublishTableBase(TableBaseWriter&& writer) {
         engine_.InstallTablePrepared(std::move(prepared));
         if (migration_candidate) {
             engine_.InstallFileWalForRotation(std::move(migration_candidate));
+            sealed_wal_bytes_ += migrated_active_wal;
             wal_chain_->has_legacy_prefix = true;
             wal_chain_->has_segment_chain = true;
             wal_chain_->legacy_prefix_generation = next.legacy_prefix_generation;
@@ -1122,6 +1400,7 @@ void CheckpointDb::PublishTableBase(TableBaseWriter&& writer) {
             wal_chain_->base_next_commit_seq = next.base_next_commit_seq;
             wal_generation_ = next.wal_lineage_generation;
         }
+        writer.impl_->keep_final = true;
         writer.impl_.reset();
         if (crash_point_ == CheckpointCrashPoint::kAfterSuccess)
             throw SimulatedCrash();
@@ -1170,6 +1449,9 @@ CheckpointDb::SnapshotCutBoundary CheckpointDb::RotateWalAtGate(CheckpointCrashP
                                  {lineage, next_id, next_id == 0 ? std::numeric_limits<uint64_t>::max() : next_id - 1,
                                   boundary.epoch + 1, boundary.next_commit_seq}));
     candidate->SetDiagnostics(engine_.diagnostics_);
+    const size_t prior_active_wal = engine_.durable_wal_bytes();
+    if (prior_active_wal > std::numeric_limits<size_t>::max() - sealed_wal_bytes_)
+        throw std::overflow_error("sealed WAL byte count exhausted");
     if (point == CheckpointCrashPoint::kRotationAfterHeaderWrite)
         throw SimulatedCrash();
     candidate->Sync();
@@ -1197,6 +1479,7 @@ CheckpointDb::SnapshotCutBoundary CheckpointDb::RotateWalAtGate(CheckpointCrashP
     try {
         PublishManifest(directory_, next, point);
         engine_.InstallFileWalForRotation(std::move(candidate));
+        sealed_wal_bytes_ += prior_active_wal;
         generation_ = next.generation;
         wal_generation_ = next.wal_lineage_generation;
         wal_chain_->has_legacy_prefix = next.has_legacy_prefix;
@@ -1217,6 +1500,206 @@ CheckpointDb::SnapshotCutBoundary CheckpointDb::RotateWalAtGate(CheckpointCrashP
     return {boundary.epoch, boundary.next_commit_seq, lineage, next_id};
 }
 
+TableBaseWriter CheckpointDb::BeginSnapshotTableBase(TableId table_id, Epoch visible_from) {
+    RequireUsable();
+    if (table_id == 0 || generation_ == std::numeric_limits<uint64_t>::max())
+        throw std::logic_error("invalid snapshot table base");
+    return TableBaseWriter(
+        std::make_unique<TableBaseWriter::Impl>(directory_, table_id, generation_ + 1, visible_from));
+}
+
+void CheckpointDb::AppendSnapshotRows(TableBaseWriter& writer, std::vector<std::pair<RowId, Row>> rows) {
+    RequireUsable();
+    if (!writer.impl_)
+        throw std::logic_error("snapshot table writer is unavailable");
+    for (auto& [id, row] : rows) {
+        if (id.table_id != writer.impl_->table_id)
+            throw std::logic_error("snapshot row belongs to another table");
+        writer.impl_->AppendAt(id.local_id, std::move(row));
+    }
+}
+
+void CheckpointDb::FinishSnapshotTableBase(TableBaseWriter& writer, uint64_t next_local_id,
+                                           SnapshotArtifact& artifact) {
+    RequireUsable();
+    if (!writer.impl_)
+        throw std::logic_error("snapshot table writer is unavailable");
+    TableRef ref = writer.impl_->Finish(crash_point_);
+    ref.next_local_id = std::max(writer.impl_->next_local_id, next_local_id);
+    artifact.tables_.push_back(ref);
+    artifact.writers_.push_back(std::move(writer));
+}
+
+CheckpointDb::PreparedSnapshotArtifacts CheckpointDb::AdoptForPublication(SnapshotArtifact&& artifact) {
+    RequireUsable();
+    PreparedSnapshotArtifacts prepared;
+    prepared.tables_ = std::move(artifact.tables_);
+    prepared.writers_ = std::move(artifact.writers_);
+    try {
+        for (const TableRef& ref : prepared.tables_)
+            prepared.readers_.emplace(ref.table_id, OpenTable(directory_, ref));
+    } catch (...) {
+        prepared.readers_.clear();
+        throw;
+    }
+    return prepared;
+}
+
+CheckpointDb::PreparedSnapshotPublication
+CheckpointDb::PrepareSnapshotPublication(const SnapshotCutBoundary& boundary, uint64_t expected_source_identity,
+                                         PreparedSnapshotArtifacts&& artifacts) {
+    RequireUsable();
+    if (!wal_chain_ || !wal_chain_->has_segment_chain || boundary.wal_lineage != wal_chain_->lineage_generation ||
+        boundary.new_active_segment_id < wal_chain_->first_segment_id ||
+        boundary.new_active_segment_id > wal_chain_->active_segment_id ||
+        generation_ == std::numeric_limits<uint64_t>::max())
+        throw std::logic_error("snapshot publication token is stale");
+    if (!engine_.current_source_ || engine_.current_source_->identity != expected_source_identity)
+        throw std::logic_error("snapshot source publication is stale");
+    ManifestState next;
+    next.manifest_format = kSegmentedManifestFormat;
+    next.generation = generation_ + 1;
+    next.wal_generation = wal_generation_;
+    next.wal_base_epoch = boundary.epoch;
+    next.base_next_commit_seq = boundary.next_commit_seq;
+    next.has_legacy_prefix = false;
+    next.legacy_prefix_generation = 0;
+    next.wal_lineage_generation = wal_chain_->lineage_generation;
+    next.first_segment_id = boundary.new_active_segment_id;
+    next.active_segment_id = wal_chain_->active_segment_id;
+    next.segment_count = next.active_segment_id - next.first_segment_id + 1;
+    next.tables = tables_;
+    ImmutableTables replacements;
+    for (const auto& ref : artifacts.tables_) {
+        if (ref.table_id == 0)
+            throw std::logic_error("snapshot publication table set changed");
+        next.tables[ref.table_id] = ref;
+        auto table = artifacts.readers_.find(ref.table_id);
+        if (table == artifacts.readers_.end() || !table->second)
+            throw std::logic_error("snapshot publication reader missing");
+        replacements.emplace(ref.table_id, table->second);
+    }
+    auto prepared_source =
+        engine_.PrepareSourcePublication(expected_source_identity, std::move(replacements), boundary.epoch);
+    PreparedSnapshotPublication prepared;
+    prepared.artifacts_ = std::move(artifacts);
+    prepared.source_ = std::move(prepared_source);
+    prepared.manifest_bytes_ = EncodeManifest(next);
+    prepared.tables_ = std::move(next.tables);
+    prepared.generation_ = next.generation;
+    prepared.base_epoch_ = next.wal_base_epoch;
+    prepared.base_next_commit_seq_ = next.base_next_commit_seq;
+    prepared.wal_lineage_ = next.wal_lineage_generation;
+    prepared.first_segment_id_ = next.first_segment_id;
+    prepared.active_segment_id_ = next.active_segment_id;
+    return prepared;
+}
+
+void CheckpointDb::PublishSnapshotPublication(PreparedSnapshotPublication&& publication) {
+    RequireUsable();
+    if (publication.manifest_bytes_.empty())
+        throw std::logic_error("invalid snapshot publication");
+    engine_.ValidatePreparedSourcePublication(publication.source_);
+    publication.artifacts_.KeepPublishedFiles();
+    bool manifest_renamed = false;
+    try {
+        PublishManifestBytes(directory_, publication.manifest_bytes_, crash_point_, manifest_renamed);
+    } catch (...) {
+        if (manifest_renamed) {
+            poisoned_ = true;
+            engine_.Poison();
+            std::terminate();
+        }
+        publication.artifacts_.UnkeepPublishedFiles();
+        throw;
+    }
+    if (crash_point_ == CheckpointCrashPoint::kSnapshotAfterManifestDurable) {
+        poisoned_ = true;
+        engine_.Poison();
+        std::terminate();
+    }
+    if (crash_point_ == CheckpointCrashPoint::kSnapshotBeforeSourceInstall) {
+        poisoned_ = true;
+        engine_.Poison();
+        std::terminate();
+    }
+    publication.artifacts_.MarkPublished();
+    generation_ = publication.generation_;
+    base_epoch_ = publication.base_epoch_;
+    wal_generation_ = publication.wal_lineage_;
+    tables_ = std::move(publication.tables_);
+    wal_chain_->base_epoch = publication.base_epoch_;
+    wal_chain_->base_next_commit_seq = publication.base_next_commit_seq_;
+    wal_chain_->has_legacy_prefix = false;
+    wal_chain_->legacy_prefix_generation = 0;
+    wal_chain_->lineage_generation = publication.wal_lineage_;
+    wal_chain_->first_segment_id = publication.first_segment_id_;
+    wal_chain_->active_segment_id = publication.active_segment_id_;
+    sealed_wal_bytes_ = 0;
+    engine_.InstallPreparedSource(publication.source_);
+    if (crash_point_ == CheckpointCrashPoint::kSnapshotAfterSourceInstall) {
+        poisoned_ = true;
+        engine_.Poison();
+        std::terminate();
+    }
+    GarbageCollectExcludedWal();
+}
+
+void CheckpointDb::GarbageCollectExcludedWal() noexcept {
+    if (!wal_chain_ || !wal_chain_->has_segment_chain || wal_chain_->has_legacy_prefix)
+        return;
+    try {
+        DirectoryFd directory(directory_);
+        const int scan_fd = dup(directory.get());
+        if (scan_fd < 0)
+            return;
+        DIR* entries = fdopendir(scan_fd);
+        if (!entries) {
+            close(scan_fd);
+            return;
+        }
+        bool removed = false;
+        while (dirent* entry = readdir(entries)) {
+            const std::string_view name(entry->d_name);
+            bool excluded = false;
+            uint64_t lineage = 0;
+            uint64_t segment_id = 0;
+            if (ParseSegmentName(name, &lineage, &segment_id)) {
+                excluded = lineage != wal_chain_->lineage_generation || segment_id < wal_chain_->first_segment_id ||
+                           segment_id > wal_chain_->active_segment_id;
+            } else if (ParseWalName(name, "db.log.") || ParseWalName(name, "wal.")) {
+                excluded = true;
+            }
+            if (!excluded)
+                continue;
+            struct stat before {};
+            if (fstatat(directory.get(), entry->d_name, &before, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(before.st_mode))
+                continue;
+            const int fd = openat(directory.get(), entry->d_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (fd < 0)
+                continue;
+            struct stat opened {};
+            struct stat current {};
+            const bool owned = fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) &&
+                               fstatat(directory.get(), entry->d_name, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+                               S_ISREG(current.st_mode) && opened.st_dev == current.st_dev &&
+                               opened.st_ino == current.st_ino && opened.st_dev == before.st_dev &&
+                               opened.st_ino == before.st_ino;
+            close(fd);
+            if (owned && unlinkat(directory.get(), entry->d_name, 0) == 0)
+                removed = true;
+        }
+        closedir(entries);
+        if (removed)
+            directory.Sync();
+    } catch (...) {
+    }
+}
+
+void CheckpointDb::GarbageCollectExcludedTables() noexcept {
+    GarbageCollectTables(directory_, tables_);
+}
+
 void CheckpointDb::OfflineCheckpoint() {
     RequireUsable();
     if (engine_.active_transaction_count() != 0)
@@ -1227,15 +1710,13 @@ void CheckpointDb::OfflineCheckpoint() {
     const uint64_t next_wal = wal_generation_ + 1;
     const Epoch cut = engine_.published_epoch();
     auto next_refs = tables_;
-    std::vector<std::string> replaced;
     for (TableId table_id : engine_.dirty_tables()) {
         TableBaseWriter writer(std::make_unique<TableBaseWriter::Impl>(directory_, table_id, next_generation, cut));
         engine_.VisitPublished(table_id, [&](RowId id, const Row& row) { writer.impl_->AppendAt(id.local_id, row); });
         TableRef ref = writer.impl_->Finish(crash_point_);
         ref.next_local_id = std::max(writer.impl_->next_local_id, engine_.next_local_id(table_id));
-        if (auto old = next_refs.find(table_id); old != next_refs.end())
-            replaced.push_back(Join(directory_, TableName(table_id, old->second.file_generation)));
         next_refs[table_id] = ref;
+        writer.impl_->keep_final = true;
         writer.impl_.reset();
     }
     const std::string next_wal_name = SegmentName(next_wal, 0);
@@ -1284,9 +1765,8 @@ void CheckpointDb::OfflineCheckpoint() {
         wal_chain_->base_next_commit_seq = next_seq;
         tables_.swap(next_refs);
         engine_ = std::move(next_engine);
-        for (const std::string& path : replaced)
-            unlink(path.c_str());
-        SyncDirectory(directory_);
+        sealed_wal_bytes_ = 0;
+        GarbageCollectExcludedTables();
         if (crash_point_ == CheckpointCrashPoint::kAfterSuccess)
             throw SimulatedCrash();
     } catch (...) {

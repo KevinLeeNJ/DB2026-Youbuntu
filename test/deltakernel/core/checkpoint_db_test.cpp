@@ -14,9 +14,133 @@
 #include <system_error>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <unistd.h>
 
 namespace epoch_si_poc {
+
+class SnapshotCursorTestPeer {
+public:
+    struct Handle {
+        EpochSiEngine::SnapshotPin pin;
+        EpochSiEngine::SnapshotCursor cursor;
+    };
+
+    static std::unique_ptr<Handle> Open(EpochSiEngine& engine, TableId table_id, size_t max_rows, size_t max_bytes,
+                                        size_t max_probes = 16) {
+        auto pin = engine.PinSnapshot();
+        auto cursor = engine.BeginSnapshotCursor(pin, table_id, max_rows, max_bytes, max_probes);
+        return std::make_unique<Handle>(Handle{std::move(pin), std::move(cursor)});
+    }
+
+    static EpochSiEngine::SnapshotCursorBatch Next(Handle& handle) {
+        return handle.cursor.FinishBatch(handle.cursor.ProbeState());
+    }
+    static size_t SourceTableCount(const Handle& handle) {
+        return handle.pin.source_->immutable_tables->size();
+    }
+
+    static std::shared_ptr<const SourceGeneration> TxnSource(const EpochSiEngine::Txn& txn) {
+        return txn.source_;
+    }
+
+    static std::shared_ptr<const SourceGeneration> CurrentSource(const EpochSiEngine& engine) {
+        return engine.current_source_;
+    }
+
+    static void ArtifactUnpublishedCleanup(CheckpointDb& db, TableId table_id, bool publish) {
+        CheckpointDb::SnapshotArtifact artifact;
+        auto writer = db.BeginSnapshotTableBase(table_id, db.engine().published_epoch());
+        writer.Append(RowImage{{7}, {}, false});
+        db.FinishSnapshotTableBase(writer, 1, artifact);
+        const auto path =
+            db.directory_ + "/tablebase." + std::to_string(table_id) + "." + std::to_string(db.generation() + 1);
+        auto prepared = db.AdoptForPublication(std::move(artifact));
+        EXPECT_TRUE(std::filesystem::exists(path));
+        if (publish)
+            prepared.MarkPublished();
+    }
+
+    static void InstallReplacement(CheckpointDb& db, TableId table_id, size_t row_count = 1) {
+        CheckpointDb::SnapshotArtifact artifact;
+        auto writer = db.BeginSnapshotTableBase(table_id, db.engine().published_epoch());
+        for (size_t i = 0; i < row_count; ++i)
+            writer.Append(RowImage{{static_cast<uint8_t>(i)}, {}, false});
+        db.FinishSnapshotTableBase(writer, row_count, artifact);
+        auto prepared_artifacts = db.AdoptForPublication(std::move(artifact));
+        auto replacement = prepared_artifacts.readers_;
+        const uint64_t identity = db.engine().current_source_->identity;
+        auto prepared = db.engine().PrepareSourcePublication(identity, std::move(replacement));
+        db.engine().ValidatePreparedSourcePublication(prepared);
+        db.engine().InstallPreparedSource(prepared);
+        prepared_artifacts.MarkPublished();
+    }
+
+    static void ExpectSourceTokenRejections(CheckpointDb& db, CheckpointDb& foreign_db) {
+        const uint64_t identity = db.engine().current_source_->identity;
+        auto foreign = db.engine().PrepareSourcePublication(identity, {});
+        EXPECT_THROW(foreign_db.engine().ValidatePreparedSourcePublication(foreign), std::logic_error);
+
+        auto stale = db.engine().PrepareSourcePublication(identity, {});
+        auto installed = db.engine().PrepareSourcePublication(identity, {});
+        db.engine().ValidatePreparedSourcePublication(installed);
+        db.engine().InstallPreparedSource(installed);
+        EXPECT_THROW(db.engine().ValidatePreparedSourcePublication(stale), std::logic_error);
+        EXPECT_THROW(db.engine().ValidatePreparedSourcePublication(installed), std::logic_error);
+    }
+
+    static void ArtifactDoesNotDeleteForeignInode(CheckpointDb& db, TableId table_id, bool symlink) {
+        CheckpointDb::SnapshotArtifact artifact;
+        auto writer = db.BeginSnapshotTableBase(table_id, db.engine().published_epoch());
+        writer.Append(RowImage{{7}, {}, false});
+        db.FinishSnapshotTableBase(writer, 1, artifact);
+        auto prepared = db.AdoptForPublication(std::move(artifact));
+        const auto path =
+            db.directory_ + "/tablebase." + std::to_string(table_id) + "." + std::to_string(db.generation() + 1);
+        const auto target = db.directory_ + "/foreign-target." + std::to_string(table_id);
+        ASSERT_TRUE(std::filesystem::remove(path));
+        if (symlink) {
+            std::ofstream output(target);
+            output << "target";
+            std::error_code error;
+            std::filesystem::create_symlink(target, path, error);
+            ASSERT_FALSE(error);
+        } else {
+            std::ofstream output(path);
+            output << "foreign";
+        }
+        prepared = {};
+        EXPECT_TRUE(std::filesystem::exists(path));
+        if (symlink) {
+            EXPECT_TRUE(std::filesystem::exists(target));
+        }
+        std::filesystem::remove(path);
+        std::filesystem::remove(target);
+    }
+
+    static void PublishSnapshot(CheckpointDb& db, TableId table_id, CheckpointCrashPoint point) {
+        auto pin = db.engine().PinSnapshot();
+        const auto boundary = db.RotateWalAtGate(CheckpointCrashPoint::kNone);
+        CheckpointDb::SnapshotArtifact artifact;
+        auto writer = db.BeginSnapshotTableBase(table_id, boundary.epoch);
+        std::vector<std::pair<RowId, Row>> rows;
+        db.engine().VisitPublished(table_id, [&](RowId id, const Row& row) { rows.emplace_back(id, row); });
+        db.AppendSnapshotRows(writer, std::move(rows));
+        db.FinishSnapshotTableBase(writer, pin.next_local_id(table_id), artifact);
+        auto artifacts = db.AdoptForPublication(std::move(artifact));
+        auto publication =
+            db.PrepareSnapshotPublication(boundary, db.engine().current_source_->identity, std::move(artifacts));
+        db.SetCrashPointForTest(point);
+        db.PublishSnapshotPublication(std::move(publication));
+    }
+
+    static CheckpointDb::SnapshotCutBoundary Rotate(CheckpointDb& db) {
+        return db.RotateWalAtGate(CheckpointCrashPoint::kNone);
+    }
+};
+
 namespace {
 
 constexpr TableId kAccounts = 1;
@@ -154,6 +278,14 @@ std::string SegmentPath(const TempDbDirectory& temp, uint64_t lineage, uint64_t 
     return temp.path() + "/db.log.s." + std::to_string(lineage) + "." + std::to_string(id);
 }
 
+size_t CountSegmentFiles(const TempDbDirectory& temp) {
+    size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        count += entry.path().filename().string().rfind("db.log.s.", 0) == 0 &&
+                 !std::filesystem::is_symlink(entry.symlink_status());
+    return count;
+}
+
 void ConvertFreshSegmentedManifestToLegacy(const TempDbDirectory& temp) {
     constexpr size_t kManifestHeaderBytes = 44;
     constexpr size_t kTableRefBytes = 40;
@@ -204,6 +336,376 @@ TEST(CheckpointDbTest, OfflineCheckpointPreservesAuthorityAndEpoch) {
     auto view = reopened.engine().Begin();
     EXPECT_EQ(test_row::Value(*reopened.engine().Read(view, {kAccounts, 1})), 99);
     reopened.engine().Abort(view);
+}
+
+TEST(CheckpointDbTest, DurableWalBytesIncludesSealedSegments) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+    PopulateTwoFrames(db);
+    const auto active_before = db.engine().durable_wal_bytes();
+    EXPECT_EQ(db.durable_wal_bytes(), active_before);
+    SnapshotCursorTestPeer::Rotate(db);
+    EXPECT_EQ(db.durable_wal_bytes(), active_before + db.engine().durable_wal_bytes());
+
+    auto txn = db.engine().Begin();
+    db.engine().PutImage(txn, {kAccounts, 1}, Bare(test_row::Make(kAccounts, "a", 12)));
+    ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    EXPECT_GT(db.durable_wal_bytes(), active_before);
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_EQ(reopened.durable_wal_bytes(), db.durable_wal_bytes());
+}
+
+TEST(CheckpointDbTest, OfflineCheckpointClearsSealedWalDebt) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+    PopulateTwoFrames(db);
+    SnapshotCursorTestPeer::Rotate(db);
+    ASSERT_GT(db.durable_wal_bytes(), db.engine().durable_wal_bytes());
+
+    db.OfflineCheckpoint();
+    EXPECT_EQ(db.durable_wal_bytes(), db.engine().durable_wal_bytes());
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_EQ(reopened.durable_wal_bytes(), db.durable_wal_bytes());
+}
+
+TEST(CheckpointDbTest, SnapshotPinParticipatesInWatermarkAndBlocksSourceReplacement) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto handle = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 1, 1);
+    EXPECT_EQ(db.engine().active_transaction_count(), 2U);
+    EXPECT_EQ(db.engine().oldest_active_snapshot_for_test(), std::optional<Epoch>(0));
+    EXPECT_THROW(db.BeginTableBase(1), std::logic_error);
+    handle.reset();
+    EXPECT_EQ(db.engine().active_transaction_count(), 0U);
+    EXPECT_NO_THROW({
+        auto writer = db.BeginTableBase(1);
+        writer.Append(Plain(7));
+        db.PublishTableBase(std::move(writer));
+    });
+}
+
+TEST(CheckpointDbTest, SourceGenerationIsSharedAcrossReadersAndSwitchesAtomically) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), CheckpointBase());
+    {
+        auto writer = db.BeginTableBase(3);
+        writer.Append(Plain(30));
+        db.PublishTableBase(std::move(writer));
+    }
+
+    auto old = db.engine().Begin();
+    const auto old_source = SnapshotCursorTestPeer::TxnSource(old);
+    EXPECT_EQ(old_source, SnapshotCursorTestPeer::CurrentSource(db.engine()));
+    const auto old_identity = old_source->identity;
+    db.engine().Abort(old);
+
+    {
+        auto writer = db.BeginTableBase(4);
+        writer.Append(Plain(40));
+        db.PublishTableBase(std::move(writer));
+    }
+
+    auto current = db.engine().Begin();
+    const auto current_source = SnapshotCursorTestPeer::TxnSource(current);
+    EXPECT_EQ(current_source, SnapshotCursorTestPeer::CurrentSource(db.engine()));
+    EXPECT_NE(current_source, old_source);
+    EXPECT_GT(current_source->identity, old_identity);
+    EXPECT_EQ(current_source->base, old_source->base);
+    ASSERT_EQ(old_source->immutable_tables->count(3), 1U);
+    EXPECT_EQ(old_source->immutable_tables->count(4), 0U);
+    EXPECT_EQ(current_source->immutable_tables->count(3), 1U);
+    EXPECT_EQ(current_source->immutable_tables->count(4), 1U);
+    EXPECT_EQ(old_source->immutable_tables->at(3)->Read(0)->bytes, Plain(30).bytes);
+    EXPECT_EQ(current_source->immutable_tables->at(4)->Read(0)->bytes, Plain(40).bytes);
+    db.engine().Abort(current);
+}
+
+TEST(CheckpointDbTest, SnapshotArtifactAdoptionOwnsFilesUntilPublication) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    const std::string unpublished = temp.path() + "/tablebase.3.1";
+    SnapshotCursorTestPeer::ArtifactUnpublishedCleanup(db, 3, false);
+    EXPECT_FALSE(std::filesystem::exists(unpublished));
+    const std::string published = temp.path() + "/tablebase.4.1";
+    SnapshotCursorTestPeer::ArtifactUnpublishedCleanup(db, 4, true);
+    EXPECT_TRUE(std::filesystem::exists(published));
+}
+
+TEST(CheckpointDbTest, PreparedSourcePublicationKeepsOldReadersAndSwapsWithoutActiveCheck) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(10)}});
+    auto old = db.engine().Begin();
+    const auto old_source = SnapshotCursorTestPeer::TxnSource(old);
+    auto writer = db.engine().Begin();
+    db.engine().PutImage(writer, {kAccounts, 1}, Plain(99));
+    ASSERT_EQ(db.engine().CommitBatch({&writer})[0].status, CommitStatus::kCommitted);
+    SnapshotCursorTestPeer::InstallReplacement(db, 3);
+    auto current = db.engine().Begin();
+    EXPECT_NE(SnapshotCursorTestPeer::TxnSource(current), old_source);
+    EXPECT_EQ(db.engine().Read(old, {kAccounts, 1})->bytes, Plain(10).bytes);
+    EXPECT_EQ(db.engine().Read(current, {kAccounts, 1})->bytes, Plain(99).bytes);
+    db.engine().Abort(current);
+    db.engine().Abort(old);
+}
+
+TEST(CheckpointDbTest, PreparedSourcePublicationRejectsForeignStaleAndDoubleTokens) {
+    TempDbDirectory first;
+    TempDbDirectory second;
+    auto db = CheckpointDb::Create(first.path(), {});
+    auto foreign = CheckpointDb::Create(second.path(), {});
+    SnapshotCursorTestPeer::ExpectSourceTokenRejections(db, foreign);
+}
+
+TEST(CheckpointDbTest, PreparedSourcePublicationKeepsAllocatorFrontier) {
+    TempDbDirectory higher;
+    auto higher_db = CheckpointDb::Create(higher.path(), {{{kAccounts, 9}, Plain(9)}});
+    SnapshotCursorTestPeer::InstallReplacement(higher_db, kAccounts);
+    EXPECT_EQ(higher_db.engine().next_local_id(kAccounts), 10U);
+
+    TempDbDirectory lower;
+    auto lower_db = CheckpointDb::Create(lower.path(), {{{kAccounts, 1}, Plain(1)}});
+    SnapshotCursorTestPeer::InstallReplacement(lower_db, kAccounts, 5);
+    EXPECT_EQ(lower_db.engine().next_local_id(kAccounts), 5U);
+}
+
+TEST(CheckpointDbTest, PreparedSourcePublicationAllocatorIsUsedByInsert) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}});
+    SnapshotCursorTestPeer::InstallReplacement(db, kAccounts, 5);
+
+    auto txn = db.engine().Begin();
+    const RowId inserted = db.engine().InsertImage(txn, kAccounts, Plain(55));
+    EXPECT_EQ(inserted.local_id, 5U);
+    ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    auto view = db.engine().Begin();
+    ASSERT_TRUE(db.engine().Read(view, inserted).has_value());
+    EXPECT_EQ(db.engine().Read(view, inserted)->bytes, Plain(55).bytes);
+    db.engine().Abort(view);
+}
+
+TEST(CheckpointDbTest, PreparedSourcePublicationPropagatesDiagnosticsToReplacement) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto diagnostics = std::make_shared<DeltaDiagnostics>();
+    db.engine().SetDiagnostics(diagnostics);
+    SnapshotCursorTestPeer::InstallReplacement(db, kAccounts);
+    const uint64_t before = diagnostics->immutable_reads.load(std::memory_order_relaxed);
+    auto txn = db.engine().Begin();
+    ASSERT_TRUE(db.engine().Read(txn, {kAccounts, 0}).has_value());
+    EXPECT_GT(diagnostics->immutable_reads.load(std::memory_order_relaxed), before);
+    db.engine().Abort(txn);
+}
+
+TEST(CheckpointDbTest, SnapshotArtifactCleanupProtectsForeignInodesAndSymlinks) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    SnapshotCursorTestPeer::ArtifactDoesNotDeleteForeignInode(db, 5, false);
+    SnapshotCursorTestPeer::ArtifactDoesNotDeleteForeignInode(db, 6, true);
+}
+
+TEST(CheckpointDbTest, SnapshotPublicationReclaimsOnlyExcludedWalAuthorities) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}});
+    auto update = db.engine().Begin();
+    db.engine().PutImage(update, {kAccounts, 1}, Plain(2));
+    ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+    ASSERT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 0)));
+    SnapshotCursorTestPeer::PublishSnapshot(db, kAccounts, CheckpointCrashPoint::kNone);
+    EXPECT_FALSE(std::filesystem::exists(SegmentPath(temp, 0, 0)));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 1)));
+    EXPECT_EQ(CountSegmentFiles(temp), 1U);
+
+    auto post = db.engine().Begin();
+    db.engine().PutImage(post, {kAccounts, 1}, Plain(3));
+    ASSERT_EQ(db.engine().CommitBatch({&post})[0].status, CommitStatus::kCommitted);
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto reader = reopened.engine().Begin();
+    EXPECT_EQ(reopened.engine().Read(reader, {kAccounts, 1})->bytes, Plain(3).bytes);
+    reopened.engine().Abort(reader);
+}
+
+TEST(CheckpointDbTest, SnapshotPublicationFailureRetainsManifestWalChain) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}});
+    auto update = db.engine().Begin();
+    db.engine().PutImage(update, {kAccounts, 1}, Plain(2));
+    ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+    EXPECT_THROW(SnapshotCursorTestPeer::PublishSnapshot(db, kAccounts, CheckpointCrashPoint::kDuringManifestTemp),
+                 SimulatedCrash);
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 0)));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 1)));
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto reader = reopened.engine().Begin();
+    EXPECT_EQ(reopened.engine().Read(reader, {kAccounts, 1})->bytes, Plain(2).bytes);
+    reopened.engine().Abort(reader);
+}
+
+TEST(CheckpointDbTest, OpenReclaimsExactWalOrphansWithoutFollowingSymlinks) {
+    TempDbDirectory temp;
+    {
+        auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}});
+        auto update = db.engine().Begin();
+        db.engine().PutImage(update, {kAccounts, 1}, Plain(2));
+        ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+        SnapshotCursorTestPeer::PublishSnapshot(db, kAccounts, CheckpointCrashPoint::kNone);
+    }
+    const std::string segment_orphan = SegmentPath(temp, 9, 4);
+    const std::string current_orphan = temp.path() + "/db.log.9";
+    const std::string legacy_orphan = temp.path() + "/wal.9";
+    const std::string malformed = temp.path() + "/db.log.s.9.bad";
+    const std::string nonregular = SegmentPath(temp, 7, 2);
+    const std::string target = temp.path() + "/outside";
+    const std::string link = SegmentPath(temp, 8, 3);
+    for (const auto& path : {segment_orphan, current_orphan, legacy_orphan, malformed, target}) {
+        std::ofstream output(path);
+        output << "residue";
+    }
+    ASSERT_EQ(symlink(target.c_str(), link.c_str()), 0);
+    ASSERT_TRUE(std::filesystem::create_directory(nonregular));
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_FALSE(std::filesystem::exists(segment_orphan));
+    EXPECT_FALSE(std::filesystem::exists(current_orphan));
+    EXPECT_FALSE(std::filesystem::exists(legacy_orphan));
+    EXPECT_TRUE(std::filesystem::exists(malformed));
+    EXPECT_TRUE(std::filesystem::is_directory(nonregular));
+    EXPECT_TRUE(std::filesystem::is_symlink(link));
+    EXPECT_TRUE(std::filesystem::exists(target));
+    EXPECT_TRUE(std::filesystem::exists(SegmentPath(temp, 0, 1)));
+}
+
+TEST(CheckpointDbTest, ConsecutiveSnapshotPublicationsKeepWalChainBounded) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}});
+    for (uint64_t value : {2U, 3U, 4U}) {
+        auto update = db.engine().Begin();
+        db.engine().PutImage(update, {kAccounts, 1}, Plain(value));
+        ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+        SnapshotCursorTestPeer::PublishSnapshot(db, kAccounts, CheckpointCrashPoint::kNone);
+        EXPECT_EQ(CountSegmentFiles(temp), 1U);
+    }
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto reader = reopened.engine().Begin();
+    EXPECT_EQ(reopened.engine().Read(reader, {kAccounts, 1})->bytes, Plain(4).bytes);
+    reopened.engine().Abort(reader);
+}
+
+TEST(CheckpointDbTest, SnapshotCursorKeepsCutBeforeDeleteUpdateAndInsert) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1}, Plain(1)}, {{kAccounts, 2}, Plain(2)}});
+    auto handle = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 16, 1U << 20);
+    auto next = db.engine().Begin();
+    db.engine().PutImage(next, {kAccounts, 1}, Plain(11));
+    db.engine().Erase(next, {kAccounts, 2});
+    db.engine().InsertImage(next, kAccounts, Plain(3));
+    ASSERT_EQ(db.engine().CommitBatch({&next})[0].status, CommitStatus::kCommitted);
+    auto batch = SnapshotCursorTestPeer::Next(*handle);
+    ASSERT_EQ(batch.rows.size(), 2U);
+    EXPECT_EQ(batch.rows[0].first.local_id, 1U);
+    EXPECT_EQ(batch.rows[1].first.local_id, 2U);
+    EXPECT_EQ(batch.rows[0].second.bytes, Plain(1).bytes);
+    EXPECT_EQ(batch.rows[1].second.bytes, Plain(2).bytes);
+    EXPECT_FALSE(batch.has_more);
+}
+
+TEST(CheckpointDbTest, SnapshotCursorSparseStrictContinuationAndBudgets) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 1000000}, Plain(1)}, {{kAccounts, 2000000}, Plain(2)}});
+    {
+        auto row_bounded = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 1, 1U << 20, 4);
+        auto first = SnapshotCursorTestPeer::Next(*row_bounded);
+        ASSERT_EQ(first.rows.size(), 1U);
+        EXPECT_EQ(first.rows[0].first.local_id, 1000000U);
+        EXPECT_TRUE(first.has_more);
+        auto second = SnapshotCursorTestPeer::Next(*row_bounded);
+        ASSERT_EQ(second.rows.size(), 1U);
+        EXPECT_EQ(second.rows[0].first.local_id, 2000000U);
+        EXPECT_FALSE(second.has_more);
+    }
+    {
+        auto byte_bounded = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 16, Plain(1).bytes.size(), 4);
+        auto first = SnapshotCursorTestPeer::Next(*byte_bounded);
+        ASSERT_EQ(first.rows.size(), 1U);
+        EXPECT_TRUE(first.has_more);
+        auto second = SnapshotCursorTestPeer::Next(*byte_bounded);
+        ASSERT_EQ(second.rows.size(), 1U);
+        EXPECT_FALSE(second.has_more);
+    }
+    {
+        auto single_oversize = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 16, 1, 4);
+        auto first = SnapshotCursorTestPeer::Next(*single_oversize);
+        ASSERT_EQ(first.rows.size(), 1U);
+        EXPECT_TRUE(first.rows[0].second.bytes.size() > 1U);
+        EXPECT_TRUE(first.has_more);
+    }
+}
+
+TEST(CheckpointDbTest, SnapshotCursorBoundsInvisiblePostCutProbesWithoutPinningRows) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto handle = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 8, 1024, 4);
+    EXPECT_EQ(SnapshotCursorTestPeer::SourceTableCount(*handle), 0U);
+    for (int value = 0; value < 20; ++value) {
+        auto txn = db.engine().Begin();
+        db.engine().InsertImage(txn, kAccounts, Plain(static_cast<uint64_t>(value)));
+        ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    }
+    size_t batches = 0;
+    for (;;) {
+        auto batch = SnapshotCursorTestPeer::Next(*handle);
+        EXPECT_LE(batch.probes, 4U);
+        EXPECT_TRUE(batch.rows.empty());
+        ++batches;
+        if (!batch.has_more)
+            break;
+        ASSERT_LT(batches, 20U);
+    }
+    EXPECT_GT(batches, 1U);
+}
+
+TEST(CheckpointDbTest, SnapshotPinRetainsAndReleaseAllowsVersionCollapse) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(temp.path(), {});
+    auto insert = db.engine().Begin();
+    const RowId id = db.engine().InsertImage(insert, kAccounts, Plain(1));
+    ASSERT_EQ(db.engine().CommitBatch({&insert})[0].status, CommitStatus::kCommitted);
+    auto handle = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 8, 1024);
+    for (uint64_t value : {2U, 3U}) {
+        auto update = db.engine().Begin();
+        db.engine().PutImage(update, id, Plain(value));
+        ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+    }
+    EXPECT_GE(db.engine().version_count(), 3U);
+    handle.reset();
+    auto update = db.engine().Begin();
+    db.engine().PutImage(update, id, Plain(4));
+    ASSERT_EQ(db.engine().CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+    EXPECT_LE(db.engine().version_count(), 2U);
+}
+
+TEST(CheckpointDbTest, SnapshotCursorOrdersTablesAndTombstoneOverridesImmutableBase) {
+    TempDbDirectory temp;
+    auto db = CheckpointDb::Create(
+        temp.path(),
+        {{{kAccounts, 3}, Plain(3)}, {{kAccounts, 9}, Plain(9)}, {{kOrders, 2}, Plain(20)}, {{kOrders, 8}, Plain(80)}});
+    db.OfflineCheckpoint();
+    auto before_cut = db.engine().Begin();
+    db.engine().Erase(before_cut, {kAccounts, 3});
+    db.engine().PutImage(before_cut, {kAccounts, 9}, Plain(99));
+    ASSERT_EQ(db.engine().CommitBatch({&before_cut})[0].status, CommitStatus::kCommitted);
+    auto accounts = SnapshotCursorTestPeer::Open(db.engine(), kAccounts, 8, 1024);
+    auto orders = SnapshotCursorTestPeer::Open(db.engine(), kOrders, 8, 1024);
+    auto after_cut = db.engine().Begin();
+    db.engine().PutImage(after_cut, {kAccounts, 9}, Plain(999));
+    db.engine().InsertImage(after_cut, kAccounts, Plain(10));
+    ASSERT_EQ(db.engine().CommitBatch({&after_cut})[0].status, CommitStatus::kCommitted);
+    auto account_batch = SnapshotCursorTestPeer::Next(*accounts);
+    ASSERT_EQ(account_batch.rows.size(), 1U);
+    EXPECT_EQ(account_batch.rows[0].first.local_id, 9U);
+    EXPECT_EQ(account_batch.rows[0].second.bytes, Plain(99).bytes);
+    auto order_batch = SnapshotCursorTestPeer::Next(*orders);
+    ASSERT_EQ(order_batch.rows.size(), 2U);
+    EXPECT_EQ(order_batch.rows[0].first.local_id, 2U);
+    EXPECT_EQ(order_batch.rows[1].first.local_id, 8U);
 }
 
 TEST(CheckpointDbTest, DiagnosticsContinueAcrossOfflineCheckpoint) {
@@ -374,6 +876,28 @@ TEST(CheckpointDbTest, LegacyPostBaseInsertSurvivesSegmentedManifestMigration) {
     EXPECT_EQ(reopened.engine().Read(view, {kAccounts, 1})->bytes, Plain(2).bytes);
     EXPECT_EQ(reopened.engine().Read(view, {kOrders, 0})->bytes, Plain(3).bytes);
     reopened.engine().Abort(view);
+}
+
+TEST(CheckpointDbTest, LegacyTablePublishPreservesWalDebtAcrossMigration) {
+    TempDbDirectory temp;
+    {
+        auto db = CheckpointDb::Create(temp.path(), {{{kAccounts, 0}, Plain(1)}});
+        auto txn = db.engine().Begin();
+        db.engine().PutImage(txn, {kAccounts, 0}, Plain(2));
+        ASSERT_EQ(db.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    }
+    ConvertFreshSegmentedManifestToLegacy(temp);
+
+    auto db = CheckpointDb::Open(temp.path());
+    const size_t before = db.durable_wal_bytes();
+    ASSERT_GT(before, 0U);
+    auto writer = db.BeginTableBase(kOrders);
+    writer.Append(Plain(3));
+    db.PublishTableBase(std::move(writer));
+    EXPECT_EQ(db.durable_wal_bytes(), before);
+
+    auto reopened = CheckpointDb::Open(temp.path());
+    EXPECT_EQ(reopened.durable_wal_bytes(), before);
 }
 
 TEST(CheckpointDbTest, SegmentHeaderRejectsIdentityBoundaryReservedAndCrcCorruption) {

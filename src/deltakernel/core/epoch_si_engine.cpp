@@ -116,6 +116,35 @@ void EncodeRow(std::vector<uint8_t>& out, const RowImage& row) {
     }
 }
 
+size_t SnapshotRowBytes(const Row& row) noexcept {
+    size_t bytes = row.bytes.size();
+    for (const auto& claim : row.claims) {
+        const size_t claim_bytes = sizeof(claim.constraint_id) + claim.bytes.size();
+        if (bytes > std::numeric_limits<size_t>::max() - claim_bytes)
+            return std::numeric_limits<size_t>::max();
+        bytes += claim_bytes;
+    }
+    return bytes;
+}
+
+template <typename Writes> auto LowerBoundWrite(Writes& writes, RowId row_id) {
+    return std::lower_bound(writes.begin(), writes.end(), row_id,
+                            [](const auto& write, RowId id) { return write.first < id; });
+}
+
+template <typename Writes> auto FindWrite(Writes& writes, RowId row_id) {
+    auto found = LowerBoundWrite(writes, row_id);
+    return found != writes.end() && found->first == row_id ? found : writes.end();
+}
+
+void StoreWrite(std::vector<std::pair<RowId, Row>>& writes, RowId row_id, Row row) {
+    auto position = LowerBoundWrite(writes, row_id);
+    if (position != writes.end() && position->first == row_id)
+        position->second = std::move(row);
+    else
+        writes.insert(position, {row_id, std::move(row)});
+}
+
 } // namespace
 
 std::vector<uint8_t> EpochSiEngine::EncodeFrame(Epoch epoch, const std::vector<Txn*>& txns,
@@ -177,10 +206,15 @@ std::vector<uint8_t> EpochSiEngine::EncodeFrame(Epoch epoch, const std::vector<T
 EpochSiEngine::EpochSiEngine(BaseImage base, Epoch base_epoch) : EpochSiEngine(std::move(base), {}, base_epoch) {}
 
 EpochSiEngine::EpochSiEngine(BaseImage base, ImmutableTables tables, Epoch base_epoch)
-    : base_(std::move(base)), immutable_tables_(std::move(tables)), identity_(std::make_shared<OwnerState>()),
-      base_epoch_(base_epoch), published_epoch_(base_epoch) {
-    for (const auto& [row_id, row] : base_) {
-        if (immutable_tables_.count(row_id.table_id))
+    : current_source_(nullptr), identity_(std::make_shared<OwnerState>()), published_epoch_(base_epoch) {
+    auto source = std::make_shared<SourceGeneration>();
+    source->identity = 1;
+    source->base_epoch = base_epoch;
+    source->base = std::make_shared<const BaseImage>(std::move(base));
+    source->immutable_tables = std::make_shared<const ImmutableTables>(std::move(tables));
+    current_source_ = std::move(source);
+    for (const auto& [row_id, row] : *current_source_->base) {
+        if (current_source_->immutable_tables->count(row_id.table_id))
             continue; // A per-table base supersedes legacy rows for that table.
         if (row_id.table_id == 0 || row_id.local_id == std::numeric_limits<uint64_t>::max()) {
             throw std::invalid_argument("invalid or exhausted base RowId");
@@ -193,11 +227,236 @@ EpochSiEngine::EpochSiEngine(BaseImage base, ImmutableTables tables, Epoch base_
             last_claim_epoch_[claim] = base_epoch;
         }
     }
-    for (const auto& [table_id, table] : immutable_tables_) {
+    for (const auto& [table_id, table] : *current_source_->immutable_tables) {
         if (!table || table_id == 0 || table_id != table->table_id())
             throw std::invalid_argument("invalid immutable table source");
         next_row_id_[table_id] = table->next_local_id();
     }
+}
+
+uint64_t EpochSiEngine::SnapshotPin::next_local_id(TableId table_id) const noexcept {
+    if (!allocators_)
+        return 0;
+    const auto found = allocators_->next_row_id.find(table_id);
+    return found == allocators_->next_row_id.end() ? 0 : found->second;
+}
+
+EpochSiEngine::SnapshotPin::~SnapshotPin() {
+    if (owner_) {
+        owner_->UnregisterSnapshot(slot_);
+        owner_.reset();
+        slot_ = std::numeric_limits<size_t>::max();
+    }
+}
+
+EpochSiEngine::SnapshotPin::SnapshotPin(SnapshotPin&& other) noexcept
+    : owner_(std::move(other.owner_)), slot_(other.slot_), epoch_(other.epoch_), source_(std::move(other.source_)),
+      allocators_(std::move(other.allocators_)), engine_(other.engine_) {
+    other.slot_ = std::numeric_limits<size_t>::max();
+    other.epoch_ = 0;
+    other.engine_ = nullptr;
+}
+
+EpochSiEngine::SnapshotPin EpochSiEngine::SnapshotPin::Clone() const {
+    if (!owner_)
+        throw std::logic_error("cannot clone an empty snapshot pin");
+    return SnapshotPin(owner_, owner_->RegisterSnapshot(epoch_), epoch_, source_, allocators_, engine_);
+}
+
+EpochSiEngine::SnapshotPin& EpochSiEngine::SnapshotPin::operator=(SnapshotPin&& other) noexcept {
+    if (this == &other)
+        return *this;
+    if (owner_)
+        owner_->UnregisterSnapshot(slot_);
+    owner_ = std::move(other.owner_);
+    slot_ = other.slot_;
+    epoch_ = other.epoch_;
+    source_ = std::move(other.source_);
+    allocators_ = std::move(other.allocators_);
+    engine_ = other.engine_;
+    other.slot_ = std::numeric_limits<size_t>::max();
+    other.epoch_ = 0;
+    other.engine_ = nullptr;
+    return *this;
+}
+
+EpochSiEngine::SnapshotPin EpochSiEngine::PinSnapshot() const {
+    if (poisoned_.load(std::memory_order_acquire) || !identity_ || !identity_->valid.load(std::memory_order_acquire))
+        throw std::runtime_error("Delta engine is unavailable");
+    const Epoch snapshot = published_epoch_;
+    auto allocators = std::make_shared<SnapshotAllocators>();
+    allocators->next_row_id = next_row_id_;
+    const size_t slot = identity_->RegisterSnapshot(snapshot);
+    return SnapshotPin(identity_, slot, snapshot, current_source_, std::move(allocators), this);
+}
+
+EpochSiEngine::SnapshotCursor EpochSiEngine::BeginSnapshotCursor(const SnapshotPin& pin, TableId table_id,
+                                                                 size_t max_rows, size_t max_bytes,
+                                                                 size_t max_probes) const {
+    if (!pin || pin.engine_ != this || pin.epoch_ > published_epoch_ || table_id == 0 || max_rows == 0 ||
+        max_bytes == 0 || max_probes < 2)
+        throw std::invalid_argument("invalid snapshot cursor");
+    return SnapshotCursor(pin.Clone(), table_id, max_rows, max_bytes, max_probes);
+}
+
+EpochSiEngine::SnapshotStateBatch EpochSiEngine::SnapshotCursor::ProbeState() const {
+    SnapshotStateBatch out;
+    if (exhausted_ || !pin_)
+        return out;
+    const EpochSiEngine& engine = *pin_.engine_;
+    const SourceGeneration& source = *pin_.source_;
+    const uint64_t start = started_ ? probe_position_ + (probe_position_ != std::numeric_limits<uint64_t>::max()) : 0;
+    const bool immutable_visible = [&] {
+        const auto found = source.immutable_tables->find(table_id_);
+        return found != source.immutable_tables->end() && found->second->visible_from() <= pin_.epoch_;
+    }();
+    auto base = immutable_visible ? source.base->end() : source.base->lower_bound({table_id_, start});
+    auto chunk = engine.row_states_.lower_bound({table_id_, start / kRowStateChunkSize});
+    size_t offset = chunk != engine.row_states_.end() && chunk->first.table_id == table_id_ &&
+                            chunk->first.chunk_id == start / kRowStateChunkSize
+                        ? static_cast<size_t>(start % kRowStateChunkSize)
+                        : 0;
+    const auto advance_state = [&]() -> std::optional<std::pair<RowId, const RowState*>> {
+        while (chunk != engine.row_states_.end() && chunk->first.table_id == table_id_) {
+            while (offset < kRowStateChunkSize) {
+                const size_t current = offset++;
+                const RowState& state = chunk->second->slots[current];
+                if (state.occupied)
+                    return std::make_pair(RowId{table_id_, chunk->first.chunk_id * kRowStateChunkSize + current},
+                                          &state);
+            }
+            ++chunk;
+            offset = 0;
+        }
+        return std::nullopt;
+    };
+    auto state = advance_state();
+    size_t bytes = 0;
+    const size_t limit = std::max<size_t>(1, max_probes_ / 2);
+    while (out.candidates.size() < limit) {
+        const bool have_base = base != source.base->end() && base->first.table_id == table_id_;
+        if (!state && !have_base)
+            break;
+        RowId id = state ? state->first : base->first;
+        if (have_base && base->first < id)
+            id = base->first;
+        SnapshotCandidate candidate;
+        candidate.id = id;
+        if (state && state->first == id) {
+            for (const Version* version = state->second->head.get(); version != nullptr;
+                 version = version->older.get()) {
+                if (version->epoch <= pin_.epoch_) {
+                    candidate.state_authoritative = true;
+                    candidate.state_row = version->row;
+                    break;
+                }
+            }
+            state = advance_state();
+        }
+        if (have_base && base->first == id) {
+            candidate.legacy_row = base->second;
+            ++base;
+        }
+        size_t candidate_bytes = candidate.state_row ? SnapshotRowBytes(*candidate.state_row) : 0;
+        if (candidate.legacy_row) {
+            const size_t legacy_bytes = SnapshotRowBytes(*candidate.legacy_row);
+            candidate_bytes = candidate_bytes > std::numeric_limits<size_t>::max() - legacy_bytes
+                                  ? std::numeric_limits<size_t>::max()
+                                  : candidate_bytes + legacy_bytes;
+        }
+        if (!out.candidates.empty() && bytes > max_bytes_ - std::min(max_bytes_, candidate_bytes)) {
+            out.has_more = true;
+            break;
+        }
+        bytes += candidate_bytes;
+        out.candidates.push_back(std::move(candidate));
+    }
+    out.has_more =
+        out.has_more || state.has_value() || (base != source.base->end() && base->first.table_id == table_id_);
+    return out;
+}
+
+EpochSiEngine::SnapshotCursorBatch EpochSiEngine::SnapshotCursor::FinishBatch(SnapshotStateBatch state) {
+    SnapshotCursorBatch out;
+    if (exhausted_ || !pin_)
+        return out;
+    const uint64_t start = started_ ? probe_position_ + (probe_position_ != std::numeric_limits<uint64_t>::max()) : 0;
+    std::vector<std::pair<RowId, Row>> immutable_rows;
+    bool immutable_more = false;
+    const auto immutable = pin_.source_->immutable_tables->find(table_id_);
+    if (immutable != pin_.source_->immutable_tables->end() && immutable->second->visible_from() <= pin_.epoch_) {
+        uint64_t next = start;
+        size_t bytes = 0;
+        const size_t limit = std::max<size_t>(1, max_probes_ - std::max<size_t>(1, max_probes_ / 2));
+        while (immutable_rows.size() < limit) {
+            auto row = immutable->second->ReadAtOrAfter(next);
+            if (!row)
+                break;
+            const size_t row_bytes = SnapshotRowBytes(row->second);
+            if (!immutable_rows.empty() && bytes > max_bytes_ - std::min(max_bytes_, row_bytes)) {
+                immutable_more = true;
+                break;
+            }
+            const uint64_t id = row->first;
+            immutable_rows.emplace_back(RowId{table_id_, id}, std::move(row->second));
+            bytes += row_bytes;
+            if (id == std::numeric_limits<uint64_t>::max())
+                break;
+            next = id + 1;
+        }
+        immutable_more = immutable_more || immutable_rows.size() == limit;
+    }
+    out.probes = state.candidates.size() + immutable_rows.size();
+    uint64_t safe_end = std::numeric_limits<uint64_t>::max();
+    if (state.has_more && !state.candidates.empty())
+        safe_end = state.candidates.back().id.local_id;
+    if (immutable_more && !immutable_rows.empty())
+        safe_end = std::min(safe_end, immutable_rows.back().first.local_id);
+    size_t state_pos = 0;
+    size_t immutable_pos = 0;
+    size_t bytes = 0;
+    bool progressed = false;
+    while (state_pos < state.candidates.size() || immutable_pos < immutable_rows.size()) {
+        RowId id =
+            state_pos < state.candidates.size() ? state.candidates[state_pos].id : immutable_rows[immutable_pos].first;
+        if (immutable_pos < immutable_rows.size() && immutable_rows[immutable_pos].first < id)
+            id = immutable_rows[immutable_pos].first;
+        if (id.local_id > safe_end)
+            break;
+        SnapshotCandidate* state_candidate = nullptr;
+        if (state_pos < state.candidates.size() && state.candidates[state_pos].id == id)
+            state_candidate = &state.candidates[state_pos++];
+        Row* immutable_row = nullptr;
+        if (immutable_pos < immutable_rows.size() && immutable_rows[immutable_pos].first == id)
+            immutable_row = &immutable_rows[immutable_pos++].second;
+        const Row* selected = nullptr;
+        if (state_candidate && state_candidate->state_authoritative)
+            selected = &*state_candidate->state_row;
+        else if (immutable_row)
+            selected = immutable_row;
+        else if (state_candidate && state_candidate->legacy_row)
+            selected = &*state_candidate->legacy_row;
+        if (selected && !selected->deleted) {
+            const size_t row_bytes = SnapshotRowBytes(*selected);
+            if (!out.rows.empty() &&
+                (out.rows.size() == max_rows_ || bytes > max_bytes_ - std::min(max_bytes_, row_bytes)))
+                break;
+            out.rows.emplace_back(id, *selected);
+            bytes += row_bytes;
+        }
+        probe_position_ = id.local_id;
+        started_ = true;
+        progressed = true;
+        if (out.rows.size() == max_rows_ || (out.rows.size() == 1 && bytes > max_bytes_))
+            break;
+    }
+    const bool sources_more = state.has_more || immutable_more || state_pos < state.candidates.size() ||
+                              immutable_pos < immutable_rows.size();
+    exhausted_ = !sources_more && state_pos == state.candidates.size() && immutable_pos == immutable_rows.size();
+    out.has_more = !exhausted_;
+    if (!progressed && !out.has_more)
+        exhausted_ = true;
+    return out;
 }
 
 EpochSiEngine::~EpochSiEngine() {
@@ -302,8 +561,9 @@ void EpochSiEngine::Txn::Finish() noexcept {
 
 EpochSiEngine::Txn::Txn(Txn&& other) noexcept
     : owner_(std::move(other.owner_)), snapshot_slot_(other.snapshot_slot_), start_epoch_(other.start_epoch_),
-      active_(other.active_), prepared_(other.prepared_), writes_(std::move(other.writes_)),
-      inserts_(std::move(other.inserts_)) {
+      active_(other.active_), prepared_(other.prepared_), source_(std::move(other.source_)),
+      writes_(std::move(other.writes_)), inserts_(std::move(other.inserts_)),
+      immutable_read_scratch_(std::move(other.immutable_read_scratch_)) {
     if (other.prepared_)
         std::terminate();
     other.start_epoch_ = 0;
@@ -313,16 +573,15 @@ EpochSiEngine::Txn::Txn(Txn&& other) noexcept
 }
 
 EpochSiEngine::EpochSiEngine(EpochSiEngine&& other) noexcept
-    : base_(std::move(other.base_)), immutable_tables_(std::move(other.immutable_tables_)),
-      row_states_(std::move(other.row_states_)), last_claim_epoch_(std::move(other.last_claim_epoch_)),
-      claim_owner_(std::move(other.claim_owner_)),
+    : current_source_(std::move(other.current_source_)), row_states_(std::move(other.row_states_)),
+      last_claim_epoch_(std::move(other.last_claim_epoch_)), claim_owner_(std::move(other.claim_owner_)),
       recovery_persisted_frontiers_(std::move(other.recovery_persisted_frontiers_)),
       next_row_id_(std::move(other.next_row_id_)), identity_(std::move(other.identity_)),
-      base_epoch_(other.base_epoch_), published_epoch_(other.published_epoch_),
-      next_commit_seq_(other.next_commit_seq_), version_count_(other.version_count_),
-      volatile_wal_(std::move(other.volatile_wal_)), recovery_wal_image_(std::move(other.recovery_wal_image_)),
-      file_wal_(std::move(other.file_wal_)), wal_frame_count_(other.wal_frame_count_),
-      wal_transaction_count_(other.wal_transaction_count_), dirty_tables_(std::move(other.dirty_tables_)),
+      published_epoch_(other.published_epoch_), next_commit_seq_(other.next_commit_seq_),
+      version_count_(other.version_count_), volatile_wal_(std::move(other.volatile_wal_)),
+      recovery_wal_image_(std::move(other.recovery_wal_image_)), file_wal_(std::move(other.file_wal_)),
+      wal_frame_count_(other.wal_frame_count_), wal_transaction_count_(other.wal_transaction_count_),
+      dirty_tables_(std::move(other.dirty_tables_)),
       last_publication_staged_entries_(other.last_publication_staged_entries_),
       last_publication_staged_versions_(other.last_publication_staged_versions_),
       last_install_version_nodes_(other.last_install_version_nodes_), crash_point_(other.crash_point_),
@@ -346,15 +605,13 @@ EpochSiEngine& EpochSiEngine::operator=(EpochSiEngine&& other) noexcept {
     if (identity_) {
         identity_->valid.store(false, std::memory_order_release);
     }
-    base_ = std::move(other.base_);
-    immutable_tables_ = std::move(other.immutable_tables_);
+    current_source_ = std::move(other.current_source_);
     row_states_ = std::move(other.row_states_);
     last_claim_epoch_ = std::move(other.last_claim_epoch_);
     claim_owner_ = std::move(other.claim_owner_);
     recovery_persisted_frontiers_ = std::move(other.recovery_persisted_frontiers_);
     next_row_id_ = std::move(other.next_row_id_);
     identity_ = std::move(other.identity_);
-    base_epoch_ = other.base_epoch_;
     published_epoch_ = other.published_epoch_;
     next_commit_seq_ = other.next_commit_seq_;
     version_count_ = other.version_count_;
@@ -477,7 +734,7 @@ void EpochSiEngine::RecoverFrame(const std::vector<uint8_t>& wal_image, size_t f
                 throw std::runtime_error("WAL deletes a missing row");
             }
             if (!row.deleted && !old_exists) {
-                if (base_.count(row_id) || FindRowState(row_id) != nullptr) {
+                if (current_source_->base->count(row_id) || FindRowState(row_id) != nullptr) {
                     throw std::runtime_error("WAL resurrects a stable RowId");
                 }
                 const auto frontier = recovery_persisted_frontiers_.find(row_id.table_id);
@@ -485,9 +742,11 @@ void EpochSiEngine::RecoverFrame(const std::vector<uint8_t>& wal_image, size_t f
                     throw std::runtime_error("WAL reuses a RowId below the persisted allocator frontier");
                 txn.inserts_.insert(row_id);
             }
-            if (!txn.writes_.emplace(row_id, std::move(row)).second) {
+            auto write = LowerBoundWrite(txn.writes_, row_id);
+            if (write != txn.writes_.end() && write->first == row_id) {
                 throw std::runtime_error("duplicate RowId in WAL transaction");
             }
+            txn.writes_.insert(write, {row_id, std::move(row)});
             ++seen_ops;
         }
         const bool claim_free = claim_owner_.empty() && last_claim_epoch_.empty() && batch_claims.empty() &&
@@ -704,6 +963,7 @@ EpochSiEngine::Txn EpochSiEngine::Begin() {
     }
     Txn txn;
     txn.owner_ = identity_;
+    txn.source_ = current_source_;
     txn.start_epoch_ = published_epoch_;
     txn.snapshot_slot_ = identity_->RegisterSnapshot(txn.start_epoch_);
     txn.active_ = true;
@@ -715,11 +975,11 @@ BaseImage EpochSiEngine::MaterializePublished() const {
         throw std::logic_error("crashed engine");
     }
     std::set<RowId> ids;
-    for (const auto& [id, row] : base_) {
-        if (!immutable_tables_.count(id.table_id))
+    for (const auto& [id, row] : *current_source_->base) {
+        if (!current_source_->immutable_tables->count(id.table_id))
             ids.insert(id);
     }
-    for (const auto& [table_id, table] : immutable_tables_) {
+    for (const auto& [table_id, table] : *current_source_->immutable_tables) {
         if (table->visible_from() <= published_epoch_) {
             for (uint64_t local_id = 0; local_id < table->row_count(); ++local_id)
                 ids.insert({table_id, local_id});
@@ -733,7 +993,7 @@ BaseImage EpochSiEngine::MaterializePublished() const {
     }
     BaseImage snapshot;
     for (RowId id : ids) {
-        if (auto row = ReadCommitted(id, published_epoch_)) {
+        if (auto row = ReadCommitted(id, published_epoch_, current_source_)) {
             snapshot.emplace(id, std::move(*row));
         }
     }
@@ -747,7 +1007,10 @@ void EpochSiEngine::RequireActive(const Txn& txn) const {
     }
 }
 
-std::optional<Row> EpochSiEngine::ReadCommitted(RowId row_id, Epoch snapshot) const {
+std::optional<Row> EpochSiEngine::ReadCommitted(RowId row_id, Epoch snapshot,
+                                                const std::shared_ptr<const SourceGeneration>& requested_source,
+                                                std::vector<uint8_t>* immutable_scratch) const {
+    const auto& source = requested_source ? requested_source : current_source_;
     const RowState* state = FindRowState(row_id);
     if (state != nullptr) {
         for (const Version* version = state->head.get(); version != nullptr; version = version->older.get()) {
@@ -758,14 +1021,16 @@ std::optional<Row> EpochSiEngine::ReadCommitted(RowId row_id, Epoch snapshot) co
             }
         }
     }
-    const auto immutable = immutable_tables_.find(row_id.table_id);
-    if (immutable != immutable_tables_.end()) {
-        return immutable->second->visible_from() <= snapshot ? immutable->second->Read(row_id.local_id) : std::nullopt;
+    const auto immutable = source->immutable_tables->find(row_id.table_id);
+    if (immutable != source->immutable_tables->end()) {
+        return immutable->second->visible_from() <= snapshot
+                   ? immutable->second->Read(row_id.local_id, immutable_scratch)
+                   : std::nullopt;
     }
-    const auto base = base_.find(row_id);
-    if (diagnostics_ && base != base_.end())
+    const auto base = source->base->find(row_id);
+    if (diagnostics_ && base != source->base->end())
         diagnostics_->base_hits.fetch_add(1, std::memory_order_relaxed);
-    return base == base_.end() || base->second.deleted ? std::nullopt : std::optional<Row>(base->second);
+    return base == source->base->end() || base->second.deleted ? std::nullopt : std::optional<Row>(base->second);
 }
 
 bool EpochSiEngine::RecoveryRowExists(RowId row_id) const {
@@ -776,16 +1041,16 @@ bool EpochSiEngine::RecoveryRowExists(RowId row_id) const {
                 return !version->row.deleted;
         }
     }
-    const auto immutable = immutable_tables_.find(row_id.table_id);
-    if (immutable != immutable_tables_.end()) {
+    const auto immutable = current_source_->immutable_tables->find(row_id.table_id);
+    if (immutable != current_source_->immutable_tables->end()) {
         if (immutable->second->visible_from() > published_epoch_)
             return false;
         if (const auto exists = immutable->second->RecoveryContains(row_id.local_id); exists.has_value())
             return *exists;
-        return ReadCommitted(row_id, published_epoch_).has_value();
+        return ReadCommitted(row_id, published_epoch_, current_source_).has_value();
     }
-    const auto base = base_.find(row_id);
-    return base != base_.end() && !base->second.deleted;
+    const auto base = current_source_->base->find(row_id);
+    return base != current_source_->base->end() && !base->second.deleted;
 }
 
 Epoch EpochSiEngine::LastExistingRowEpoch(RowId row_id) const {
@@ -793,22 +1058,26 @@ Epoch EpochSiEngine::LastExistingRowEpoch(RowId row_id) const {
         return state->last_epoch;
     // Base rows and published versions always have explicit metadata. Put/Erase (and WAL decode) prove existence, so
     // an existing write without it can only be the untouched immutable base row.
-    if (const auto table = immutable_tables_.find(row_id.table_id); table != immutable_tables_.end())
+    if (const auto table = current_source_->immutable_tables->find(row_id.table_id);
+        table != current_source_->immutable_tables->end())
         return table->second->visible_from();
-    if (const auto base = base_.find(row_id); base != base_.end() && !base->second.deleted)
-        return base_epoch_;
+    if (const auto base = current_source_->base->find(row_id);
+        base != current_source_->base->end() && !base->second.deleted)
+        return current_source_->base_epoch;
     throw std::logic_error("existing transaction write has no committed source");
 }
 
 std::optional<Row> EpochSiEngine::Read(const Txn& txn, RowId row_id) const {
     RequireActive(txn);
-    const auto local = txn.writes_.find(row_id);
+    if (txn.writes_.empty())
+        return ReadCommitted(row_id, txn.start_epoch_, txn.source_, &txn.immutable_read_scratch_);
+    const auto local = FindWrite(txn.writes_, row_id);
     if (local != txn.writes_.end()) {
         if (diagnostics_)
             diagnostics_->private_hits.fetch_add(1, std::memory_order_relaxed);
         return local->second.deleted ? std::nullopt : std::optional<Row>(local->second);
     }
-    return ReadCommitted(row_id, txn.start_epoch_);
+    return ReadCommitted(row_id, txn.start_epoch_, txn.source_, &txn.immutable_read_scratch_);
 }
 
 std::vector<std::pair<RowId, Row>> EpochSiEngine::Scan(const Txn& txn, TableId table_id) const {
@@ -822,6 +1091,7 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
                               const std::function<void(RowId, const Row&)>& visitor) const {
     RequireActive(txn);
     const auto diagnostics = diagnostics_;
+    const auto& source = *txn.source_;
     std::set<RowId> legacy_base_ids;
     std::vector<std::pair<RowId, const RowState*>> version_rows;
     const auto first_chunk = row_states_.lower_bound({table_id, 0});
@@ -833,12 +1103,12 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
             }
         }
     }
-    const auto immutable = immutable_tables_.find(table_id);
+    const auto immutable = source.immutable_tables->find(table_id);
     const bool immutable_visible =
-        immutable != immutable_tables_.end() && immutable->second->visible_from() <= txn.start_epoch_;
+        immutable != source.immutable_tables->end() && immutable->second->visible_from() <= txn.start_epoch_;
     if (immutable_visible) {
         size_t version = 0;
-        auto local = txn.writes_.lower_bound({table_id, 0});
+        auto local = LowerBoundWrite(txn.writes_, {table_id, 0});
         immutable->second->Visit([&](uint64_t local_id, Row&& row) {
             const RowId id{table_id, local_id};
             while (local != txn.writes_.end() && local->first.table_id == table_id && local->first < id)
@@ -870,8 +1140,8 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
             visitor(id, row);
         });
     } else {
-        for (auto base = base_.lower_bound({table_id, 0}); base != base_.end() && base->first.table_id == table_id;
-             ++base) {
+        for (auto base = source.base->lower_bound({table_id, 0});
+             base != source.base->end() && base->first.table_id == table_id; ++base) {
             const RowId id = base->first;
             legacy_base_ids.insert(id);
             if (auto visible = Read(txn, id))
@@ -888,7 +1158,7 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
         if (!legacy_base_ids.count(id))
             overlay_ids.insert(id);
     }
-    for (auto local = txn.writes_.lower_bound({table_id, first_overlay_id});
+    for (auto local = LowerBoundWrite(txn.writes_, {table_id, first_overlay_id});
          local != txn.writes_.end() && local->first.table_id == table_id; ++local) {
         if (diagnostics)
             diagnostics->scan_private_entries_examined.fetch_add(1, std::memory_order_relaxed);
@@ -896,7 +1166,7 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
             overlay_ids.insert(local->first);
     }
     for (RowId id : overlay_ids) {
-        if (const auto local = txn.writes_.find(id); local != txn.writes_.end()) {
+        if (const auto local = FindWrite(txn.writes_, id); local != txn.writes_.end()) {
             if (!local->second.deleted)
                 visitor(id, local->second);
             continue;
@@ -934,9 +1204,10 @@ bool EpochSiEngine::IsLatestSnapshot(const Txn& txn) const {
 }
 
 bool EpochSiEngine::CanInstallPristineTable(TableId table_id) const {
-    if (table_id == 0 || immutable_tables_.count(table_id) || next_row_id_.count(table_id))
+    if (table_id == 0 || current_source_->immutable_tables->count(table_id) || next_row_id_.count(table_id) ||
+        (identity_ && identity_->active_count.load(std::memory_order_acquire) != 0))
         return false;
-    for (const auto& [id, row] : base_)
+    for (const auto& [id, row] : *current_source_->base)
         if (id.table_id == table_id)
             return false;
     if (HasRowStateTable(table_id))
@@ -946,7 +1217,7 @@ bool EpochSiEngine::CanInstallPristineTable(TableId table_id) const {
 
 size_t EpochSiEngine::immutable_index_bytes() const {
     size_t bytes = 0;
-    for (const auto& [table_id, table] : immutable_tables_)
+    for (const auto& [table_id, table] : *current_source_->immutable_tables)
         bytes += table->index_bytes();
     return bytes;
 }
@@ -959,7 +1230,7 @@ void EpochSiEngine::SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics
     diagnostics_ = std::move(diagnostics);
     if (file_wal_)
         file_wal_->SetDiagnostics(diagnostics_);
-    for (const auto& [table_id, table] : immutable_tables_)
+    for (const auto& [table_id, table] : *current_source_->immutable_tables)
         table->SetDiagnostics(diagnostics_);
 }
 
@@ -981,7 +1252,7 @@ RowId EpochSiEngine::InsertImage(Txn& txn, TableId table_id, RowImage row) {
             throw std::overflow_error("RowId exhausted");
         id = {table_id, next++};
     }
-    txn.writes_[id] = std::move(row);
+    StoreWrite(txn.writes_, id, std::move(row));
     txn.inserts_.insert(id);
     return id;
 }
@@ -996,7 +1267,7 @@ void EpochSiEngine::PutImage(Txn& txn, RowId row_id, RowImage row) {
     if (row.deleted)
         throw std::invalid_argument("PutImage requires a live row image");
     ValidateRow(row);
-    txn.writes_[row_id] = std::move(row);
+    StoreWrite(txn.writes_, row_id, std::move(row));
 }
 
 void EpochSiEngine::Erase(Txn& txn, RowId row_id) {
@@ -1007,10 +1278,13 @@ void EpochSiEngine::Erase(Txn& txn, RowId row_id) {
         throw std::invalid_argument("Erase target does not exist in transaction view");
     }
     if (txn.inserts_.erase(row_id) != 0) {
-        txn.writes_.erase(row_id);
+        const auto write = FindWrite(txn.writes_, row_id);
+        if (write == txn.writes_.end())
+            throw std::logic_error("private insert is missing its row image");
+        txn.writes_.erase(write);
         return;
     }
-    txn.writes_[row_id] = RowImage{{}, {}, true};
+    StoreWrite(txn.writes_, row_id, RowImage{{}, {}, true});
 }
 
 void EpochSiEngine::Abort(Txn& txn) {
@@ -1036,7 +1310,7 @@ CommitStatus EpochSiEngine::Certify(const Txn& txn, std::set<RowId>& batch_rows,
             row_conflict = true;
         }
         if (!claim_free && !inserted) {
-            const auto old = ReadCommitted(id, published_epoch_);
+            const auto old = ReadCommitted(id, published_epoch_, current_source_);
             if (old) {
                 footprint.insert(old->claims.begin(), old->claims.end());
             }
@@ -1064,7 +1338,7 @@ CommitStatus EpochSiEngine::Certify(const Txn& txn, std::set<RowId>& batch_rows,
     for (const auto& [id, row] : txn.writes_) {
         if (txn.inserts_.count(id))
             continue;
-        const auto old = ReadCommitted(id, published_epoch_);
+        const auto old = ReadCommitted(id, published_epoch_, current_source_);
         if (old) {
             for (const auto& claim : old->claims) {
                 const auto owner = projected_owners.find(claim);
@@ -1108,7 +1382,7 @@ CommitStatus EpochSiEngine::Certify(const Txn& txn, std::set<RowId>& batch_rows,
     for (const auto& [id, row] : txn.writes_) {
         batch_rows.insert(id);
         if (!txn.inserts_.count(id)) {
-            const auto old = ReadCommitted(id, published_epoch_);
+            const auto old = ReadCommitted(id, published_epoch_, current_source_);
             if (old) {
                 batch_claims.insert(old->claims.begin(), old->claims.end());
             }
@@ -1130,7 +1404,7 @@ void EpochSiEngine::InstallRecoveredLatest(const std::vector<Txn*>& accepted, Ep
                 throw std::overflow_error("replayed RowId exhausts table");
             }
             if (!claim_free) {
-                const auto old = ReadCommitted(id, published_epoch_);
+                const auto old = ReadCommitted(id, published_epoch_, current_source_);
                 if (old) {
                     for (const auto& claim : old->claims) {
                         const auto owner = claim_owner_.find(claim);
@@ -1204,7 +1478,7 @@ EpochSiEngine::PreparedState EpochSiEngine::PreparePublication(const std::vector
             prepared.touched_rows.push_back(id);
             ++prepared.staged_versions;
             if (!claim_free && !txn->inserts_.count(id)) {
-                const auto old = ReadCommitted(id, published_epoch_);
+                const auto old = ReadCommitted(id, published_epoch_, current_source_);
                 if (old) {
                     for (const auto& claim : old->claims) {
                         const auto owner = claim_owner_.find(claim);
@@ -1358,16 +1632,24 @@ EpochSiEngine::PreparedTableInstall
 EpochSiEngine::PrepareTableInstall(std::shared_ptr<const ImmutableTable> table) const {
     if (!table || !CanInstallPristineTable(table->table_id()))
         throw std::logic_error("immutable table install requires a pristine table");
-    PreparedTableInstall prepared{immutable_tables_, last_claim_epoch_, claim_owner_, next_row_id_};
-    prepared.tables.emplace(table->table_id(), table);
+    auto tables = std::make_shared<ImmutableTables>(*current_source_->immutable_tables);
+    tables->emplace(table->table_id(), table);
+    auto source = std::make_shared<SourceGeneration>();
+    source->identity = current_source_->identity + 1;
+    source->base_epoch = current_source_->base_epoch;
+    source->base = current_source_->base;
+    source->immutable_tables = std::move(tables);
+    PreparedTableInstall prepared{std::move(source), last_claim_epoch_, claim_owner_, next_row_id_};
     prepared.next_row_id[table->table_id()] = table->next_local_id();
     return prepared;
 }
 
 void EpochSiEngine::InstallTablePrepared(PreparedTableInstall&& prepared) noexcept {
-    immutable_tables_.swap(prepared.tables);
+    if (identity_ && identity_->active_count.load(std::memory_order_acquire) != 0)
+        std::terminate();
+    current_source_.swap(prepared.source);
     if (diagnostics_) {
-        for (const auto& [table_id, table] : immutable_tables_)
+        for (const auto& [table_id, table] : *current_source_->immutable_tables)
             table->SetDiagnostics(diagnostics_);
     }
     last_claim_epoch_.swap(prepared.last_claim_epoch);
@@ -1396,6 +1678,259 @@ void EpochSiEngine::Poison() noexcept {
     poisoned_.store(true, std::memory_order_release);
     if (identity_)
         identity_->valid.store(false, std::memory_order_release);
+}
+
+EpochSiEngine::PreparedSourcePublication::PreparedSourcePublication(PreparedSourcePublication&& other) noexcept
+    : engine_(other.engine_), expected_identity_(other.expected_identity_), source_(std::move(other.source_)),
+      next_row_id_(std::move(other.next_row_id_)), dirty_tables_(std::move(other.dirty_tables_)) {
+    other.engine_ = nullptr;
+    other.expected_identity_ = 0;
+}
+
+EpochSiEngine::PreparedSourcePublication&
+EpochSiEngine::PreparedSourcePublication::operator=(PreparedSourcePublication&& other) noexcept {
+    if (this == &other)
+        return *this;
+    engine_ = other.engine_;
+    expected_identity_ = other.expected_identity_;
+    source_ = std::move(other.source_);
+    next_row_id_ = std::move(other.next_row_id_);
+    dirty_tables_ = std::move(other.dirty_tables_);
+    other.engine_ = nullptr;
+    other.expected_identity_ = 0;
+    return *this;
+}
+
+EpochSiEngine::PreparedSourcePublication EpochSiEngine::PrepareSourcePublication(uint64_t expected_identity,
+                                                                                 ImmutableTables replacements) const {
+    const Epoch base_epoch = current_source_ ? current_source_->base_epoch : 0;
+    return PrepareSourcePublication(expected_identity, std::move(replacements), base_epoch);
+}
+
+EpochSiEngine::PreparedSourcePublication EpochSiEngine::PrepareSourcePublication(uint64_t expected_identity,
+                                                                                 ImmutableTables replacements,
+                                                                                 Epoch base_epoch) const {
+    if (poisoned_.load(std::memory_order_acquire) || !identity_ || !current_source_)
+        throw std::logic_error("crashed engine");
+    if (expected_identity != current_source_->identity)
+        throw std::logic_error("source publication is stale");
+    if (current_source_->identity == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("source generation exhausted");
+    for (const auto& [table_id, table] : replacements) {
+        if (table_id == 0 || !table || table->table_id() != table_id)
+            throw std::invalid_argument("invalid immutable source replacement");
+        table->SetDiagnostics(diagnostics_);
+    }
+    auto next_row_id = next_row_id_;
+    auto dirty_tables = dirty_tables_;
+    auto tables = std::make_shared<ImmutableTables>(*current_source_->immutable_tables);
+    for (auto& [table_id, table] : replacements) {
+        dirty_tables.erase(table_id);
+        for (auto chunk = row_states_.lower_bound({table_id, 0});
+             chunk != row_states_.end() && chunk->first.table_id == table_id; ++chunk) {
+            const bool has_post_cut_head =
+                std::any_of(chunk->second->slots.begin(), chunk->second->slots.end(), [&](const RowState& state) {
+                    return state.occupied && state.head && state.head->epoch > table->visible_from();
+                });
+            if (has_post_cut_head) {
+                dirty_tables.insert(table_id);
+                break;
+            }
+        }
+        (*tables)[table_id] = std::move(table);
+        const uint64_t frontier = (*tables)[table_id]->next_local_id();
+        auto& current = next_row_id[table_id];
+        current = std::max(current, frontier);
+    }
+    auto source = std::make_shared<SourceGeneration>();
+    source->identity = current_source_->identity + 1;
+    source->base_epoch = base_epoch;
+    source->base = current_source_->base;
+    source->immutable_tables = std::move(tables);
+    PreparedSourcePublication prepared;
+    prepared.engine_ = const_cast<EpochSiEngine*>(this);
+    prepared.expected_identity_ = expected_identity;
+    prepared.source_ = std::move(source);
+    prepared.next_row_id_ = std::move(next_row_id);
+    prepared.dirty_tables_ = std::move(dirty_tables);
+    return prepared;
+}
+
+void EpochSiEngine::ValidatePreparedSourcePublication(const PreparedSourcePublication& prepared) const {
+    if (prepared.engine_ != this || !prepared.source_ || prepared.expected_identity_ == 0 || !current_source_ ||
+        prepared.expected_identity_ != current_source_->identity ||
+        prepared.source_->identity != prepared.expected_identity_ + 1 || poisoned_.load(std::memory_order_acquire) ||
+        !identity_ || !identity_->valid.load(std::memory_order_acquire))
+        throw std::logic_error("invalid source publication");
+}
+
+void EpochSiEngine::InstallPreparedSource(PreparedSourcePublication& prepared) noexcept {
+    if (prepared.engine_ != this || !prepared.source_)
+        std::terminate();
+    current_source_.swap(prepared.source_);
+    next_row_id_.swap(prepared.next_row_id_);
+    dirty_tables_.swap(prepared.dirty_tables_);
+    prepared.engine_ = nullptr;
+    prepared.expected_identity_ = 0;
+}
+
+EpochSiEngine::PreparedGenerationCollapse
+EpochSiEngine::PrepareGenerationCollapseStep(const std::map<TableId, Epoch>& cuts, GenerationCollapseCursor cursor) {
+    if (poisoned_.load(std::memory_order_acquire) || !identity_ || !current_source_)
+        throw std::logic_error("crashed engine");
+    // ponytail: one unusually long row chain can exceed this chunk budget; add a resumable per-row chain cursor only
+    // if measured checkpoint pauses require it.
+    constexpr size_t kMaxChunks = 16;
+    PreparedGenerationCollapse prepared;
+    prepared.engine_ = this;
+    prepared.expected_source_identity_ = current_source_->identity;
+    prepared.expected_version_count_ = version_count_;
+    for (const auto& [table_id, cut] : cuts) {
+        const auto immutable = current_source_->immutable_tables->find(table_id);
+        if (table_id == 0 || cut > published_epoch_ || immutable == current_source_->immutable_tables->end() ||
+            immutable->second->visible_from() != cut)
+            throw std::logic_error("generation collapse source changed");
+    }
+    if (cursor.done || cuts.empty()) {
+        prepared.next_.done = true;
+        return prepared;
+    }
+    auto cut = cursor.table_id == 0 ? cuts.begin() : cuts.lower_bound(cursor.table_id);
+    uint64_t next_chunk = cut != cuts.end() && cut->first == cursor.table_id ? cursor.chunk_id : 0;
+    size_t processed_chunks = 0;
+    while (cut != cuts.end() && processed_chunks < kMaxChunks) {
+        auto chunk = row_states_.lower_bound({cut->first, next_chunk});
+        if (chunk == row_states_.end() || chunk->first.table_id != cut->first) {
+            ++cut;
+            next_chunk = 0;
+            continue;
+        }
+        size_t cleared = 0;
+        for (size_t offset = 0; offset < kRowStateChunkSize; ++offset) {
+            const RowState& state = chunk->second->slots[offset];
+            if (!state.occupied)
+                continue;
+            if (!state.head || state.version_count == 0)
+                throw std::logic_error("invalid row state during generation collapse");
+            size_t retained = 0;
+            size_t actual = 0;
+            const Version* boundary = nullptr;
+            for (const Version* version = state.head.get(); version != nullptr; version = version->older.get()) {
+                ++actual;
+                if (!boundary && version->epoch <= cut->second)
+                    boundary = version;
+                if (!boundary)
+                    ++retained;
+            }
+            if (actual != state.version_count)
+                throw std::logic_error("row version census changed during generation collapse");
+            if (!boundary)
+                continue;
+            const size_t removed = actual - retained;
+            if (removed == 0 || removed > version_count_ || prepared.removed_versions_ > version_count_ - removed)
+                throw std::logic_error("invalid generation collapse version count");
+            prepared.removed_versions_ += removed;
+            const bool clear_state = retained == 0;
+            cleared += clear_state;
+            prepared.actions_.push_back({{cut->first, chunk->first.chunk_id * kRowStateChunkSize + offset},
+                                         cut->second,
+                                         retained,
+                                         removed,
+                                         clear_state});
+        }
+        if (cleared == chunk->second->occupied)
+            prepared.empty_chunks_.push_back(chunk->first);
+        ++processed_chunks;
+        if (chunk->first.chunk_id == std::numeric_limits<uint64_t>::max()) {
+            ++cut;
+            next_chunk = 0;
+        } else {
+            next_chunk = chunk->first.chunk_id + 1;
+        }
+    }
+    while (cut != cuts.end()) {
+        const auto next = row_states_.lower_bound({cut->first, next_chunk});
+        if (next != row_states_.end() && next->first.table_id == cut->first)
+            break;
+        ++cut;
+        next_chunk = 0;
+    }
+    if (cut == cuts.end()) {
+        prepared.next_.done = true;
+    } else {
+        prepared.next_.table_id = cut->first;
+        prepared.next_.chunk_id = next_chunk;
+    }
+    prepared.retired_versions_.resize(prepared.actions_.size());
+    prepared.retired_chunks_.resize(prepared.empty_chunks_.size());
+    return prepared;
+}
+
+EpochSiEngine::RetiredGenerationState
+EpochSiEngine::InstallGenerationCollapse(PreparedGenerationCollapse&& prepared,
+                                         GenerationCollapseCursor* cursor) noexcept {
+    if (prepared.engine_ != this || !current_source_ ||
+        prepared.expected_source_identity_ != current_source_->identity ||
+        prepared.expected_version_count_ != version_count_ || prepared.removed_versions_ > version_count_ ||
+        prepared.retired_versions_.size() != prepared.actions_.size() ||
+        prepared.retired_chunks_.size() != prepared.empty_chunks_.size() || cursor == nullptr)
+        std::terminate();
+    for (const GenerationCollapseAction& action : prepared.actions_) {
+        const RowState* state = FindRowState(action.id);
+        if (!state || !state->head || state->version_count != action.retained + action.removed || action.removed == 0 ||
+            action.clear_state != (action.retained == 0))
+            std::terminate();
+        const Version* boundary = state->head.get();
+        size_t retained = 0;
+        while (boundary && boundary->epoch > action.cut) {
+            ++retained;
+            boundary = boundary->older.get();
+        }
+        if (!boundary || retained != action.retained)
+            std::terminate();
+    }
+
+    size_t retired_position = 0;
+    for (const GenerationCollapseAction& action : prepared.actions_) {
+        const auto chunk = row_states_.find(ChunkKey(action.id));
+        if (chunk == row_states_.end())
+            std::terminate();
+        RowState& state = chunk->second->slots[ChunkSlot(action.id)];
+        if (action.clear_state) {
+            prepared.retired_versions_[retired_position++] = std::move(state.head);
+            state.last_epoch = 0;
+            state.last_pruned_watermark = 0;
+            state.version_count = 0;
+            state.occupied = false;
+            if (chunk->second->occupied == 0)
+                std::terminate();
+            --chunk->second->occupied;
+            continue;
+        }
+        std::unique_ptr<Version>* boundary = &state.head;
+        while (*boundary && (*boundary)->epoch > action.cut)
+            boundary = &(*boundary)->older;
+        if (!*boundary)
+            std::terminate();
+        prepared.retired_versions_[retired_position++] = std::move(*boundary);
+        state.version_count = action.retained;
+        state.last_pruned_watermark = std::max(state.last_pruned_watermark, action.cut);
+    }
+    if (retired_position != prepared.retired_versions_.size())
+        std::terminate();
+    for (size_t position = 0; position < prepared.empty_chunks_.size(); ++position) {
+        const auto found = row_states_.find(prepared.empty_chunks_[position]);
+        if (found == row_states_.end() || found->second->occupied != 0)
+            std::terminate();
+        prepared.retired_chunks_[position] = row_states_.extract(found);
+    }
+    version_count_ -= prepared.removed_versions_;
+    *cursor = prepared.next_;
+    prepared.engine_ = nullptr;
+    RetiredGenerationState retired;
+    retired.versions_ = std::move(prepared.retired_versions_);
+    retired.chunks_ = std::move(prepared.retired_chunks_);
+    return retired;
 }
 
 EpochSiEngine::PreparedCommit::PreparedCommit() = default;

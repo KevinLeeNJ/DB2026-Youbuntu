@@ -13,10 +13,150 @@
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <csignal>
 #include <thread>
 #include <type_traits>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace deltakernel {
+class DeltaSnapshotTestPeer {
+public:
+    struct PinHandle {
+        epoch_si_poc::EpochSiEngine::SnapshotPin pin;
+    };
+    static void Build(DeltaDatabase& database) {
+        database.BuildSnapshotBases();
+    }
+    static bool SnapshotBuilderBusy(DeltaDatabase& database) {
+        if (!database.snapshot_builder_mutex_.try_lock())
+            return true;
+        database.snapshot_builder_mutex_.unlock();
+        return false;
+    }
+    static void SetIoHook(DeltaDatabase& database, std::function<void()> hook) {
+        database.snapshot_io_hook_for_test_ = std::move(hook);
+    }
+    static std::unique_lock<std::shared_mutex> HoldExecution(DeltaDatabase& database) {
+        return std::unique_lock<std::shared_mutex>(database.execution_gate_);
+    }
+    static void SetSidecarFinishHook(DeltaDatabase& database, std::function<void(size_t)> hook) {
+        database.sidecar_finish_hook_for_test_ = std::move(hook);
+    }
+    static void SetSidecarArtifactHook(
+        DeltaDatabase& database,
+        std::function<void(epoch_si_poc::TableId, const std::vector<std::array<uint64_t, 4>>&)> hook) {
+        database.sidecar_artifact_hook_for_test_ = std::move(hook);
+    }
+    static void SetRowsHook(DeltaDatabase& database, const std::string& table,
+                            std::function<void(epoch_si_poc::Epoch, std::vector<int32_t>)> hook) {
+        const auto schema = database.tables_.at(table);
+        database.snapshot_rows_hook_for_test_ =
+            [&database, schema, hook = std::move(hook)](
+                epoch_si_poc::Epoch cut,
+                const std::map<epoch_si_poc::TableId, std::vector<std::pair<epoch_si_poc::RowId, epoch_si_poc::Row>>>&
+                    rows) {
+                std::vector<int32_t> values;
+                if (const auto found = rows.find(schema.id); found != rows.end()) {
+                    for (const auto& [id, row] : found->second) {
+                        (void)id;
+                        const auto cells = database.DecodeRow(schema, row);
+                        values.push_back(cells.at(1).integer);
+                    }
+                }
+                hook(cut, std::move(values));
+            };
+    }
+    static void SetCrashPoint(DeltaDatabase& database, epoch_si_poc::CheckpointCrashPoint point) {
+        database.db_.SetCrashPointForTest(point);
+    }
+    static std::string FutureSnapshotTemp(const DeltaDatabase& database, const std::string& table) {
+        return database.directory_ + "/tablebase." + std::to_string(database.tables_.at(table).id) + "." +
+               std::to_string(database.db_.generation() + 2) + ".tmp";
+    }
+    static std::array<uint64_t, 4> IndexState(const DeltaDatabase& database) {
+        const auto& sidecar = database.sidecars_.begin()->second;
+        return {sidecar.generation, sidecar.snapshot_epoch, database.overlay_.size(), database.current_overlay_.size()};
+    }
+    static std::array<uint64_t, 4> OverlayState(const DeltaDatabase& database) {
+        return {database.overlay_.size(), database.frozen_overlay_.size(), database.current_overlay_.size(),
+                database.frozen_current_overlay_.size()};
+    }
+    static std::array<uint64_t, 6> ReclamationState(const DeltaDatabase& database) {
+        return {database.db_.engine().version_count(),
+                database.db_.engine().retained_version_count_for_test(),
+                database.db_.engine().row_state_chunk_count_for_test(),
+                database.retired_sources_.size(),
+                database.retired_collapse_cursor_.done,
+                database.retired_tables_collected_};
+    }
+    static void SetRetiredStateReleaseHook(DeltaDatabase& database, std::function<void()> hook) {
+        database.retired_state_release_hook_for_test_ = std::move(hook);
+    }
+    static std::unique_ptr<PinHandle> HoldSnapshotPin(DeltaDatabase& database) {
+        return std::make_unique<PinHandle>(PinHandle{database.db_.engine().PinSnapshot()});
+    }
+    static void AppendRowCopies(DeltaDatabase& database, const std::string& table, size_t count) {
+        const auto table_id = database.tables_.at(table).id;
+        auto reader = database.db_.engine().Begin();
+        auto image = database.db_.engine().Read(reader, {table_id, 0});
+        database.db_.engine().Abort(reader);
+        if (!image)
+            throw std::logic_error("copy source missing");
+        auto writer = database.db_.engine().Begin();
+        for (size_t position = 0; position < count; ++position)
+            database.db_.engine().InsertImage(writer, table_id, *image);
+        const auto result = database.db_.engine().CommitBatch({&writer});
+        if (result.size() != 1 || result[0].status != epoch_si_poc::CommitStatus::kCommitted)
+            throw std::logic_error("copy rows not committed");
+    }
+    static std::array<uint64_t, 3> SnapshotState(const DeltaDatabase& database) {
+        return {database.db_.generation(), database.db_.engine().DirtyTableIds().size(),
+                database.db_.immutable_table_count()};
+    }
+    static std::array<uint64_t, 3> AuthorityState(const DeltaDatabase& database) {
+        return {database.db_.generation(), database.db_.base_epoch(), database.db_.engine().published_epoch()};
+    }
+    static DeltaDatabase::StagedSidecarArtifact
+    BuildStaged(DeltaDatabase& database, const std::string& table, size_t index,
+                const std::vector<std::pair<std::vector<uint8_t>, uint64_t>>& entries, uint64_t generation,
+                uint64_t snapshot_epoch) {
+        const auto& schema = database.tables_.at(table);
+        std::vector<DeltaDatabase::SidecarBuildEntry> input;
+        input.reserve(entries.size());
+        for (const auto& entry : entries)
+            input.push_back({entry.first, entry.second});
+        return database.BuildStagedSidecarForTest(schema, schema.indexes.at(index), input, generation, snapshot_epoch);
+    }
+    static uint64_t Generation(const DeltaDatabase& database, const std::string& table) {
+        return *database.db_.TableGeneration(database.tables_.at(table).id);
+    }
+    static std::string TableBasePath(const DeltaDatabase& database, const std::string& table, uint64_t generation) {
+        return database.directory_ + "/tablebase." + std::to_string(database.tables_.at(table).id) + "." +
+               std::to_string(generation);
+    }
+    static std::string GenerationSidecarPath(const DeltaDatabase& database, const std::string& table, size_t index) {
+        const auto& schema = database.tables_.at(table);
+        return database.directory_ + "/deltaidx." + std::to_string(schema.id) + "." +
+               std::to_string(schema.indexes.at(index).constraint_id) + ".g" +
+               std::to_string(*database.db_.TableGeneration(schema.id));
+    }
+    static uint64_t Snapshot(const DeltaDatabase& database) {
+        return std::max<uint64_t>(database.db_.engine().published_epoch(),
+                                  *database.db_.TableVisibleFrom(database.tables_.begin()->second.id));
+    }
+    static bool ValidateStaged(DeltaDatabase& database, const std::string& table, const std::string& path,
+                               uint64_t generation, uint64_t snapshot) {
+        const auto& schema = database.tables_.at(table);
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0)
+            return false;
+        const bool valid = database.ValidateSidecarFd(schema, schema.indexes.at(0), fd, false, generation, snapshot);
+        close(fd);
+        return valid;
+    }
+};
+} // namespace deltakernel
 
 namespace {
 static_assert(!std::is_copy_constructible_v<deltakernel::DeltaSession>);
@@ -273,6 +413,537 @@ TEST(DeltaDatabaseTest, PrivateCommitAbortCheckpointAndRestart) {
     RunSql(*db, session, "commit;");
 }
 
+TEST(DeltaDatabaseTest, MaintenanceCutsReadOnlyWalAndReopens) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int);\n");
+    RunSql(*db, session, "begin;\n");
+    RunSql(*db, session, "select * from t;\n");
+    RunSql(*db, session, "commit;\n");
+    db->SetMaintenanceThresholdsForTest(1, 2);
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+    auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(reopened->WalFrameCountForTest(), 0U);
+}
+
+TEST(DeltaDatabaseTest, MaintenanceCooldownAndHardThresholdAreGeneric) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int);\n");
+    auto readonly_commit = [&] {
+        RunSql(*db, session, "begin;\n");
+        RunSql(*db, session, "select * from t;\n");
+        RunSql(*db, session, "commit;\n");
+    };
+    db->SetMaintenanceThresholdsForTest(1, 1024);
+    db->SetMaintenanceCooldownForTest(std::chrono::hours(1));
+    readonly_commit();
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+    readonly_commit();
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kReclaimed);
+    db->SetMaintenanceThresholdsForTest(1, 1);
+    readonly_commit();
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+}
+
+TEST(DeltaDatabaseTest, MaintenanceCancelRestoresAuthorityBeforePublication) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int, v int);\n");
+    RunSql(*db, session, "insert into t values (1, 7);\n");
+    db->SetMaintenanceThresholdsForTest(1, 2);
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] { db->StopMaintenance(); });
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCancelled);
+    auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession reopened_session;
+    auto rows = Query(*reopened, reopened_session, "select * from t;\n");
+    ASSERT_EQ(rows.rows.size(), 1U);
+    EXPECT_EQ(rows.rows[0][1], "7");
+}
+
+TEST(DeltaDatabaseTest, ReadOnlyCutPreservesPinnedRetiredChain) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 7);");
+    auto old_pin = deltakernel::DeltaSnapshotTestPeer::HoldSnapshotPin(*db);
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    ASSERT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 1U);
+
+    db->SetMaintenanceThresholdsForTest(1, 2);
+    RunSql(*db, setup, "begin;");
+    RunSql(*db, setup, "select * from t;");
+    RunSql(*db, setup, "commit;");
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+    const auto pinned = deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db);
+    EXPECT_EQ(pinned[3], 2U);
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+
+    old_pin.reset();
+    for (size_t attempt = 0; attempt < 8 && deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3] != 0;
+         ++attempt)
+        EXPECT_NE(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCancelled);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 0U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, MaintenanceBuildsDirtyTablesOnceAtThreshold) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int, v int);\n");
+    RunSql(*db, session, "insert into t values (1, 7);\n");
+    db->SetMaintenanceThresholdsForTest(1, 2);
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+    const auto generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    EXPECT_EQ(db->MaintenanceTick(), deltakernel::DeltaDatabase::MaintenanceResult::kReclaimed);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t"), generation);
+}
+
+TEST(DeltaDatabaseTest, MaintenanceBuilderPacesAtForegroundBatchBoundary) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int);\n");
+    for (int32_t id = 0; id < 2048; ++id) {
+        const auto sql = "insert into t values (" + std::to_string(id) + ");\n";
+        RunSql(*db, session, sql.c_str());
+    }
+
+    std::mutex gate;
+    std::condition_variable changed;
+    size_t batches = 0;
+    bool release_first = false;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        std::unique_lock<std::mutex> lock(gate);
+        ++batches;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_first; });
+    });
+    std::exception_ptr error;
+    std::thread builder([&] {
+        try {
+            deltakernel::DeltaSnapshotTestPeer::Build(*db);
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    bool reached_first_batch = false;
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_first_batch = changed.wait_for(lock, std::chrono::seconds(5), [&] { return batches != 0; });
+    }
+    if (!reached_first_batch) {
+        {
+            std::lock_guard<std::mutex> release_lock(gate);
+            release_first = true;
+        }
+        changed.notify_all();
+        db->StopMaintenance();
+        builder.join();
+        deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+        FAIL() << "builder did not reach its first batch";
+    }
+    auto foreground = deltakernel::DeltaSnapshotTestPeer::HoldExecution(*db);
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        release_first = true;
+    }
+    changed.notify_all();
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        EXPECT_FALSE(changed.wait_for(lock, std::chrono::milliseconds(5), [&] { return batches > 1; }));
+    }
+    foreground.unlock();
+    builder.join();
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    ASSERT_FALSE(error);
+    EXPECT_GT(batches, 1U);
+}
+
+TEST(DeltaDatabaseTest, MaintenanceBuilderCancelDuringPacingReturnsPromptly) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t (id int);\n");
+    for (int32_t id = 0; id < 2048; ++id) {
+        const auto sql = "insert into t values (" + std::to_string(id) + ");\n";
+        RunSql(*db, session, sql.c_str());
+    }
+
+    std::mutex gate;
+    std::condition_variable changed;
+    bool release_first = false;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        std::unique_lock<std::mutex> lock(gate);
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_first; });
+    });
+    std::exception_ptr error;
+    std::thread builder([&] {
+        try {
+            deltakernel::DeltaSnapshotTestPeer::Build(*db);
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    bool reached_first_batch = false;
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_first_batch = changed.wait_for(lock, std::chrono::seconds(5)) != std::cv_status::timeout;
+    }
+    if (!reached_first_batch) {
+        db->StopMaintenance();
+        {
+            std::lock_guard<std::mutex> release_lock(gate);
+            release_first = true;
+        }
+        changed.notify_all();
+        builder.join();
+        deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+        FAIL() << "builder did not reach its first batch";
+    }
+    auto foreground = deltakernel::DeltaSnapshotTestPeer::HoldExecution(*db);
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        release_first = true;
+    }
+    changed.notify_all();
+    const auto started = std::chrono::steady_clock::now();
+    db->StopMaintenance();
+    foreground.unlock();
+    builder.join();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    ASSERT_FALSE(error);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(100));
+}
+
+TEST(DeltaDatabaseTest, MaintenanceRechecksDirtyTablesAfterWaitingForCommit) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession writer;
+    RunSql(*db, writer, "create table t (id int, v int);\n");
+    const auto initial_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    deltakernel::DeltaSession debt;
+    RunSql(*db, debt, "begin;\n");
+    RunSql(*db, debt, "select * from t;\n");
+    RunSql(*db, debt, "commit;\n");
+    RunSql(*db, writer, "begin;\n");
+    RunSql(*db, writer, "insert into t values (1, 7);\n");
+    db->SetMaintenanceThresholdsForTest(1, 2);
+
+    std::mutex gate;
+    std::condition_variable changed;
+    bool writer_holding_execution = false;
+    bool release_writer = false;
+    bool maintenance_waiting = false;
+    db->SetExecuteLockHookForTest([&] {
+        std::unique_lock<std::mutex> lock(gate);
+        writer_holding_execution = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_writer; });
+    });
+    db->SetExecutionWriterWaitHookForTest([&] {
+        std::lock_guard<std::mutex> lock(gate);
+        maintenance_waiting = true;
+        changed.notify_all();
+    });
+
+    std::exception_ptr writer_error;
+    std::thread writer_thread([&] {
+        try {
+            RunSql(*db, writer, "commit;\n");
+        } catch (...) {
+            writer_error = std::current_exception();
+        }
+    });
+    bool reached_writer = false;
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_writer = changed.wait_for(lock, std::chrono::seconds(2), [&] { return writer_holding_execution; });
+    }
+
+    std::optional<deltakernel::DeltaDatabase::MaintenanceResult> maintenance_result;
+    std::exception_ptr maintenance_error;
+    std::thread maintenance_thread;
+    if (reached_writer) {
+        maintenance_thread = std::thread([&] {
+            try {
+                maintenance_result = db->MaintenanceTick();
+            } catch (...) {
+                maintenance_error = std::current_exception();
+            }
+        });
+    }
+    bool reached_maintenance = false;
+    if (reached_writer) {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_maintenance = changed.wait_for(lock, std::chrono::seconds(2), [&] { return maintenance_waiting; });
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        release_writer = true;
+        changed.notify_all();
+    }
+    writer_thread.join();
+    if (maintenance_thread.joinable())
+        maintenance_thread.join();
+    db->SetExecuteLockHookForTest({});
+    db->SetExecutionWriterWaitHookForTest({});
+
+    ASSERT_TRUE(reached_writer);
+    ASSERT_TRUE(reached_maintenance);
+    ASSERT_EQ(writer_error, nullptr);
+    ASSERT_EQ(maintenance_error, nullptr);
+    ASSERT_EQ(maintenance_result, deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+    EXPECT_GT(deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t"), initial_generation);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::SnapshotState(*db)[1], 0U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(db->WalFrameCountForTest(), 0U);
+    deltakernel::DeltaSession reader;
+    EXPECT_EQ(Query(*db, reader, "select v from t where id = 1;\n").rows,
+              (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, MaintenanceDebtReadWaitsForCommitSync) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession writer;
+    RunSql(*db, writer, "create table t (id int, v int);\n");
+    RunSql(*db, writer, "begin;\n");
+    RunSql(*db, writer, "insert into t values (1, 7);\n");
+    db->SetMaintenanceThresholdsForTest(1, 2);
+
+    std::mutex gate;
+    std::condition_variable changed;
+    bool sync_waiting = false;
+    bool release_sync = false;
+    bool maintenance_execution_wait = false;
+    db->SetCommitSyncHookForTest([&] {
+        std::unique_lock<std::mutex> lock(gate);
+        sync_waiting = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_sync; });
+    });
+    db->SetExecutionWriterWaitHookForTest([&] {
+        std::lock_guard<std::mutex> lock(gate);
+        maintenance_execution_wait = true;
+        changed.notify_all();
+    });
+
+    std::exception_ptr writer_error;
+    std::thread writer_thread([&] {
+        try {
+            RunSql(*db, writer, "commit;\n");
+        } catch (...) {
+            writer_error = std::current_exception();
+        }
+    });
+    const bool reached_sync = WaitForCondition(changed, gate, [&] { return sync_waiting; });
+
+    std::optional<deltakernel::DeltaDatabase::MaintenanceResult> maintenance_result;
+    std::exception_ptr maintenance_error;
+    std::atomic<bool> maintenance_done{false};
+    std::thread maintenance_thread;
+    if (reached_sync) {
+        maintenance_thread = std::thread([&] {
+            try {
+                maintenance_result = db->MaintenanceTick();
+            } catch (...) {
+                maintenance_error = std::current_exception();
+            }
+            maintenance_done.store(true, std::memory_order_release);
+        });
+    }
+    bool maintenance_started = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (reached_sync && std::chrono::steady_clock::now() < deadline) {
+        if (deltakernel::DeltaSnapshotTestPeer::SnapshotBuilderBusy(*db)) {
+            maintenance_started = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    bool passed_debt_read = false;
+    const bool completed_while_sync_blocked = maintenance_done.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        passed_debt_read = maintenance_execution_wait;
+        release_sync = true;
+        changed.notify_all();
+    }
+    writer_thread.join();
+    if (maintenance_thread.joinable())
+        maintenance_thread.join();
+    db->SetCommitSyncHookForTest({});
+    db->SetExecutionWriterWaitHookForTest({});
+
+    ASSERT_TRUE(reached_sync);
+    ASSERT_TRUE(maintenance_started);
+    EXPECT_FALSE(completed_while_sync_blocked);
+    EXPECT_FALSE(passed_debt_read);
+    ASSERT_FALSE(writer_error);
+    ASSERT_FALSE(maintenance_error);
+    EXPECT_EQ(maintenance_result, deltakernel::DeltaDatabase::MaintenanceResult::kCheckpointed);
+}
+
+TEST(DeltaDatabaseTest, SqlCheckpointWaitsForSnapshotBuilder) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t (id int, v int);\n");
+    RunSql(*db, setup, "insert into t values (1, 7);\n");
+
+    std::mutex gate;
+    std::condition_variable changed;
+    bool snapshot_io_waiting = false;
+    bool release_snapshot = false;
+    bool checkpoint_waiting = false;
+    std::atomic<bool> checkpoint_entered{false};
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        std::unique_lock<std::mutex> lock(gate);
+        snapshot_io_waiting = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_snapshot; });
+    });
+    db->SetSnapshotBuilderWaitHookForTest([&] {
+        std::lock_guard<std::mutex> lock(gate);
+        checkpoint_waiting = true;
+        changed.notify_all();
+    });
+    db->SetExecuteLockHookForTest([&] { checkpoint_entered.store(true, std::memory_order_release); });
+
+    std::exception_ptr snapshot_error;
+    std::thread snapshot_thread([&] {
+        try {
+            deltakernel::DeltaSnapshotTestPeer::Build(*db);
+        } catch (...) {
+            snapshot_error = std::current_exception();
+        }
+    });
+    bool reached_snapshot_io = false;
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_snapshot_io = changed.wait_for(lock, std::chrono::seconds(2), [&] { return snapshot_io_waiting; });
+    }
+
+    std::exception_ptr checkpoint_error;
+    std::thread checkpoint_thread;
+    if (reached_snapshot_io) {
+        checkpoint_thread = std::thread([&] {
+            try {
+                deltakernel::DeltaSession checkpoint;
+                RunSql(*db, checkpoint, "create static_checkpoint;\n");
+            } catch (...) {
+                checkpoint_error = std::current_exception();
+            }
+        });
+    }
+    bool reached_checkpoint_wait = false;
+    if (reached_snapshot_io) {
+        std::unique_lock<std::mutex> lock(gate);
+        reached_checkpoint_wait = changed.wait_for(lock, std::chrono::seconds(2), [&] { return checkpoint_waiting; });
+    }
+    EXPECT_FALSE(checkpoint_entered.load(std::memory_order_acquire));
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        release_snapshot = true;
+        changed.notify_all();
+    }
+    snapshot_thread.join();
+    if (checkpoint_thread.joinable())
+        checkpoint_thread.join();
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    db->SetSnapshotBuilderWaitHookForTest({});
+    db->SetExecuteLockHookForTest({});
+
+    ASSERT_TRUE(reached_snapshot_io);
+    ASSERT_TRUE(reached_checkpoint_wait);
+    ASSERT_FALSE(snapshot_error);
+    ASSERT_FALSE(checkpoint_error);
+    EXPECT_TRUE(checkpoint_entered.load(std::memory_order_acquire));
+    const auto authority = deltakernel::DeltaSnapshotTestPeer::AuthorityState(*db);
+    EXPECT_EQ(authority[1], authority[2]);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 0U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession reader;
+    EXPECT_EQ(Query(*db, reader, "select v from t where id = 1;\n").rows,
+              (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, StagedSidecarUsesBoundedSortedLayout) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    const auto artifact = deltakernel::DeltaSnapshotTestPeer::BuildStaged(
+        *db, "t", 0, {{{0xff, 0x00}, 9}, {{0x00, 0xfe}, 3}, {{0x00, 0xff}, 7}},
+        deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t"), deltakernel::DeltaSnapshotTestPeer::Snapshot(*db));
+    ASSERT_TRUE(std::filesystem::exists(artifact.path));
+    const auto header = ReadSidecarHeader(artifact.path);
+    EXPECT_EQ(ReadLeAt<uint64_t>(header, 48), 3U);
+    EXPECT_EQ(ReadLeAt<uint64_t>(header, 64), 6U);
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/deltaidx.1.1"));
+}
+
+TEST(DeltaDatabaseTest, StagedSidecarRejectsDuplicateLocalId) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::BuildStaged(*db, "t", 0, {{{1}, 4}, {{2}, 4}}, 1, 0),
+                 std::runtime_error);
+}
+
+TEST(DeltaDatabaseTest, StagedSidecarSharedValidatorRejectsCorruption) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    const auto generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    const auto snapshot = deltakernel::DeltaSnapshotTestPeer::Snapshot(*db);
+    auto artifact = deltakernel::DeltaSnapshotTestPeer::BuildStaged(*db, "t", 0, {{{1, 2}, 4}}, generation, snapshot);
+    std::fstream file(artifact.path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(file);
+    file.seekp(0);
+    char byte = 0;
+    file.read(&byte, 1);
+    byte ^= 1;
+    file.seekp(0);
+    file.write(&byte, 1);
+    file.close();
+    EXPECT_FALSE(deltakernel::DeltaSnapshotTestPeer::ValidateStaged(*db, "t", artifact.path, generation, snapshot));
+}
+
+TEST(DeltaDatabaseTest, StagedSidecarTokenCleansOwnedFile) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    std::string path;
+    {
+        auto artifact = deltakernel::DeltaSnapshotTestPeer::BuildStaged(
+            *db, "t", 0, {{{1}, 4}}, deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t"),
+            deltakernel::DeltaSnapshotTestPeer::Snapshot(*db));
+        path = artifact.path;
+        ASSERT_TRUE(std::filesystem::exists(path));
+    }
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
 TEST(DeltaDatabaseTest, StaleSameKeyCommitAborts) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
@@ -365,6 +1036,63 @@ TEST(DeltaDatabaseTest, FirstRotationRefreshesLegacyReplayBoundaryFrontier) {
     deltakernel::DeltaSession session;
     EXPECT_EQ(Query(*reopened, session, "select k from t order by k;").rows,
               (std::vector<std::vector<std::string>>{{"0"}, {"1"}}));
+}
+
+TEST(DeltaDatabaseTest, LegacyRotationCrashRetainsReplayAuthority) {
+    TempDelta temp;
+    {
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession session;
+        RunSql(*db, session, "create table t(k int);");
+        RunSql(*db, session, "insert into t values(7);");
+        db->Checkpoint();
+    }
+    ConvertSegmentedManifestToLegacy(temp);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto db = deltakernel::DeltaDatabase::Open(temp.path());
+        db->SetWalRotationCrashPointForTest(
+            epoch_si_poc::CheckpointCrashPoint::kRotationAfterManifestRenameBeforeDirSync);
+        try {
+            db->RotateWalForTest();
+        } catch (...) {
+            kill(getpid(), SIGKILL);
+        }
+        _exit(1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    ASSERT_EQ(WTERMSIG(status), SIGKILL);
+    auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession reader;
+    EXPECT_EQ(Query(*reopened, reader, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotPublishCannotRestoreLegacyReplayOnLaterRotation) {
+    TempDelta temp;
+    {
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession setup;
+        RunSql(*db, setup, "create table t(k int);");
+        RunSql(*db, setup, "insert into t values(7);");
+        db->Checkpoint();
+    }
+    ConvertSegmentedManifestToLegacy(temp);
+    auto db = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession writer;
+    RunSql(*db, writer, "update t set k = 7 where k = 7;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    db->RotateWalForTest();
+    db.reset();
+    const auto manifest = ReadDeltaFile(temp.path() + "/MANIFEST");
+    const uint32_t table_count = GetDeltaLe<uint32_t>(manifest, 36);
+    const size_t chain = 44 + static_cast<size_t>(table_count) * 40;
+    EXPECT_EQ(GetDeltaLe<uint32_t>(manifest, chain + 8), 0U);
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession reader;
+    EXPECT_EQ(Query(*db, reader, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
 }
 
 TEST(DeltaDatabaseTest, RetainedHighSegmentRangeCanRotate) {
@@ -635,8 +1363,10 @@ TEST(DeltaDatabaseTest, WalSyncRunsWithoutStateLockAndExclusiveWorkWaitsForCommi
     });
     const bool saw_sync = WaitForCondition(condition, mutex, [&] { return syncing; });
     CapturingSink old;
-    if (saw_sync)
+    if (saw_sync) {
         old = Query(*db, reader, "select v from t where k = 1;");
+        RunSql(*db, reader, "rollback;");
+    }
 
     std::thread second([&] {
         try {
@@ -664,7 +1394,8 @@ TEST(DeltaDatabaseTest, WalSyncRunsWithoutStateLockAndExclusiveWorkWaitsForCommi
             checkpoint_error = std::current_exception();
         }
     });
-    const bool saw_exclusive_wait = second_queued && WaitForCondition(condition, mutex, [&] { return exclusive_waiters >= 1; });
+    const bool saw_exclusive_wait =
+        second_queued && WaitForCondition(condition, mutex, [&] { return exclusive_waiters >= 1; });
     const bool ddl_finished_early = ddl_done.load();
     const bool checkpoint_finished_early = checkpoint_done.load();
 
@@ -675,7 +1406,6 @@ TEST(DeltaDatabaseTest, WalSyncRunsWithoutStateLockAndExclusiveWorkWaitsForCommi
     condition.notify_all();
     first.join();
     second.join();
-    RunSql(*db, reader, "rollback;");
     ddl_thread.join();
     checkpoint_thread.join();
     db->SetCommitSyncHookForTest({});
@@ -693,10 +1423,8 @@ TEST(DeltaDatabaseTest, WalSyncRunsWithoutStateLockAndExclusiveWorkWaitsForCommi
     EXPECT_FALSE(checkpoint_error);
     EXPECT_TRUE(ddl_done.load());
     EXPECT_TRUE(checkpoint_done.load());
-    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows,
-              (std::vector<std::vector<std::string>>{{"9"}}));
-    EXPECT_EQ(Query(*db, reader, "select v from t where k = 2;").rows,
-              (std::vector<std::vector<std::string>>{{"2"}}));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"9"}}));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"2"}}));
 }
 
 TEST(DeltaDatabaseTest, CommitQueuedDuringUnlockedSyncCertifiesSameRowAgainstPublication) {
@@ -749,23 +1477,21 @@ TEST(DeltaDatabaseTest, CommitQueuedDuringUnlockedSyncCertifiesSameRowAgainstPub
     EXPECT_TRUE(second_queued);
     EXPECT_FALSE(winner_error);
     EXPECT_TRUE(stale_error);
-    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows,
-              (std::vector<std::vector<std::string>>{{"2"}}));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"2"}}));
 }
 
 TEST(DeltaDatabaseTest, ReacquireFailureAfterDurableSyncTerminates) {
-    EXPECT_DEATH((
-        [&] {
-            TempDelta temp;
-            auto db = deltakernel::DeltaDatabase::Create(temp.path());
-            deltakernel::DeltaSession setup, writer;
-            RunSql(*db, setup, "create table t(k int);");
-            RunSql(*db, writer, "begin;");
-            RunSql(*db, writer, "insert into t values(1);");
-            db->SetCommitReacquireHookForTest([] { throw std::runtime_error("test reacquire failure"); });
-            RunSql(*db, writer, "commit;");
-        }()),
-        "");
+    EXPECT_DEATH(([&] {
+                     TempDelta temp;
+                     auto db = deltakernel::DeltaDatabase::Create(temp.path());
+                     deltakernel::DeltaSession setup, writer;
+                     RunSql(*db, setup, "create table t(k int);");
+                     RunSql(*db, writer, "begin;");
+                     RunSql(*db, writer, "insert into t values(1);");
+                     db->SetCommitReacquireHookForTest([] { throw std::runtime_error("test reacquire failure"); });
+                     RunSql(*db, writer, "commit;");
+                 }()),
+                 "");
 }
 
 TEST(DeltaDatabaseTest, WalSyncFailurePoisonsDatabaseBeforeAnyFurtherAck) {
@@ -1136,6 +1862,7 @@ TEST(DeltaDatabaseTest, ParameterizedJoinRechecksSnapshotAndPrivateKeyMoves) {
     RunSql(*db, setup, "insert into targets values(1, 9);");
     RunSql(*db, old_snapshot, "begin;");
     RunSql(*db, updater, "update targets set k = 2 where k = 1;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
 
     EXPECT_EQ(Query(*db, old_snapshot, "select sources.k from sources, targets where sources.k = targets.k;").rows,
               (std::vector<std::vector<std::string>>{{"1"}}));
@@ -1835,40 +2562,771 @@ TEST(DeltaDatabaseTest, PendingCommitPreventsReaderBargingAndPublishesIndexAtomi
     EXPECT_GT(late_reader_order, install_order);
 }
 
-TEST(DeltaDatabaseTest, CheckpointWaitsForExplicitTransactionWithoutBlockingCommit) {
+TEST(DeltaDatabaseTest, CheckpointDoesNotWaitForIdleExplicitTransaction) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
-    deltakernel::DeltaSession writer, reader;
-    RunSql(*db, writer, "create table t(k int);");
-    RunSql(*db, writer, "begin;");
-    RunSql(*db, writer, "insert into t values(1);");
+    deltakernel::DeltaSession setup, old_reader, writer, latest_reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, old_reader, "begin;");
+
+    EXPECT_NO_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db));
+
+    RunSql(*db, writer, "update t set v = 20 where k = 1;");
+    EXPECT_EQ(Query(*db, old_reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, latest_reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"20"}}));
+}
+
+TEST(DeltaDatabaseTest, CatalogMutationRejectsOldTransactionBeforeIndexPublication) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_reader, deleter, ddl, latest_reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, old_reader, "begin;");
+    RunSql(*db, deleter, "delete from t where k = 1;");
+
+    EXPECT_THROW(RunSql(*db, ddl, "create table later(k int);"), std::runtime_error);
+    EXPECT_THROW(RunSql(*db, ddl, "create index t_k on t(k);"), std::runtime_error);
+    EXPECT_EQ(Query(*db, old_reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+
+    RunSql(*db, old_reader, "rollback;");
+    EXPECT_NO_THROW(RunSql(*db, ddl, "create table later(k int);"));
+    EXPECT_NO_THROW(RunSql(*db, ddl, "create index t_k on t(k);"));
+    EXPECT_TRUE(Query(*db, latest_reader, "select v from t where k = 1;").rows.empty());
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderFileIoDoesNotBlockPostCutCommit) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, post_cut, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, setup, "insert into t values(2, 20);");
     std::mutex mutex;
     std::condition_variable condition;
-    bool checkpoint_waiting = false;
-    std::atomic<bool> checkpoint_done{false};
-    std::exception_ptr checkpoint_error;
-    db->SetExecutionWriterWaitHookForTest([&] {
-        std::lock_guard<std::mutex> lock(mutex);
-        checkpoint_waiting = true;
+    bool entered = false;
+    bool release = false;
+    epoch_si_poc::Epoch built_cut = 0;
+    std::vector<int32_t> built_values;
+    deltakernel::DeltaSnapshotTestPeer::SetRowsHook(*db, "t",
+                                                    [&](epoch_si_poc::Epoch cut, std::vector<int32_t> values) {
+                                                        built_cut = cut;
+                                                        built_values = std::move(values);
+                                                    });
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
         condition.notify_all();
+        condition.wait(lock, [&] { return release; });
     });
-    std::thread checkpoint([&] {
+    std::exception_ptr build_error;
+    std::thread builder([&] {
         try {
-            db->Checkpoint();
-            checkpoint_done = true;
+            deltakernel::DeltaSnapshotTestPeer::Build(*db);
         } catch (...) {
-            checkpoint_error = std::current_exception();
+            build_error = std::current_exception();
         }
     });
-    const bool saw_wait = WaitForCondition(condition, mutex, [&] { return checkpoint_waiting; });
-    EXPECT_FALSE(checkpoint_done.load());
-    RunSql(*db, writer, "commit;");
-    checkpoint.join();
-    db->SetExecutionWriterWaitHookForTest({});
-    EXPECT_TRUE(saw_wait);
-    EXPECT_FALSE(checkpoint_error);
-    EXPECT_TRUE(checkpoint_done.load());
+    const bool saw_io = WaitForCondition(condition, mutex, [&] { return entered; });
+    if (saw_io) {
+        RunSql(*db, post_cut, "update t set k = 4 where k = 1;");
+        RunSql(*db, post_cut, "update t set k = 1 where k = 4;");
+        RunSql(*db, post_cut, "update t set v = 99 where k = 1;");
+        RunSql(*db, post_cut, "delete from t where k = 2;");
+        RunSql(*db, post_cut, "insert into t values(3, 30);");
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_all();
+    builder.join();
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    EXPECT_TRUE(saw_io);
+    EXPECT_FALSE(build_error);
+    EXPECT_EQ(built_cut, 2U);
+    EXPECT_EQ(built_values, (std::vector<int32_t>{10, 20}));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"99"}}));
+    EXPECT_TRUE(Query(*db, reader, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"30"}}));
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::IndexState(*db)[3], 2U);
+    const auto post_cut_authority = deltakernel::DeltaSnapshotTestPeer::AuthorityState(*db);
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::AuthorityState(*db)[0], post_cut_authority[0] + 2);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::IndexState(*db)[3], 0U);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, reader, "select k, v from t order by k;").rows,
+              (std::vector<std::vector<std::string>>{{"1", "99"}, {"3", "30"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderQueriesFrozenAndActiveIndexGenerations) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, historical, post_cut, latest;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    RunSql(*db, setup, "update t set k = 2 where k = 1;");
+    RunSql(*db, historical, "begin;");
+
+    bool changed = false;
+    std::array<uint64_t, 4> before_value_update{};
+    std::array<uint64_t, 4> after_value_update{};
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (changed)
+            return;
+        changed = true;
+        RunSql(*db, post_cut, "update t set k = 1 where k = 2;");
+        before_value_update = deltakernel::DeltaSnapshotTestPeer::OverlayState(*db);
+        RunSql(*db, post_cut, "update t set v = 99 where k = 1;");
+        after_value_update = deltakernel::DeltaSnapshotTestPeer::OverlayState(*db);
+        EXPECT_EQ(Query(*db, latest, "select v from t where k = 1;").rows,
+                  (std::vector<std::vector<std::string>>{{"99"}}));
+        EXPECT_TRUE(Query(*db, latest, "select v from t where k = 2;").rows.empty());
+        EXPECT_EQ(Query(*db, historical, "select v from t where k = 2;").rows,
+                  (std::vector<std::vector<std::string>>{{"10"}}));
+    });
+    EXPECT_NO_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db));
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+
+    EXPECT_TRUE(changed);
+    EXPECT_EQ(before_value_update, after_value_update);
+    EXPECT_GT(before_value_update[1], 0U);
+    EXPECT_GT(before_value_update[2], 0U);
+    EXPECT_GT(before_value_update[3], 0U);
+    EXPECT_EQ(Query(*db, latest, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"99"}}));
+    EXPECT_TRUE(Query(*db, latest, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, historical, "select v from t where k = 2;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    const auto published = deltakernel::DeltaSnapshotTestPeer::OverlayState(*db);
+    EXPECT_EQ(published[1], 0U);
+    EXPECT_EQ(published[3], 0U);
+    EXPECT_GT(published[0], 0U);
+    EXPECT_GT(published[2], 0U);
+    RunSql(*db, historical, "rollback;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::OverlayState(*db), (std::array<uint64_t, 4>{0, 0, 0, 0}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderFailureRestoresBothOverlayGenerations) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, historical, post_cut, latest;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    RunSql(*db, setup, "update t set k = 2 where k = 1;");
+    RunSql(*db, historical, "begin;");
+
+    bool changed = false;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (changed)
+            return;
+        changed = true;
+        RunSql(*db, post_cut, "update t set k = 3 where k = 2;");
+        RunSql(*db, post_cut, "insert into t values(9, 90);");
+        RunSql(*db, post_cut, "delete from t where k = 9;");
+        EXPECT_EQ(Query(*db, latest, "select v from t where k = 3;").rows,
+                  (std::vector<std::vector<std::string>>{{"10"}}));
+        EXPECT_EQ(Query(*db, historical, "select v from t where k = 2;").rows,
+                  (std::vector<std::vector<std::string>>{{"10"}}));
+        EXPECT_TRUE(Query(*db, latest, "select v from t where k = 9;").rows.empty());
+    });
+    deltakernel::DeltaSnapshotTestPeer::SetSidecarFinishHook(*db,
+                                                             [](size_t) { throw std::runtime_error("stop build"); });
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::runtime_error);
+    EXPECT_TRUE(changed);
+    auto restored = deltakernel::DeltaSnapshotTestPeer::OverlayState(*db);
+    EXPECT_EQ(restored[1], 0U);
+    EXPECT_EQ(restored[3], 0U);
+    EXPECT_GT(restored[0], 0U);
+    EXPECT_GT(restored[2], 0U);
+    EXPECT_EQ(Query(*db, latest, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, historical, "select v from t where k = 2;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_TRUE(Query(*db, latest, "select v from t where k = 9;").rows.empty());
+
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::runtime_error);
+    restored = deltakernel::DeltaSnapshotTestPeer::OverlayState(*db);
+    EXPECT_EQ(restored[1], 0U);
+    EXPECT_EQ(restored[3], 0U);
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    deltakernel::DeltaSnapshotTestPeer::SetSidecarFinishHook(*db, {});
+    EXPECT_NO_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db));
+    EXPECT_EQ(Query(*db, latest, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_TRUE(Query(*db, latest, "select v from t where k = 9;").rows.empty());
+    RunSql(*db, historical, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderRejectsPostCutGenerationDrift) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    bool rotated = false;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (!rotated) {
+            rotated = true;
+            db->RotateWalForTest();
+        }
+    });
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::logic_error);
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    ASSERT_TRUE(rotated);
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        EXPECT_EQ(entry.path().filename().string().find("deltaidx-staged"), std::string::npos);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, setup, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderKeepsOldTransactionSource) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_reader, writer, fresh;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, old_reader, "begin;");
+    RunSql(*db, writer, "update t set v = 20 where k = 1;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_EQ(Query(*db, old_reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"20"}}));
+    RunSql(*db, old_reader, "abort;");
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderRejectsCatalogMutationWhilePinned) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, ddl;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    bool attempted = false;
+    bool rejected = false;
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (!attempted) {
+            attempted = true;
+            try {
+                RunSql(*db, ddl, "create table u(k int);");
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+        }
+    });
+    EXPECT_NO_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db));
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    EXPECT_TRUE(attempted);
+    EXPECT_TRUE(rejected);
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        EXPECT_NE(entry.path().extension(), ".tmp");
+    EXPECT_THROW(Query(*db, ddl, "select k from u;"), std::runtime_error);
+    EXPECT_NO_THROW(RunSql(*db, ddl, "create table u(k int);"));
+    EXPECT_EQ(Query(*db, setup, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderPublishesEmptyAndLegacyTables) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table empty_t(k int);");
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    const auto before = deltakernel::DeltaSnapshotTestPeer::SnapshotState(*db);
+    EXPECT_EQ(before[1], 1U);
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const auto after = deltakernel::DeltaSnapshotTestPeer::SnapshotState(*db);
+    EXPECT_EQ(after[0], before[0] + 2);
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_TRUE(Query(*db, setup, "select k from empty_t;").rows.empty());
+    EXPECT_EQ(Query(*db, setup, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+    RunSql(*db, setup, "insert into empty_t values(9);");
+    EXPECT_EQ(Query(*db, setup, "select k from empty_t;").rows, (std::vector<std::vector<std::string>>{{"9"}}));
+}
+
+TEST(DeltaDatabaseTest, CleanSnapshotBuildIsAnExactNoOp) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const auto before = deltakernel::DeltaSnapshotTestPeer::AuthorityState(*db);
+    std::set<std::string> wal_before;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        if (const auto name = entry.path().filename().string();
+            name.rfind("db.log", 0) == 0 || name.rfind("wal.", 0) == 0)
+            wal_before.insert(name);
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    std::set<std::string> wal_after;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        if (const auto name = entry.path().filename().string();
+            name.rfind("db.log", 0) == 0 || name.rfind("wal.", 0) == 0)
+            wal_after.insert(name);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::AuthorityState(*db), before);
+    EXPECT_EQ(wal_after, wal_before);
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderCrashPointsRecoverPublishedAuthority) {
+    for (const auto point : {epoch_si_poc::CheckpointCrashPoint::kAfterManifestRenameBeforeDirSync,
+                             epoch_si_poc::CheckpointCrashPoint::kSnapshotAfterManifestDurable,
+                             epoch_si_poc::CheckpointCrashPoint::kSnapshotBeforeSourceInstall,
+                             epoch_si_poc::CheckpointCrashPoint::kSnapshotAfterSourceInstall}) {
+        TempDelta temp;
+        {
+            auto db = deltakernel::DeltaDatabase::Create(temp.path());
+            deltakernel::DeltaSession setup;
+            RunSql(*db, setup, "create table t(k int);");
+            RunSql(*db, setup, "create index t_k on t(k);");
+            RunSql(*db, setup, "insert into t values(7);");
+        }
+        const pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            std::signal(SIGABRT, [](int) { kill(getpid(), SIGKILL); });
+            auto db = deltakernel::DeltaDatabase::Open(temp.path());
+            deltakernel::DeltaSnapshotTestPeer::SetCrashPoint(*db, point);
+            deltakernel::DeltaSnapshotTestPeer::Build(*db);
+            _exit(1);
+        }
+        int status = 0;
+        ASSERT_EQ(waitpid(child, &status, 0), child);
+        ASSERT_TRUE(WIFSIGNALED(status)) << static_cast<int>(point);
+        ASSERT_EQ(WTERMSIG(status), SIGKILL) << static_cast<int>(point);
+        auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+        deltakernel::DeltaSession reader;
+        EXPECT_EQ(Query(*reopened, reader, "select k from t where k = 7;").rows,
+                  (std::vector<std::vector<std::string>>{{"7"}}))
+            << static_cast<int>(point);
+        size_t segments = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+            segments += entry.path().filename().string().rfind("db.log.s.", 0) == 0 &&
+                        !std::filesystem::is_symlink(entry.symlink_status());
+        EXPECT_EQ(segments, 1U) << static_cast<int>(point);
+    }
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderAdoptsSidecarAndDropsFoldedHistoricalOverlay) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    db->Checkpoint();
+    RunSql(*db, setup, "update t set k = 2 where k = 1;");
+    const auto before = deltakernel::DeltaSnapshotTestPeer::IndexState(*db);
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const auto after = deltakernel::DeltaSnapshotTestPeer::IndexState(*db);
+    EXPECT_GT(after[0], before[0]);
+    EXPECT_GT(after[1], before[1]);
+    EXPECT_GT(before[2], 0U);
+    EXPECT_EQ(after[2], 0U);
+    EXPECT_EQ(after[3], 0U);
+    EXPECT_TRUE(Query(*db, reader, "select v from t where k = 1;").rows.empty());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotSidecarKeepsOldSourceIndexSemantics) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, old_reader, writer, fresh;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    RunSql(*db, setup, "insert into t values(2, 20);");
+    RunSql(*db, old_reader, "begin;");
+    RunSql(*db, writer, "update t set k = 3 where k = 1;");
+    RunSql(*db, writer, "delete from t where k = 2;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_EQ(Query(*db, old_reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, old_reader, "select v from t where k = 2;").rows,
+              (std::vector<std::vector<std::string>>{{"20"}}));
+    EXPECT_EQ(Query(*db, old_reader, "select k from t order by k limit 1;").rows,
+              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 1;").rows.empty());
+    EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+    RunSql(*db, old_reader, "rollback;");
+}
+
+TEST(DeltaDatabaseTest, SnapshotSidecarPromotionIsAllOrNone) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "create index t_v on t(v);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    std::string first_final;
+    std::string collision;
+    deltakernel::DeltaSnapshotTestPeer::SetSidecarArtifactHook(
+        *db, [&](epoch_si_poc::TableId table_id, const std::vector<std::array<uint64_t, 4>>& headers) {
+            ASSERT_EQ(headers.size(), 2U);
+            first_final = temp.path() + "/deltaidx." + std::to_string(table_id) + "." + std::to_string(headers[0][3]) +
+                          ".g" + std::to_string(headers[0][1]);
+            collision = temp.path() + "/deltaidx." + std::to_string(table_id) + "." + std::to_string(headers[1][3]) +
+                        ".g" + std::to_string(headers[1][1]);
+            std::ofstream output(collision);
+            output << "owned by test";
+        });
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::system_error);
+    EXPECT_FALSE(std::filesystem::exists(first_final));
+    EXPECT_TRUE(std::filesystem::exists(collision));
+    EXPECT_TRUE(std::filesystem::remove(collision));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotSidecarManifestFailureRemovesPromotedFiles) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    deltakernel::DeltaSnapshotTestPeer::SetCrashPoint(*db, epoch_si_poc::CheckpointCrashPoint::kDuringManifestTemp);
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), epoch_si_poc::SimulatedCrash);
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        const auto name = entry.path().filename().string();
+        if (name.rfind("deltaidx.1.1.g", 0) == 0)
+            ADD_FAILURE() << name;
+    }
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotSidecarMissingOrCorruptRebuildsSafely) {
+    for (bool corrupt : {false, true}) {
+        TempDelta temp;
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession setup, reader;
+        RunSql(*db, setup, "create table t(k int, v int);");
+        RunSql(*db, setup, "create index t_k on t(k);");
+        RunSql(*db, setup, "insert into t values(1, 10);");
+        deltakernel::DeltaSnapshotTestPeer::Build(*db);
+        const std::string sidecar = deltakernel::DeltaSnapshotTestPeer::GenerationSidecarPath(*db, "t", 0);
+        db.reset();
+        if (corrupt) {
+            std::fstream output(sidecar, std::ios::binary | std::ios::in | std::ios::out);
+            ASSERT_TRUE(output);
+            output.put('!');
+        } else {
+            ASSERT_TRUE(std::filesystem::remove(sidecar));
+        }
+        db = deltakernel::DeltaDatabase::Open(temp.path());
+        EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows,
+                  (std::vector<std::vector<std::string>>{{"10"}}))
+            << corrupt;
+    }
+}
+
+TEST(DeltaDatabaseTest, SnapshotSidecarSupportsConsecutivePublications) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const uint64_t first_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    RunSql(*db, setup, "update t set k = 2 where k = 1;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const uint64_t second_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    EXPECT_GT(second_generation, first_generation);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::IndexState(*db)[0], second_generation);
+    size_t generation_sidecars = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path()))
+        generation_sidecars += entry.path().filename().string().rfind("deltaidx.1.1.g", 0) == 0;
+    EXPECT_EQ(generation_sidecars, 1U);
+    EXPECT_TRUE(Query(*db, reader, "select v from t where k = 1;").rows.empty());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+}
+
+TEST(DeltaDatabaseTest, OpenPreservesReplacedGenerationSidecarResidue) {
+    TempDelta temp;
+    TempDelta external;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    db.reset();
+    const std::string orphan = temp.path() + "/deltaidx.1.1.g999";
+    {
+        std::ofstream output(orphan);
+        output << "orphan";
+    }
+    const std::string malformed = temp.path() + "/deltaidx.malformed.g";
+    {
+        std::ofstream output(malformed);
+        output << "malformed";
+    }
+    const std::string target = external.path() + "/target";
+    {
+        std::ofstream output(target);
+        output << "target";
+    }
+    const std::string replaced = temp.path() + "/deltaidx.1.1.g998";
+    ASSERT_EQ(symlink(target.c_str(), replaced.c_str()), 0);
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_FALSE(std::filesystem::exists(orphan));
+    EXPECT_TRUE(std::filesystem::exists(malformed));
+    EXPECT_TRUE(std::filesystem::is_symlink(replaced));
+    std::ifstream input(target);
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()), "target");
+}
+
+TEST(DeltaDatabaseTest, GenerationReclamationWaitsForEveryOldSourceAndReleasesOutsideLocks) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, historical, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 10);");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+
+    const uint64_t first_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    const std::string first_table = deltakernel::DeltaSnapshotTestPeer::TableBasePath(*db, "t", first_generation);
+    std::unique_ptr<deltakernel::DeltaSnapshotTestPeer::PinHandle> oldest_pin;
+    RunSql(*db, setup, "update t set k = 2 where k = 1;");
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (!oldest_pin)
+            oldest_pin = deltakernel::DeltaSnapshotTestPeer::HoldSnapshotPin(*db);
+    });
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    ASSERT_TRUE(oldest_pin);
+    ASSERT_TRUE(std::filesystem::exists(first_table));
+
+    const uint64_t middle_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    const std::string middle_table = deltakernel::DeltaSnapshotTestPeer::TableBasePath(*db, "t", middle_generation);
+    std::unique_ptr<deltakernel::DeltaSnapshotTestPeer::PinHandle> middle_pin;
+    RunSql(*db, setup, "update t set k = 3 where k = 2;");
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (!middle_pin)
+            middle_pin = deltakernel::DeltaSnapshotTestPeer::HoldSnapshotPin(*db);
+    });
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    ASSERT_TRUE(middle_pin);
+    ASSERT_TRUE(std::filesystem::exists(first_table));
+    ASSERT_TRUE(std::filesystem::exists(middle_table));
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 2U);
+
+    RunSql(*db, historical, "begin;");
+    RunSql(*db, setup, "update t set k = 4 where k = 3;");
+    middle_pin.reset();
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 2U);
+    EXPECT_TRUE(std::filesystem::exists(first_table));
+    EXPECT_TRUE(std::filesystem::exists(middle_table));
+
+    size_t release_calls = 0;
+    deltakernel::DeltaSnapshotTestPeer::SetRetiredStateReleaseHook(*db, [&] {
+        ++release_calls;
+        EXPECT_EQ(Query(*db, reader, "select v from t where k = 4;").rows,
+                  (std::vector<std::vector<std::string>>{{"10"}}));
+    });
+    oldest_pin.reset();
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    deltakernel::DeltaSnapshotTestPeer::SetRetiredStateReleaseHook(*db, {});
+    EXPECT_GT(release_calls, 0U);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 1U);
+    EXPECT_FALSE(std::filesystem::exists(first_table));
+    EXPECT_FALSE(std::filesystem::exists(middle_table));
+    EXPECT_EQ(Query(*db, historical, "select v from t where k = 3;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_TRUE(Query(*db, historical, "select v from t where k = 4;").rows.empty());
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 4;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+    RunSql(*db, historical, "rollback;");
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[3], 0U);
+
+    const uint64_t protected_generation = deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t");
+    const std::string protected_table =
+        deltakernel::DeltaSnapshotTestPeer::TableBasePath(*db, "t", protected_generation);
+    std::unique_ptr<deltakernel::DeltaSnapshotTestPeer::PinHandle> protected_pin;
+    RunSql(*db, setup, "update t set k = 5 where k = 4;");
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, [&] {
+        if (!protected_pin)
+            protected_pin = deltakernel::DeltaSnapshotTestPeer::HoldSnapshotPin(*db);
+    });
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    deltakernel::DeltaSnapshotTestPeer::SetIoHook(*db, {});
+    ASSERT_TRUE(std::filesystem::remove(protected_table));
+    const std::string foreign = temp.path() + "/foreign-tablebase";
+    {
+        std::ofstream output(foreign);
+        output << "not a table base";
+    }
+    ASSERT_NO_THROW(std::filesystem::create_symlink(foreign, protected_table));
+    protected_pin.reset();
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(protected_table)));
+    EXPECT_TRUE(std::filesystem::exists(foreign));
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 5;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
+}
+
+TEST(DeltaDatabaseTest, GenerationCollapseAdvancesInBoundedChunkSteps) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    deltakernel::DeltaSnapshotTestPeer::AppendRowCopies(*db, "t", 4096);
+    ASSERT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[0], 4097U);
+    ASSERT_EQ(deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db)[2], 17U);
+
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const auto partial = deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db);
+    EXPECT_EQ(partial[0], 1U);
+    EXPECT_EQ(partial[1], 1U);
+    EXPECT_EQ(partial[2], 1U);
+    EXPECT_EQ(partial[3], 1U);
+
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    const auto complete = deltakernel::DeltaSnapshotTestPeer::ReclamationState(*db);
+    EXPECT_EQ(complete[0], 0U);
+    EXPECT_EQ(complete[1], 0U);
+    EXPECT_EQ(complete[2], 0U);
+    EXPECT_EQ(complete[3], 0U);
+    EXPECT_EQ(Query(*db, reader, "select count(*) from t;").rows, (std::vector<std::vector<std::string>>{{"4097"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderFailureKeepsRotatedAuthorityAndCleansFiles) {
+    TempDelta temp;
+    {
+        auto db = deltakernel::DeltaDatabase::Create(temp.path());
+        deltakernel::DeltaSession setup;
+        RunSql(*db, setup, "create table t(k int);");
+        RunSql(*db, setup, "insert into t values(7);");
+        deltakernel::DeltaSnapshotTestPeer::SetCrashPoint(*db, epoch_si_poc::CheckpointCrashPoint::kAfterBaseRename);
+        EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), epoch_si_poc::SimulatedCrash);
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        EXPECT_FALSE(entry.path().extension() == ".tmp");
+        EXPECT_EQ(entry.path().filename().string().find("tablebase."), std::string::npos);
+    }
+    auto reopened = deltakernel::DeltaDatabase::Open(temp.path());
+    deltakernel::DeltaSession reader;
+    EXPECT_EQ(Query(*reopened, reader, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"7"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderCleansStreamingSidecarCohortOnFailure) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 2);");
+    deltakernel::DeltaSnapshotTestPeer::SetSidecarFinishHook(*db, [](size_t ordinal) {
+        if (ordinal == 0)
+            throw std::runtime_error("sidecar finish failure");
+    });
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::runtime_error);
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        const auto name = entry.path().filename().string();
+        EXPECT_EQ(name.find("deltaidx-staged"), std::string::npos);
+        EXPECT_EQ(name.find(".spool"), std::string::npos);
+        EXPECT_EQ(name.find(".entries"), std::string::npos);
+        EXPECT_EQ(name.find(".keys"), std::string::npos);
+        EXPECT_EQ(name.find(".roworder"), std::string::npos);
+    }
     EXPECT_EQ(Query(*db, reader, "select k from t;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderStreamsAllIndexesFromOneCursor) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "create index t_v on t(v);");
+    for (int n = 0; n < 1100; ++n) {
+        const std::string insert = "insert into t values(" + std::to_string(n) + "," + std::to_string(n + 1) + ");";
+        RunSql(*db, setup, insert.c_str());
+    }
+    std::vector<std::array<uint64_t, 4>> headers;
+    deltakernel::DeltaSnapshotTestPeer::SetSidecarArtifactHook(
+        *db, [&](epoch_si_poc::TableId, const std::vector<std::array<uint64_t, 4>>& values) { headers = values; });
+    deltakernel::DeltaSnapshotTestPeer::Build(*db);
+    ASSERT_EQ(headers.size(), 2U);
+    EXPECT_EQ(headers[0][0], 1100U);
+    EXPECT_EQ(headers[1][0], 1100U);
+    EXPECT_EQ(headers[0][1], deltakernel::DeltaSnapshotTestPeer::Generation(*db, "t"));
+    EXPECT_EQ(headers[1][1], headers[0][1]);
+    EXPECT_LE(headers[0][2], deltakernel::DeltaSnapshotTestPeer::Snapshot(*db));
+    EXPECT_NE(headers[0][3], headers[1][3]);
+    EXPECT_EQ(Query(*db, reader, "select count(*) from t;").rows, (std::vector<std::vector<std::string>>{{"1100"}}));
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        const auto name = entry.path().filename().string();
+        EXPECT_EQ(name.find("deltaidx-staged"), std::string::npos);
+        EXPECT_EQ(name.find(".sort-run-"), std::string::npos);
+        EXPECT_EQ(name.find(".spool"), std::string::npos);
+        EXPECT_EQ(name.find(".entries"), std::string::npos);
+        EXPECT_EQ(name.find(".keys"), std::string::npos);
+        EXPECT_EQ(name.find(".roworder"), std::string::npos);
+    }
+}
+
+TEST(DeltaDatabaseTest, OpenRemovesOnlyGeneratedStagedResidue) {
+    TempDelta temp;
+    auto created = deltakernel::DeltaDatabase::Create(temp.path());
+    created.reset();
+    auto make_file = [&](const std::string& name) {
+        std::ofstream output(temp.path() + "/" + name);
+        output << "residue";
+    };
+    const std::string prefix = "deltaidx-staged.1.2.g3.e4.5.6";
+    make_file(prefix);
+    make_file(prefix + ".entries");
+    make_file(prefix + ".keys");
+    make_file(prefix + ".roworder");
+    make_file(prefix + ".spool");
+    make_file(prefix + ".sort-sort-run-7");
+    make_file(prefix + ".rowsort-sort-run-8");
+    make_file("deltaidx-staged.malformed.entries");
+    const std::string symlink_prefix = "deltaidx-staged.7.8.g9.e10.11.12";
+    const auto symlink_path = temp.path() + "/" + symlink_prefix + ".spool";
+    ASSERT_EQ(symlink("deltaidx-staged.malformed.entries", symlink_path.c_str()), 0);
+    auto db = deltakernel::DeltaDatabase::Open(temp.path());
+    (void)db;
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/" + prefix));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/" + prefix + ".entries"));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() + "/" + prefix + ".sort-sort-run-7"));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() + "/deltaidx-staged.malformed.entries"));
+    EXPECT_TRUE(std::filesystem::is_symlink(symlink_path));
+}
+
+TEST(DeltaDatabaseTest, SnapshotBuilderRejectsSymlinkResidueWithoutFollowingIt) {
+    TempDelta temp;
+    TempDelta external;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, setup, "insert into t values(7);");
+    const std::string outside = external.path() + "/outside";
+    {
+        std::ofstream output(outside);
+        output << "sentinel";
+    }
+    const std::string residue = deltakernel::DeltaSnapshotTestPeer::FutureSnapshotTemp(*db, "t");
+    ASSERT_EQ(symlink(outside.c_str(), residue.c_str()), 0);
+    EXPECT_THROW(deltakernel::DeltaSnapshotTestPeer::Build(*db), std::system_error);
+    EXPECT_TRUE(std::filesystem::is_symlink(residue));
+    std::ifstream input(outside);
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()), "sentinel");
 }
 
 TEST(DeltaDatabaseTest, CommitEnqueueFailureEndsPrivateTransactionBeforeAdmissionRelease) {
@@ -2290,8 +3748,7 @@ TEST(DeltaDatabaseTest, OrderedLatestBitmapKeepsOldSnapshotAndReverseBounds) {
     db->EnableDiagnosticsForTest();
     const auto before_routes = db->RouteDiagnosticsForTest();
 
-    EXPECT_EQ(Query(*db, old_snapshot, "select min(k) from t;").rows,
-              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_EQ(Query(*db, old_snapshot, "select min(k) from t;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
     EXPECT_EQ(Query(*db, fresh, "select k from t order by k desc limit 3;").rows,
               (std::vector<std::vector<std::string>>{{"3"}, {"2"}}));
     EXPECT_TRUE(Query(*db, fresh, "select k from t where k < 0 order by k desc limit 1;").rows.empty());
@@ -2316,8 +3773,7 @@ TEST(DeltaDatabaseTest, OrderedLatestBitmapSkipsDeadPrefixWithSummary) {
     db->EnableDiagnosticsForTest();
     const auto before_routes = db->RouteDiagnosticsForTest();
 
-    EXPECT_EQ(Query(*db, latest, "select min(k) from t;").rows,
-              (std::vector<std::vector<std::string>>{{"10000"}}));
+    EXPECT_EQ(Query(*db, latest, "select min(k) from t;").rows, (std::vector<std::vector<std::string>>{{"10000"}}));
     EXPECT_EQ(db->OrderedProbeCensusForTest(latest)[0], 1U);
     EXPECT_LT(db->LiveSummaryProbeCensusForTest(latest), 16U);
     const auto after_routes = db->RouteDiagnosticsForTest();
@@ -2358,13 +3814,11 @@ TEST(DeltaDatabaseTest, PrivateInsertKeyMovesAndDeleteLeaveNoCurrentGhosts) {
     RunSql(*db, writer, "update t set k = 2 where k = 1;");
     EXPECT_TRUE(Query(*db, writer, "select k from t where k = 1;").rows.empty());
     EXPECT_EQ(db->IndexProbeCensusForTest(writer), (std::array<size_t, 3>{0, 0, 0}));
-    EXPECT_EQ(Query(*db, writer, "select k from t where k = 2;").rows,
-              (std::vector<std::vector<std::string>>{{"2"}}));
+    EXPECT_EQ(Query(*db, writer, "select k from t where k = 2;").rows, (std::vector<std::vector<std::string>>{{"2"}}));
     RunSql(*db, writer, "update t set k = 3 where k = 2;");
     EXPECT_TRUE(Query(*db, writer, "select k from t where k = 2;").rows.empty());
     EXPECT_EQ(db->IndexProbeCensusForTest(writer), (std::array<size_t, 3>{0, 0, 0}));
-    EXPECT_EQ(Query(*db, writer, "select k from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"3"}}));
+    EXPECT_EQ(Query(*db, writer, "select k from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"3"}}));
     RunSql(*db, writer, "delete from t where k = 3;");
     RunSql(*db, writer, "commit;");
 
@@ -2394,19 +3848,16 @@ TEST(DeltaDatabaseTest, ExistingKeyMovesCoalesceCurrentOverlay) {
 
     EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
     EXPECT_EQ(db->IndexProbeCensusForTest(fresh), (std::array<size_t, 3>{0, 0, 0}));
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
 
     RunSql(*db, writer, "begin;");
     RunSql(*db, writer, "update t set v = 11 where k = 3;");
     RunSql(*db, writer, "commit;");
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"11"}}));
     db->Checkpoint();
     db.reset();
     db = deltakernel::DeltaDatabase::Open(temp.path());
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"11"}}));
 }
 
 TEST(DeltaDatabaseTest, ExistingKeyMoveThenDeleteLeavesNoCurrentGhost) {
@@ -2434,17 +3885,13 @@ TEST(DeltaDatabaseTest, CurrentBaseKeepsUnchangedIndexKeys) {
     RunSql(*db, setup, "create index t_a on t(a);");
     RunSql(*db, setup, "create index t_b on t(b);");
     RunSql(*db, setup, "update t set v = 11 where a = 1;");
-    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 1;").rows,
-              (std::vector<std::vector<std::string>>{{"11"}}));
-    EXPECT_EQ(Query(*db, fresh, "select min(a) from t;").rows,
-              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 1;").rows, (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select min(a) from t;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
 
     RunSql(*db, setup, "update t set a = 4 where b = 2;");
-    EXPECT_EQ(Query(*db, fresh, "select v from t where b = 2;").rows,
-              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where b = 2;").rows, (std::vector<std::vector<std::string>>{{"11"}}));
     EXPECT_TRUE(Query(*db, fresh, "select v from t where a = 1;").rows.empty());
-    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 4;").rows,
-              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where a = 4;").rows, (std::vector<std::vector<std::string>>{{"11"}}));
 }
 
 TEST(DeltaDatabaseTest, CommitTransfersNonuniqueCandidatesAndSkipsNewIdsInBaseLookup) {
@@ -2476,8 +3923,7 @@ TEST(DeltaDatabaseTest, CommitTransfersNonuniqueCandidatesAndSkipsNewIdsInBaseLo
     RunSql(*db, writer, "update t set k = 1 where k = 0;");
     EXPECT_GT(db->CurrentIndexCensusForTest()[0], inserted[0]);
     EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 0;").rows.empty());
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows,
-              (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
     RunSql(*db, old_snapshot, "rollback;");
 }
 
@@ -2508,11 +3954,9 @@ TEST(DeltaDatabaseTest, OrderedCurrentStateSurvivesReopenAndPrivateKeyMoveAbort)
     RunSql(*db, local, "begin;");
     RunSql(*db, local, "update t set k = 3 where k = 1;");
     EXPECT_TRUE(Query(*db, local, "select v from t where k = 1;").rows.empty());
-    EXPECT_EQ(Query(*db, local, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, local, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
     RunSql(*db, local, "rollback;");
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows,
-              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
     EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 3;").rows.empty());
 
     RunSql(*db, setup, "update t set k = 3 where k = 1;");
@@ -2521,8 +3965,7 @@ TEST(DeltaDatabaseTest, OrderedCurrentStateSurvivesReopenAndPrivateKeyMoveAbort)
     db = deltakernel::DeltaDatabase::Open(temp.path());
     EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 1;").rows.empty());
     EXPECT_TRUE(Query(*db, fresh, "select v from t where k = 2;").rows.empty());
-    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, fresh, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
 TEST(DeltaDatabaseTest, OrderedDescLimitStreamsReverseAndSurvivesDuplicateFold) {
@@ -2591,9 +4034,8 @@ TEST(DeltaDatabaseTest, DiagnosticsSnapshotQueryCensusBeforeCommitUnlock) {
         ready.wait(lock, [&] { return first_waiting; });
     }
     deltakernel::DeltaSession second;
-    std::thread second_query([&] {
-        EXPECT_EQ(Query(*db, second, "select k from orders order by k desc limit 3;").rows.size(), 3U);
-    });
+    std::thread second_query(
+        [&] { EXPECT_EQ(Query(*db, second, "select k from orders order by k desc limit 3;").rows.size(), 3U); });
     ASSERT_TRUE(WaitForCommitQueueDepth(*db, 2));
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -2612,7 +4054,8 @@ TEST(DeltaDatabaseTest, DiagnosticsSnapshotQueryCensusBeforeCommitUnlock) {
     RunSql(*db, setup, "begin;");
     for (int key = 1; key <= 24; ++key) {
         RunSql(*db, setup, ("insert into sources values(" + std::to_string(key) + ");").c_str());
-        RunSql(*db, setup, ("insert into targets values(" + std::to_string(key) + ", " + std::to_string(key) + ");").c_str());
+        RunSql(*db, setup,
+               ("insert into targets values(" + std::to_string(key) + ", " + std::to_string(key) + ");").c_str());
     }
     RunSql(*db, setup, "commit;");
     RunSql(*db, setup, "create index targets_k on targets(k);");
@@ -2631,10 +4074,11 @@ TEST(DeltaDatabaseTest, DiagnosticsSnapshotQueryCensusBeforeCommitUnlock) {
     const auto join_before = db->QueryDiagnosticsForTest();
     deltakernel::DeltaSession first_join;
     std::thread first_join_query([&] {
-        EXPECT_EQ(Query(*db, first_join,
-                        "select count(targets.v) from sources, targets where sources.k = targets.k and sources.k <= 12;")
-                      .rows[0][0],
-                  "12");
+        EXPECT_EQ(
+            Query(*db, first_join,
+                  "select count(targets.v) from sources, targets where sources.k = targets.k and sources.k <= 12;")
+                .rows[0][0],
+            "12");
     });
     {
         std::unique_lock<std::mutex> lock(mutex);
@@ -2678,10 +4122,10 @@ TEST(DeltaDatabaseTest, DiagnosticsReportRoutesRatherThanQueryResults) {
     RunSql(*db, session, "create table right_rows(k int);");
     RunSql(*db, session, "insert into left_rows values(1);");
     const auto before_join = db->QueryDiagnosticsForTest();
-    EXPECT_EQ(Query(*db, session,
-                    "select count(right_rows.k) from left_rows, right_rows where left_rows.k = right_rows.k;")
-                  .rows[0][0],
-              "0");
+    EXPECT_EQ(
+        Query(*db, session, "select count(right_rows.k) from left_rows, right_rows where left_rows.k = right_rows.k;")
+            .rows[0][0],
+        "0");
     const auto after_join = db->QueryDiagnosticsForTest();
     EXPECT_EQ(after_join[2] - before_join[2], 0U);
     EXPECT_EQ(after_join[3] - before_join[3], 1U); // Empty right side still selected fallback.
@@ -3231,8 +4675,7 @@ TEST(DeltaDatabaseTest, V3SidecarUsesFourByteOrdinalForSparseLocalIds) {
     EXPECT_EQ(count, 2U);
     EXPECT_EQ(ReadLeAt<uint64_t>(header, 56), row_order_offset + count * 4);
     EXPECT_EQ(ReadLeAt<uint64_t>(header, 56) - row_order_offset, 8U);
-    EXPECT_EQ(Query(*db, session, "select v from t where k = 3;").rows,
-              (std::vector<std::vector<std::string>>{{"3"}}));
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"3"}}));
     EXPECT_TRUE(Query(*db, session, "select v from t where k = 2;").rows.empty());
 }
 
@@ -3317,6 +4760,31 @@ TEST(DeltaDatabaseTest, PreparedProgramExecutesTypedParametersWithoutTreeClone) 
     EXPECT_FALSE(db->ExecutePrepared(*program, parameters, session, nullptr));
     EXPECT_EQ(Query(*db, session, "select amount from typed where id = 7;").rows,
               (std::vector<std::vector<std::string>>{{"1073741824"}})); // 2.0f bits
+}
+
+TEST(DeltaDatabaseTest, PreparedProgramRejectsCatalogMutation) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table typed(id int);");
+    auto old_program =
+        db->CompilePrepared(ast::parse_sql("select id from typed where id = $1;"), {deltakernel::DeltaValueType::Int});
+    ASSERT_TRUE(old_program);
+
+    deltakernel::DeltaSession ddl_session;
+    std::thread ddl([&] { RunSql(*db, ddl_session, "create index typed_id on typed(id);"); });
+    ddl.join();
+
+    deltakernel::DeltaParameterFrame parameters(1);
+    parameters[0].type = deltakernel::DeltaValueType::Int;
+    parameters[0].present = true;
+    parameters[0].integer = 1;
+    EXPECT_THROW(db->ExecutePrepared(*old_program, parameters, setup, nullptr), std::runtime_error);
+
+    auto new_program =
+        db->CompilePrepared(ast::parse_sql("select id from typed where id = $1;"), {deltakernel::DeltaValueType::Int});
+    ASSERT_TRUE(new_program);
+    EXPECT_TRUE(db->ExecutePrepared(*new_program, parameters, setup, nullptr));
 }
 
 TEST(DeltaDatabaseTest, PreparedProgramRejectsRuntimeLimitAndOffset) {

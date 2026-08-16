@@ -174,6 +174,33 @@ TEST(EpochSiEngineTest, SnapshotPointScanReadYourWritesAndAbort) {
     engine.Abort(current);
 }
 
+TEST(EpochSiEngineTest, PrivateWritesStayOrderedAcrossPointScanCommitAndRecovery) {
+    EpochSiEngine engine(Base());
+    auto txn = engine.Begin();
+    engine.PutImage(txn, {kAccounts, 2}, test_row::Make(kAccounts, "b", 202));
+    engine.PutImage(txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 101));
+    const RowId inserted = engine.InsertImage(txn, kAccounts, test_row::Make(kAccounts, "c", 303));
+    ASSERT_TRUE(engine.Read(txn, {kAccounts, 1}).has_value());
+    ASSERT_TRUE(engine.Read(txn, {kAccounts, 2}).has_value());
+    ASSERT_EQ(test_row::Value(*engine.Read(txn, inserted)), 303);
+    engine.Erase(txn, inserted);
+
+    const auto rows = engine.Scan(txn, kAccounts);
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(rows[0].first, (RowId{kAccounts, 1}));
+    EXPECT_EQ(rows[1].first, (RowId{kAccounts, 2}));
+    EXPECT_EQ(test_row::Value(rows[0].second), 101);
+    EXPECT_EQ(test_row::Value(rows[1].second), 202);
+
+    ASSERT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+    auto recovered = EpochSiEngine::Recover(Base(), engine.recovery_wal_image_for_test());
+    auto check = recovered.Begin();
+    EXPECT_EQ(test_row::Value(*recovered.Read(check, {kAccounts, 1})), 101);
+    EXPECT_EQ(test_row::Value(*recovered.Read(check, {kAccounts, 2})), 202);
+    EXPECT_FALSE(recovered.Read(check, inserted).has_value());
+    recovered.Abort(check);
+}
+
 TEST(EpochSiEngineTest, ImmutableScanUsesSnapshotVersionsAndDecodedBaseRows) {
     TempDbDirectory temp;
     auto db = CheckpointDb::Create(temp.path(), {});

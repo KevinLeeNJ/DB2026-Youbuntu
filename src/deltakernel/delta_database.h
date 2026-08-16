@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <condition_variable>
@@ -17,12 +18,15 @@
 #include <set>
 #include <tuple>
 #include <vector>
+#include <sys/types.h>
 
 #include "checkpoint_db.h"
 #include "common/context.h"
 #include "parser/ast.h"
 
 namespace deltakernel {
+
+class DeltaSnapshotTestPeer;
 
 enum class DeltaValueType : uint8_t { Int, Float, Char };
 struct DeltaParameter {
@@ -85,9 +89,6 @@ struct DeltaSession {
     DeltaOverlay overlay;
     DeltaOverlay removed_overlay;
     std::set<epoch_si_poc::RowId> private_insert_ids;
-    // Held for the lifetime of an explicit transaction so DDL/checkpoint/LOAD
-    // cannot pass between its writes and durable commit.
-    std::optional<std::shared_lock<std::shared_mutex>> admission;
 
 private:
     friend class DeltaDatabase;
@@ -128,6 +129,10 @@ private:
 
 class DeltaDatabase {
 public:
+    enum class MaintenanceResult : uint8_t { kReclaimed, kCheckpointed, kCancelled };
+    static constexpr size_t kMaintenanceSoftWalThreshold = size_t{512} << 20;
+    static constexpr size_t kMaintenanceHardWalThreshold = size_t{1} << 30;
+
     ~DeltaDatabase();
     static std::unique_ptr<DeltaDatabase> Create(const std::string& directory);
     static std::unique_ptr<DeltaDatabase> Open(const std::string& directory);
@@ -143,6 +148,10 @@ public:
                                          const std::vector<DeltaValueType>& declared_parameters) const;
     void Abort(DeltaSession& session) noexcept;
     void Checkpoint();
+    MaintenanceResult MaintenanceTick();
+    void StopMaintenance() noexcept;
+    void SetMaintenanceThresholdsForTest(size_t soft_bytes, size_t hard_bytes);
+    void SetMaintenanceCooldownForTest(std::chrono::milliseconds cooldown);
     bool DiagnosticsEnabled() const noexcept {
         return diagnostics_ != nullptr;
     }
@@ -167,6 +176,9 @@ public:
     }
     void SetExecutionWriterWaitHookForTest(std::function<void()> hook) {
         execution_writer_wait_hook_for_test_ = std::move(hook);
+    }
+    void SetSnapshotBuilderWaitHookForTest(std::function<void()> hook) {
+        snapshot_builder_wait_hook_for_test_ = std::move(hook);
     }
     void SetStateWriterWaitHookForTest(std::function<void()> hook) {
         state_writer_wait_hook_for_test_ = std::move(hook);
@@ -214,6 +226,7 @@ public:
     std::optional<uint64_t> SidecarLiveTailForTest(epoch_si_poc::ConstraintId constraint_id) const;
 
 private:
+    friend class DeltaSnapshotTestPeer;
     bool ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session, QueryResultSink* sink,
                      uint64_t expected_catalog_generation = 0);
     enum class ColumnType : uint8_t { Int, Float, Char };
@@ -246,6 +259,46 @@ private:
         std::vector<uint8_t> key;
         uint64_t local_id;
     };
+    struct StagedSidecarArtifact {
+        int directory_fd = -1;
+        std::string basename;
+        std::string path;
+        dev_t device = 0;
+        ino_t inode = 0;
+        epoch_si_poc::TableId table_id = 0;
+        epoch_si_poc::ConstraintId constraint_id = 0;
+        uint64_t generation = 0;
+        epoch_si_poc::Epoch snapshot_epoch = 0;
+        uint64_t count = 0;
+        StagedSidecarArtifact() = default;
+        StagedSidecarArtifact(int directory_fd, std::string basename, std::string path, dev_t device, ino_t inode,
+                              epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id,
+                              uint64_t generation, epoch_si_poc::Epoch snapshot_epoch, uint64_t count)
+            : directory_fd(directory_fd), basename(std::move(basename)), path(std::move(path)), device(device),
+              inode(inode), table_id(table_id), constraint_id(constraint_id), generation(generation),
+              snapshot_epoch(snapshot_epoch), count(count) {}
+        ~StagedSidecarArtifact();
+        StagedSidecarArtifact(const StagedSidecarArtifact&) = delete;
+        StagedSidecarArtifact& operator=(const StagedSidecarArtifact&) = delete;
+        StagedSidecarArtifact(StagedSidecarArtifact&& other) noexcept;
+        StagedSidecarArtifact& operator=(StagedSidecarArtifact&& other) noexcept;
+
+    private:
+        friend class DeltaDatabase;
+        void Promote(const std::string& final_basename, const std::string& directory);
+        int OpenOwned() const;
+        void Keep() noexcept;
+        void Cleanup() noexcept;
+    };
+    struct StreamingSidecarBuilder;
+    struct StreamingSidecarDeleter {
+        void operator()(StreamingSidecarBuilder*) const noexcept;
+    };
+    using StreamingSidecarPtr = std::unique_ptr<StreamingSidecarBuilder, StreamingSidecarDeleter>;
+    StreamingSidecarPtr BeginStreamingSidecar(const TableSchema&, const Index&, uint64_t, epoch_si_poc::Epoch);
+    static void AddStreamingSidecar(StreamingSidecarBuilder*, std::string_view, uint64_t);
+    static StagedSidecarArtifact FinishStreamingSidecar(StreamingSidecarBuilder*,
+                                                        const std::function<bool()>& progress = {});
     struct SidecarDescriptor {
         epoch_si_poc::TableId table_id = 0;
         epoch_si_poc::ConstraintId constraint_id = 0;
@@ -296,6 +349,11 @@ private:
         bool done = false;
         std::condition_variable ready;
     };
+    struct RetiredSource {
+        std::weak_ptr<const epoch_si_poc::SourceGeneration> source;
+        uint64_t installed_source_identity = 0;
+        std::vector<epoch_si_poc::CheckpointDb::TableRef> tables;
+    };
     struct ExecutionCensus {
         bool captured = false;
         size_t base_entries = 0;
@@ -344,9 +402,24 @@ private:
     void LoadCsv(const ast::LoadStmt& load, DeltaSession& session);
     void BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
                        uint64_t generation);
+    StagedSidecarArtifact BuildStagedSidecarForTest(const TableSchema& schema, const Index& index,
+                                                    const std::vector<SidecarBuildEntry>& entries, uint64_t generation,
+                                                    uint64_t snapshot_epoch);
     bool ValidateSidecar(const TableSchema& schema, const Index& index);
+    bool ValidateSidecarFd(const TableSchema& schema, const Index& index, int fd, bool install,
+                           std::optional<uint64_t> expected_generation, std::optional<uint64_t> expected_snapshot_epoch,
+                           std::optional<std::pair<dev_t, ino_t>> expected_identity = std::nullopt);
+    SidecarDescriptor PrepareSidecarDescriptor(const TableSchema& schema, const Index& index,
+                                               const StagedSidecarArtifact& artifact);
+    void InstallSnapshotSidecars(std::map<epoch_si_poc::ConstraintId, SidecarDescriptor>& replacements) noexcept;
+    void CleanupGenerationSidecarOrphans() noexcept;
+    void CleanupStagedSidecarOrphans() noexcept;
     void RebuildSidecars(const TableSchema& schema);
     void CheckpointSidecars();
+    void BuildSnapshotBases();
+    void BuildSnapshotBasesLocked();
+    void CutWalOnlyLocked();
+    void TryReclaimRetiredGenerations() noexcept;
     std::vector<epoch_si_poc::RowId> IndexedCandidates(DeltaSession& session, const TableSchema& schema,
                                                        const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                                                        bool* usable, const IndexEqualities* equalities = nullptr,
@@ -435,12 +508,20 @@ private:
     std::atomic<uint64_t> ordered_early_stop_{0};
     std::atomic<uint64_t> ordered_stream_{0};
     std::atomic<uint64_t> ordered_materialize_{0};
+    // Maintenance-only counters; no Execute path updates these fields.
+    std::atomic<uint64_t> maintenance_busy_samples_{0};
+    std::atomic<uint64_t> maintenance_pause_ns_{0};
+    std::atomic<uint64_t> maintenance_forced_progress_{0};
+    std::atomic<uint64_t> maintenance_builder_wall_ns_{0};
+    std::atomic<uint64_t> maintenance_debt_before_bytes_{0};
+    std::atomic<uint64_t> maintenance_debt_after_bytes_{0};
     epoch_si_poc::CheckpointDb db_;
     Catalog tables_;
     std::map<epoch_si_poc::TableId, const TableSchema*> table_by_id_;
     epoch_si_poc::TableId next_table_id_ = 1;
     epoch_si_poc::ConstraintId next_constraint_id_ = 1;
     uint64_t catalog_generation_ = 1;
+    std::atomic<uint64_t> catalog_generation_snapshot_{1};
     bool fail_catalog_save_for_test_ = false;
     bool fail_catalog_post_rename_for_test_ = false;
     bool fail_commit_enqueue_for_test_ = false;
@@ -449,22 +530,44 @@ private:
     std::function<void()> execute_lock_hook_for_test_;
     std::function<void()> execute_blocked_hook_for_test_;
     std::function<void()> execution_writer_wait_hook_for_test_;
+    std::function<void()> snapshot_builder_wait_hook_for_test_;
     std::function<void()> state_writer_wait_hook_for_test_;
     std::function<void()> abort_lock_attempt_hook_for_test_;
     std::function<void()> commit_batch_hook_for_test_;
     std::function<void()> commit_install_hook_for_test_;
     std::function<void()> commit_sync_hook_for_test_;
     std::function<void()> commit_reacquire_hook_for_test_;
+    std::function<void()> snapshot_io_hook_for_test_;
+    std::function<void(
+        epoch_si_poc::Epoch,
+        const std::map<epoch_si_poc::TableId, std::vector<std::pair<epoch_si_poc::RowId, epoch_si_poc::Row>>>&)>
+        snapshot_rows_hook_for_test_;
+    std::function<void(size_t)> sidecar_finish_hook_for_test_;
+    std::function<void(epoch_si_poc::TableId, const std::vector<std::array<uint64_t, 4>>&)>
+        sidecar_artifact_hook_for_test_;
+    std::function<void()> retired_state_release_hook_for_test_;
     epoch_si_poc::CheckpointCrashPoint rotation_crash_point_for_test_ = epoch_si_poc::CheckpointCrashPoint::kNone;
     mutable std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> sidecars_;
     CommittedOverlay overlay_;
+    CommittedOverlay frozen_overlay_;
     CommittedOverlay current_overlay_;
+    CommittedOverlay frozen_current_overlay_;
+    std::vector<RetiredSource> retired_sources_;
+    epoch_si_poc::EpochSiEngine::GenerationCollapseCursor retired_collapse_cursor_;
+    bool retired_tables_collected_ = false;
     std::atomic<uint64_t> current_base_row_order_comparisons_{0};
     size_t sidecar_validation_count_ = 0;
     mutable std::mutex execution_turnstile_;
     std::shared_mutex execution_gate_;
     mutable std::mutex commit_mutex_;
     mutable std::mutex commit_epoch_gate_;
+    std::mutex snapshot_builder_mutex_;
+    std::atomic<bool> maintenance_cancel_{false};
+    size_t maintenance_next_trigger_bytes_ = kMaintenanceSoftWalThreshold;
+    size_t maintenance_soft_threshold_ = kMaintenanceSoftWalThreshold;
+    size_t maintenance_hard_threshold_ = kMaintenanceHardWalThreshold;
+    std::chrono::steady_clock::time_point maintenance_cooldown_until_{};
+    std::chrono::milliseconds maintenance_cooldown_{std::chrono::minutes(3)};
     std::deque<std::shared_ptr<CommitTicket>> commit_queue_;
     std::condition_variable commit_slot_available_;
     bool commit_leader_ = false;

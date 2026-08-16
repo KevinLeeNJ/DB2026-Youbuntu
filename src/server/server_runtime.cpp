@@ -40,11 +40,37 @@ void ServerRuntime::client_handler(int fd, std::uint64_t worker_id) {
 }
 
 void ServerRuntime::start_checkpoint() {
-    if (database_.is_delta()) {
-        return;
-    }
     checkpoint_stop_.store(false, std::memory_order_release);
     checkpoint_thread_ = std::thread([this] {
+        if (database_.is_delta()) {
+            auto retry_delay = std::chrono::milliseconds(100);
+            while (!checkpoint_stop_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> wait_lock(checkpoint_mutex_);
+                checkpoint_cv_.wait_for(wait_lock, std::chrono::seconds(1),
+                                        [this] { return checkpoint_stop_.load(std::memory_order_acquire); });
+                if (checkpoint_stop_.load(std::memory_order_acquire))
+                    break;
+                wait_lock.unlock();
+                try {
+                    database_.delta_database->MaintenanceTick();
+                    retry_delay = std::chrono::milliseconds(100);
+                } catch (const std::exception& error) {
+                    LOG_WARN("delta maintenance tick failed: %s", error.what());
+                    std::unique_lock<std::mutex> retry_lock(checkpoint_mutex_);
+                    checkpoint_cv_.wait_for(retry_lock, retry_delay,
+                                            [this] { return checkpoint_stop_.load(std::memory_order_acquire); });
+                    retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(60000));
+                } catch (...) {
+                    LOG_WARN("delta maintenance tick failed with unknown exception");
+                    std::unique_lock<std::mutex> retry_lock(checkpoint_mutex_);
+                    checkpoint_cv_.wait_for(retry_lock, retry_delay,
+                                            [this] { return checkpoint_stop_.load(std::memory_order_acquire); });
+                    retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(60000));
+                }
+            }
+            database_.delta_database->StopMaintenance();
+            return;
+        }
         auto& legacy = database_.legacy();
         CheckpointManager checkpoint_mgr(&legacy.txn_manager, &legacy.sm_manager, &legacy.log_manager);
         while (!checkpoint_stop_.load(std::memory_order_acquire)) {
@@ -154,6 +180,8 @@ void ServerRuntime::run(std::uint16_t port) {
 }
 
 void ServerRuntime::stop() {
+    if (database_.is_delta())
+        database_.delta_database->StopMaintenance();
     if (listener_ != -1) {
         ::close(listener_);
         listener_ = -1;
@@ -174,6 +202,7 @@ void ServerRuntime::stop() {
         }
     }
     checkpoint_stop_.store(true, std::memory_order_release);
+    checkpoint_cv_.notify_all();
     if (checkpoint_thread_.joinable()) {
         checkpoint_thread_.join();
     }

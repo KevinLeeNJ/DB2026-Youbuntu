@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <csignal>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <thread>
@@ -52,5 +53,7 @@ private:
     std::vector<Worker> workers_;
     std::uint64_t next_worker_id_{0};
     std::atomic<bool> checkpoint_stop_{false};
+    std::mutex checkpoint_mutex_;
+    std::condition_variable checkpoint_cv_;
     std::thread checkpoint_thread_;
 };

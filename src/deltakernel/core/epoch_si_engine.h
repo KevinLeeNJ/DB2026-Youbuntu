@@ -14,7 +14,14 @@
 #include <stdexcept>
 #include <vector>
 
+namespace deltakernel {
+class DeltaDatabase;
+class DeltaSnapshotTestPeer;
+} // namespace deltakernel
+
 namespace epoch_si_poc {
+
+class SnapshotCursorTestPeer;
 
 class FileWal;
 class CheckpointDb;
@@ -67,6 +74,16 @@ using Row = RowImage;
 
 using BaseImage = std::map<RowId, Row>;
 using ImmutableTables = std::map<TableId, std::shared_ptr<const ImmutableTable>>;
+
+// A source generation is the complete immutable read source for one published
+// base.  It is shared by transactions and pins so a source switch never copies
+// the legacy image or the table directory into each reader.
+struct SourceGeneration {
+    uint64_t identity = 0;
+    Epoch base_epoch = 0;
+    std::shared_ptr<const BaseImage> base;
+    std::shared_ptr<const ImmutableTables> immutable_tables;
+};
 
 // Installed only when RMDB_DELTA_DIAGNOSTICS is set.  The normal path keeps this
 // pointer null, so it performs no counter writes.
@@ -136,7 +153,7 @@ public:
     size_t index_bytes() const {
         return (block_first_ids_.size() + block_offsets_.size()) * sizeof(uint64_t);
     }
-    std::optional<Row> Read(uint64_t local_id) const;
+    std::optional<Row> Read(uint64_t local_id, std::vector<uint8_t>* scratch = nullptr) const;
     void Visit(const std::function<void(uint64_t, Row&&)>& visitor) const;
     void ValidateRowsForInstall();
     void SetDiagnostics(std::shared_ptr<DeltaDiagnostics> diagnostics) const;
@@ -148,6 +165,7 @@ public:
 
 private:
     friend class EpochSiEngine;
+    std::optional<std::pair<uint64_t, Row>> ReadAtOrAfter(uint64_t local_id) const;
     std::optional<bool> RecoveryContains(uint64_t local_id) const;
 
     std::string path_;
@@ -193,6 +211,9 @@ public:
 class EpochSiEngine {
 private:
     friend class CheckpointDb;
+    friend class SnapshotCursorTestPeer;
+    friend class deltakernel::DeltaDatabase;
+    friend class deltakernel::DeltaSnapshotTestPeer;
     struct PendingCommit;
     struct OwnerState {
         struct SnapshotSlot {
@@ -211,7 +232,118 @@ private:
         std::atomic<bool> valid{true};
     };
 
+    struct SnapshotAllocators {
+        std::map<TableId, uint64_t> next_row_id;
+    };
+
+    class SnapshotPin {
+    public:
+        SnapshotPin() = default;
+        ~SnapshotPin();
+        SnapshotPin(const SnapshotPin&) = delete;
+        SnapshotPin& operator=(const SnapshotPin&) = delete;
+        SnapshotPin(SnapshotPin&& other) noexcept;
+        SnapshotPin& operator=(SnapshotPin&& other) noexcept;
+
+        Epoch epoch() const noexcept {
+            return epoch_;
+        }
+        uint64_t next_local_id(TableId table_id) const noexcept;
+        explicit operator bool() const noexcept {
+            return owner_ != nullptr;
+        }
+
+        SnapshotPin Clone() const;
+
+    private:
+        friend class EpochSiEngine;
+        friend class SnapshotCursor;
+        friend class SnapshotCursorTestPeer;
+        friend class deltakernel::DeltaSnapshotTestPeer;
+        SnapshotPin(std::shared_ptr<OwnerState> owner, size_t slot, Epoch epoch,
+                    std::shared_ptr<const SourceGeneration> source,
+                    std::shared_ptr<const SnapshotAllocators> allocators, const EpochSiEngine* engine)
+            : owner_(std::move(owner)), slot_(slot), epoch_(epoch), source_(std::move(source)),
+              allocators_(std::move(allocators)), engine_(engine) {}
+
+        std::shared_ptr<OwnerState> owner_;
+        size_t slot_ = std::numeric_limits<size_t>::max();
+        Epoch epoch_ = 0;
+        std::shared_ptr<const SourceGeneration> source_;
+        std::shared_ptr<const SnapshotAllocators> allocators_;
+        const EpochSiEngine* engine_ = nullptr;
+    };
+
+    struct SnapshotCandidate {
+        RowId id;
+        std::optional<Row> state_row;
+        bool state_authoritative = false;
+        std::optional<Row> legacy_row;
+    };
+
+    struct SnapshotStateBatch {
+        std::vector<SnapshotCandidate> candidates;
+        bool has_more = false;
+    };
+
+    struct SnapshotCursorBatch {
+        std::vector<std::pair<RowId, Row>> rows;
+        bool has_more = false;
+        size_t probes = 0;
+    };
+
+    class SnapshotCursor {
+    public:
+        SnapshotCursor() = default;
+        ~SnapshotCursor() = default;
+        SnapshotCursor(const SnapshotCursor&) = delete;
+        SnapshotCursor& operator=(const SnapshotCursor&) = delete;
+        SnapshotCursor(SnapshotCursor&&) noexcept = default;
+        SnapshotCursor& operator=(SnapshotCursor&&) noexcept = default;
+
+    private:
+        friend class EpochSiEngine;
+        friend class deltakernel::DeltaDatabase;
+        friend class SnapshotCursorTestPeer;
+        SnapshotCursor(SnapshotPin pin, TableId table_id, size_t max_rows, size_t max_bytes, size_t max_probes)
+            : pin_(std::move(pin)), table_id_(table_id), max_rows_(max_rows), max_bytes_(max_bytes),
+              max_probes_(max_probes) {}
+        SnapshotStateBatch ProbeState() const;
+        SnapshotCursorBatch FinishBatch(SnapshotStateBatch state);
+
+        SnapshotPin pin_;
+        TableId table_id_ = 0;
+        size_t max_rows_ = 0;
+        size_t max_bytes_ = 0;
+        uint64_t probe_position_ = 0;
+        bool started_ = false;
+        bool exhausted_ = false;
+        size_t max_probes_ = 0;
+    };
+
+    SnapshotPin PinSnapshot() const;
+    SnapshotCursor BeginSnapshotCursor(const SnapshotPin& pin, TableId table_id, size_t max_rows, size_t max_bytes,
+                                       size_t max_probes) const;
+
 public:
+    class PreparedSourcePublication {
+    public:
+        PreparedSourcePublication() = default;
+        ~PreparedSourcePublication() = default;
+        PreparedSourcePublication(const PreparedSourcePublication&) = delete;
+        PreparedSourcePublication& operator=(const PreparedSourcePublication&) = delete;
+        PreparedSourcePublication(PreparedSourcePublication&& other) noexcept;
+        PreparedSourcePublication& operator=(PreparedSourcePublication&& other) noexcept;
+
+    private:
+        friend class EpochSiEngine;
+        EpochSiEngine* engine_ = nullptr;
+        uint64_t expected_identity_ = 0;
+        std::shared_ptr<const SourceGeneration> source_;
+        std::map<TableId, uint64_t> next_row_id_;
+        std::set<TableId> dirty_tables_;
+    };
+
     // The caller holds the engine's external state lock while preparing and
     // publishing.  Syncing the already-built frame intentionally needs none.
     class PreparedCommit {
@@ -243,14 +375,18 @@ public:
 
     private:
         friend class EpochSiEngine;
+        friend class deltakernel::DeltaDatabase;
+        friend class SnapshotCursorTestPeer;
         void Finish() noexcept;
         std::shared_ptr<OwnerState> owner_;
         size_t snapshot_slot_ = std::numeric_limits<size_t>::max();
         Epoch start_epoch_ = 0;
         bool active_ = false;
         bool prepared_ = false;
-        std::map<RowId, Row> writes_;
+        std::shared_ptr<const SourceGeneration> source_;
+        std::vector<std::pair<RowId, Row>> writes_;
         std::set<RowId> inserts_;
+        mutable std::vector<uint8_t> immutable_read_scratch_;
     };
 
     explicit EpochSiEngine(BaseImage base, Epoch base_epoch = 0);
@@ -308,6 +444,9 @@ public:
     size_t explicit_row_metadata_count() const {
         return OccupiedRowStateCount();
     }
+    size_t row_state_chunk_count_for_test() const {
+        return row_states_.size();
+    }
     size_t last_publication_staged_entries_for_test() const {
         return last_publication_staged_entries_;
     }
@@ -338,17 +477,17 @@ public:
     BaseImage MaterializePublished() const;
     bool CanInstallPristineTable(TableId table_id) const;
     size_t resident_base_row_count() const {
-        return base_.size();
+        return current_source_->base->size();
     }
     size_t immutable_index_bytes() const;
     size_t immutable_read_probes_for_test() const;
     std::optional<bool> immutable_recovery_membership_for_test(RowId row_id) const {
-        const auto table = immutable_tables_.find(row_id.table_id);
-        return table == immutable_tables_.end() ? std::optional<bool>(false)
-                                                : table->second->RecoveryContains(row_id.local_id);
+        const auto& tables = *current_source_->immutable_tables;
+        const auto table = tables.find(row_id.table_id);
+        return table == tables.end() ? std::optional<bool>(false) : table->second->RecoveryContains(row_id.local_id);
     }
     size_t immutable_table_count() const {
-        return immutable_tables_.size();
+        return current_source_->immutable_tables->size();
     }
     void VisitLatestVersions(const std::function<void(RowId, const Row&)>& visitor) const;
     void VisitLatestVersionHeads(const std::function<void(RowId, Epoch, const Row&)>& visitor) const;
@@ -399,6 +538,54 @@ private:
     };
     using RowStateDirectory = std::map<RowStateChunkKey, std::unique_ptr<RowStateChunk>>;
 
+    struct GenerationCollapseAction {
+        RowId id;
+        Epoch cut = 0;
+        size_t retained = 0;
+        size_t removed = 0;
+        bool clear_state = false;
+    };
+    struct GenerationCollapseCursor {
+        TableId table_id = 0;
+        uint64_t chunk_id = 0;
+        bool done = false;
+    };
+    class PreparedGenerationCollapse {
+    public:
+        PreparedGenerationCollapse() = default;
+        PreparedGenerationCollapse(const PreparedGenerationCollapse&) = delete;
+        PreparedGenerationCollapse& operator=(const PreparedGenerationCollapse&) = delete;
+        PreparedGenerationCollapse(PreparedGenerationCollapse&&) noexcept = default;
+        PreparedGenerationCollapse& operator=(PreparedGenerationCollapse&&) noexcept = default;
+
+    private:
+        friend class EpochSiEngine;
+        friend class deltakernel::DeltaDatabase;
+        EpochSiEngine* engine_ = nullptr;
+        uint64_t expected_source_identity_ = 0;
+        size_t expected_version_count_ = 0;
+        size_t removed_versions_ = 0;
+        GenerationCollapseCursor next_;
+        std::vector<GenerationCollapseAction> actions_;
+        std::vector<RowStateChunkKey> empty_chunks_;
+        std::vector<std::unique_ptr<Version>> retired_versions_;
+        std::vector<RowStateDirectory::node_type> retired_chunks_;
+    };
+    class RetiredGenerationState {
+    public:
+        RetiredGenerationState() = default;
+        RetiredGenerationState(const RetiredGenerationState&) = delete;
+        RetiredGenerationState& operator=(const RetiredGenerationState&) = delete;
+        RetiredGenerationState(RetiredGenerationState&&) noexcept = default;
+        RetiredGenerationState& operator=(RetiredGenerationState&&) noexcept = default;
+
+    private:
+        friend class EpochSiEngine;
+        friend class deltakernel::DeltaDatabase;
+        std::vector<std::unique_ptr<Version>> versions_;
+        std::vector<RowStateDirectory::node_type> chunks_;
+    };
+
     static RowStateChunkKey ChunkKey(RowId row_id) {
         return {row_id.table_id, row_id.local_id / kRowStateChunkSize};
     }
@@ -434,7 +621,7 @@ private:
         bool published = false;
     };
     struct PreparedTableInstall {
-        ImmutableTables tables;
+        std::shared_ptr<const SourceGeneration> source;
         std::map<ConstraintClaim, Epoch> last_claim_epoch;
         std::map<ConstraintClaim, RowId> claim_owner;
         std::map<TableId, uint64_t> next_row_id;
@@ -457,7 +644,9 @@ private:
     void RecoverFileFrames(FileWal& file, bool allow_torn_tail);
     static DecodedFrameHeader DecodeFrameHeader(const std::vector<uint8_t>& wal_image, size_t frame_start);
     void RecoverFrame(const std::vector<uint8_t>& wal_image, size_t frame_start, const DecodedFrameHeader& header);
-    std::optional<Row> ReadCommitted(RowId row_id, Epoch snapshot) const;
+    std::optional<Row> ReadCommitted(RowId row_id, Epoch snapshot,
+                                     const std::shared_ptr<const SourceGeneration>& source,
+                                     std::vector<uint8_t>* immutable_scratch = nullptr) const;
     bool RecoveryRowExists(RowId row_id) const;
     Epoch LastExistingRowEpoch(RowId row_id) const;
     static std::vector<uint8_t> EncodeFrame(Epoch epoch, const std::vector<Txn*>& txns,
@@ -469,6 +658,15 @@ private:
     void PruneTouchedVersions(PreparedState& prepared, Epoch low_watermark) noexcept;
     PreparedTableInstall PrepareTableInstall(std::shared_ptr<const ImmutableTable> table) const;
     void InstallTablePrepared(PreparedTableInstall&& prepared) noexcept;
+    PreparedSourcePublication PrepareSourcePublication(uint64_t expected_identity, ImmutableTables replacements) const;
+    PreparedSourcePublication PrepareSourcePublication(uint64_t expected_identity, ImmutableTables replacements,
+                                                       Epoch base_epoch) const;
+    void ValidatePreparedSourcePublication(const PreparedSourcePublication& prepared) const;
+    void InstallPreparedSource(PreparedSourcePublication& prepared) noexcept;
+    PreparedGenerationCollapse PrepareGenerationCollapseStep(const std::map<TableId, Epoch>& cuts,
+                                                             GenerationCollapseCursor cursor);
+    RetiredGenerationState InstallGenerationCollapse(PreparedGenerationCollapse&& prepared,
+                                                     GenerationCollapseCursor* cursor) noexcept;
     void VisitPublished(TableId table_id, const std::function<void(RowId, const Row&)>& visitor);
     const std::set<TableId>& dirty_tables() const {
         return dirty_tables_;
@@ -477,8 +675,7 @@ private:
     void Poison() noexcept;
     CommitStatus Certify(const Txn& txn, std::set<RowId>& batch_rows, std::set<ConstraintClaim>& batch_claims) const;
 
-    BaseImage base_;
-    ImmutableTables immutable_tables_;
+    std::shared_ptr<const SourceGeneration> current_source_;
     RowStateDirectory row_states_;
     std::map<ConstraintClaim, Epoch> last_claim_epoch_;
     std::map<ConstraintClaim, RowId> claim_owner_;
@@ -487,7 +684,6 @@ private:
     std::mutex row_id_allocator_mutex_;
     std::map<TableId, uint64_t> next_row_id_;
     std::shared_ptr<OwnerState> identity_;
-    Epoch base_epoch_ = 0;
     Epoch published_epoch_ = 0;
     uint64_t next_commit_seq_ = 1;
     size_t version_count_ = 0;

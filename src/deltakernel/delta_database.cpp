@@ -11,18 +11,112 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <thread>
 #include <unistd.h>
+#include <utility>
 
 #include "common/csv.h"
 #include "system/sm_meta.h"
+#include "deltakernel/sidecar_sorter.h"
 
 namespace deltakernel {
+DeltaDatabase::StagedSidecarArtifact::~StagedSidecarArtifact() {
+    Cleanup();
+}
+DeltaDatabase::StagedSidecarArtifact::StagedSidecarArtifact(StagedSidecarArtifact&& other) noexcept
+    : directory_fd(std::exchange(other.directory_fd, -1)), basename(std::move(other.basename)),
+      path(std::move(other.path)), device(other.device), inode(other.inode), table_id(other.table_id),
+      constraint_id(other.constraint_id), generation(other.generation), snapshot_epoch(other.snapshot_epoch),
+      count(other.count) {
+    other.device = 0;
+    other.inode = 0;
+}
+DeltaDatabase::StagedSidecarArtifact&
+DeltaDatabase::StagedSidecarArtifact::operator=(StagedSidecarArtifact&& other) noexcept {
+    if (this == &other)
+        return *this;
+    Cleanup();
+    directory_fd = std::exchange(other.directory_fd, -1);
+    basename = std::move(other.basename);
+    path = std::move(other.path);
+    device = other.device;
+    inode = other.inode;
+    table_id = other.table_id;
+    constraint_id = other.constraint_id;
+    generation = other.generation;
+    snapshot_epoch = other.snapshot_epoch;
+    count = other.count;
+    other.device = 0;
+    other.inode = 0;
+    return *this;
+}
+void DeltaDatabase::StagedSidecarArtifact::Promote(const std::string& final_basename, const std::string& directory) {
+    if (directory_fd < 0 || basename.empty() || final_basename.empty() || final_basename.find('/') != std::string::npos)
+        throw std::logic_error("invalid staged sidecar promotion");
+    std::string next_basename = final_basename;
+    std::string next_path = directory + "/" + final_basename;
+    if (syscall(SYS_renameat2, directory_fd, basename.c_str(), directory_fd, final_basename.c_str(),
+                RENAME_NOREPLACE) != 0)
+        throw std::system_error(errno, std::generic_category(), "promote staged sidecar");
+    basename.swap(next_basename);
+    path.swap(next_path);
+}
+int DeltaDatabase::StagedSidecarArtifact::OpenOwned() const {
+    if (directory_fd < 0 || basename.empty())
+        throw std::logic_error("staged sidecar is unavailable");
+    const int fd = openat(directory_fd, basename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open staged sidecar");
+    struct stat status {};
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_dev != device || status.st_ino != inode) {
+        close(fd);
+        throw std::runtime_error("staged sidecar ownership changed");
+    }
+    return fd;
+}
+void DeltaDatabase::StagedSidecarArtifact::Keep() noexcept {
+    if (directory_fd >= 0)
+        close(directory_fd);
+    directory_fd = -1;
+    basename.clear();
+    path.clear();
+}
+void DeltaDatabase::StagedSidecarArtifact::Cleanup() noexcept {
+    if (directory_fd >= 0 && !basename.empty()) {
+        struct stat at_status {};
+        if (fstatat(directory_fd, basename.c_str(), &at_status, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(at_status.st_mode) && at_status.st_dev == device && at_status.st_ino == inode) {
+            const int fd = openat(directory_fd, basename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (fd >= 0) {
+                struct stat opened {};
+                if (fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) && opened.st_dev == device &&
+                    opened.st_ino == inode)
+                    (void)unlinkat(directory_fd, basename.c_str(), 0);
+                close(fd);
+            }
+        }
+        close(directory_fd);
+    }
+    directory_fd = -1;
+    basename.clear();
+    path.clear();
+    device = 0;
+    inode = 0;
+    table_id = 0;
+    constraint_id = 0;
+    generation = 0;
+    snapshot_epoch = 0;
+    count = 0;
+}
 namespace {
 thread_local const DeltaParameterFrame* active_prepared_parameters = nullptr;
 
@@ -53,6 +147,7 @@ constexpr uint32_t kSidecarRowOrderEntryBytes = 4;
 constexpr uint32_t kSidecarHeaderCrcOffset = 92;
 constexpr size_t kCommitBatchSize = 32;
 constexpr size_t kCommitQueueLimit = 128;
+std::atomic<uint64_t> staged_sidecar_sequence{0};
 
 enum class DiagnosticOperation : size_t { TxnControl, PointDml, ScanJoinAggregate, Other, Count };
 
@@ -154,6 +249,13 @@ template <typename T> void PutLeAt(std::array<uint8_t, kSidecarHeaderBytes>& byt
         bytes[offset + i] = static_cast<uint8_t>(bits >> (i * 8));
 }
 
+template <typename T, size_t N> void PutLeAt(std::array<uint8_t, N>& bytes, size_t offset, T value) {
+    using U = typename std::make_unsigned<T>::type;
+    const U bits = static_cast<U>(value);
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bytes[offset + i] = static_cast<uint8_t>(bits >> (i * 8));
+}
+
 uint64_t AlignUp(uint64_t value, uint64_t alignment) {
     const uint64_t remainder = value % alignment;
     if (remainder == 0)
@@ -222,6 +324,12 @@ std::vector<uint8_t> PrefixSuccessor(std::vector<uint8_t> key) {
         return {};
     ++key.back();
     return key;
+}
+
+std::string SidecarGenerationName(epoch_si_poc::TableId table_id, epoch_si_poc::ConstraintId constraint_id,
+                                  uint64_t generation) {
+    return "deltaidx." + std::to_string(table_id) + "." + std::to_string(constraint_id) + ".g" +
+           std::to_string(generation);
 }
 
 template <typename T> T GetLe(const std::vector<uint8_t>& bytes, size_t& offset) {
@@ -635,8 +743,10 @@ void DeltaDatabase::EnableDiagnosticsForTest() {
 std::array<uint64_t, 6> DeltaDatabase::QueryDiagnosticsForTest() const {
     return {sidecar_base_entries_.load(std::memory_order_relaxed),
             join_parameterized_probes_.load(std::memory_order_relaxed),
-            join_parameterized_.load(std::memory_order_relaxed), join_fallback_.load(std::memory_order_relaxed),
-            ordered_stream_.load(std::memory_order_relaxed), ordered_materialize_.load(std::memory_order_relaxed)};
+            join_parameterized_.load(std::memory_order_relaxed),
+            join_fallback_.load(std::memory_order_relaxed),
+            ordered_stream_.load(std::memory_order_relaxed),
+            ordered_materialize_.load(std::memory_order_relaxed)};
 }
 
 std::array<uint64_t, 5> DeltaDatabase::RouteDiagnosticsForTest() const {
@@ -701,123 +811,128 @@ void DeltaDatabase::ReportDiagnostics(bool periodic) const noexcept {
     }
     const auto load = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
     const uint64_t phase_code = load(commit_phase_);
-    constexpr std::array<const char*, 6> kCommitPhaseNames = {"idle", "initial_wait", "prepare", "sync",
-                                                               "publish_wait", "publish"};
+    constexpr std::array<const char*, 6> kCommitPhaseNames = {"idle", "initial_wait", "prepare",
+                                                              "sync", "publish_wait", "publish"};
     const char* phase_name = phase_code < kCommitPhaseNames.size() ? kCommitPhaseNames[phase_code] : "unknown";
     std::fprintf(stderr, "DELTA_PREPARED_DIAGNOSTICS prepared_native_count=%llu prepared_fallback_count=%llu\n",
                  static_cast<unsigned long long>(load(prepared_native_count_)),
                  static_cast<unsigned long long>(load(prepared_fallback_count_)));
-    std::fprintf(stderr,
-                 "DELTA_DIAGNOSTICS report=%s prepared_clone_count=%llu prepared_clone_ns=%llu "
-                 "execute_txn_calls=%llu execute_point_dml_calls=%llu execute_scan_join_aggregate_calls=%llu "
-                 "execute_other_calls=%llu execute_txn_wall_ns=%llu execute_point_dml_wall_ns=%llu "
-                 "execute_scan_join_aggregate_wall_ns=%llu execute_other_wall_ns=%llu execute_shared_wait_ns=%llu "
-                 "execute_shared_calls=%llu state_unique_commit_wait_ns=%llu state_unique_commit_batches=%llu "
-                 "peak_inflight_execute=%llu writer_turnstile_wait_ns=%llu "
-                 "immutable_reads=%llu immutable_bytes=%llu immutable_pread_ns=%llu immutable_decode_ns=%llu "
-                 "private_hits=%llu version_hits=%llu base_hits=%llu sidecar_base_entries=%llu sidecar_overlay_refs=%llu "
-                 "join_parameterized_queries=%llu join_fallback_queries=%llu ordered_early_stop=%llu "
-                 "join_outer_indexed_queries=%llu join_outer_candidates=%llu join_outer_full_scan_rows=%llu "
-                 "join_inferred_literal_components=%llu join_inferred_literal_probes=%llu "
-                 "ordered_stream_queries=%llu ordered_materialize_queries=%llu "
-                 "commit_queue_wait_ns=%llu commit_ready_wait_ns=%llu commit_leader_reacquire_wait_ns=%llu "
-                 "prepare_unique_ns=%llu sync_unlocked_ns=%llu reacquire_ns=%llu publish_unique_ns=%llu "
-                 "commit_frames=%llu commit_tickets=%llu commit_batch_hist=%s commit_encode_ns=%llu "
-                 "commit_prepare_ns=%llu wal_pwrite_calls=%llu wal_pwrite_bytes=%llu wal_pwrite_ns=%llu "
-                 "wal_fdatasync_calls=%llu wal_fdatasync_ns=%llu commit_install_ns=%llu commit_publish_ns=%llu "
-                 "execute_txn_max_ns=%llu execute_point_dml_max_ns=%llu execute_scan_join_aggregate_max_ns=%llu "
-                 "execute_other_max_ns=%llu execute_shared_wait_max_ns=%llu commit_ready_wait_max_ns=%llu "
-                 "initial_unique_wait_max_ns=%llu publish_unique_wait_max_ns=%llu prepare_unique_max_ns=%llu "
-                 "sync_unlocked_max_ns=%llu publish_unique_max_ns=%llu wal_fdatasync_max_ns=%llu "
-                 "current_index_latest_routes=%llu current_index_historical_routes=%llu "
-                 "current_live_base_candidates=%llu current_live_summary_skips=%llu current_live_summary_words=%llu "
-                 "current_overlay_addition_ids=%llu current_overlay_removal_ids=%llu current_base_bit_flips=%llu "
-                 "current_base_row_order_comparisons=%llu "
-                 "execute_txn_inflight=%llu execute_point_dml_inflight=%llu "
-                 "execute_scan_join_aggregate_inflight=%llu execute_other_inflight=%llu "
-                 "commit_phase_code=%llu commit_phase=%s "
-                 "minor_faults=%ld major_faults=%ld max_rss_kb=%ld\n",
-                 periodic ? "periodic" : "final",
-                 static_cast<unsigned long long>(load(prepared_clone_count_)),
-                 static_cast<unsigned long long>(load(prepared_clone_ns_)),
-                 static_cast<unsigned long long>(load(execute_calls_[0])),
-                 static_cast<unsigned long long>(load(execute_calls_[1])),
-                 static_cast<unsigned long long>(load(execute_calls_[2])),
-                 static_cast<unsigned long long>(load(execute_calls_[3])),
-                 static_cast<unsigned long long>(load(execute_ns_[0])),
-                 static_cast<unsigned long long>(load(execute_ns_[1])),
-                 static_cast<unsigned long long>(load(execute_ns_[2])),
-                 static_cast<unsigned long long>(load(execute_ns_[3])),
-                 static_cast<unsigned long long>(load(execute_shared_wait_ns_)),
-                 static_cast<unsigned long long>(load(execute_shared_calls_)),
-                 static_cast<unsigned long long>(load(state_unique_commit_wait_ns_)),
-                 static_cast<unsigned long long>(load(state_unique_commit_batches_)),
-                 static_cast<unsigned long long>(load(peak_inflight_execute_)),
-                 static_cast<unsigned long long>(load(writer_turnstile_wait_ns_)),
-                 static_cast<unsigned long long>(load(diagnostics_->immutable_reads)),
-                 static_cast<unsigned long long>(load(diagnostics_->immutable_bytes)),
-                 static_cast<unsigned long long>(load(diagnostics_->immutable_pread_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->immutable_decode_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->private_hits)),
-                 static_cast<unsigned long long>(load(diagnostics_->version_hits)),
-                 static_cast<unsigned long long>(load(diagnostics_->base_hits)),
-                 static_cast<unsigned long long>(load(sidecar_base_entries_)),
-                 static_cast<unsigned long long>(load(sidecar_overlay_refs_)),
-                 static_cast<unsigned long long>(load(join_parameterized_)),
-                 static_cast<unsigned long long>(load(join_fallback_)),
-                 static_cast<unsigned long long>(load(ordered_early_stop_)),
-                 static_cast<unsigned long long>(load(join_outer_indexed_)),
-                 static_cast<unsigned long long>(load(join_outer_candidates_)),
-                 static_cast<unsigned long long>(load(join_outer_full_scan_rows_)),
-                 static_cast<unsigned long long>(load(join_inferred_literal_components_)),
-                 static_cast<unsigned long long>(load(join_inferred_literal_probes_)),
-                 static_cast<unsigned long long>(load(ordered_stream_)),
-                 static_cast<unsigned long long>(load(ordered_materialize_)),
-                 static_cast<unsigned long long>(load(commit_queue_wait_ns_)),
-                 static_cast<unsigned long long>(load(commit_ready_wait_ns_)),
-                 static_cast<unsigned long long>(load(commit_leader_reacquire_wait_ns_)),
-                 static_cast<unsigned long long>(load(commit_prepare_unique_ns_)),
-                 static_cast<unsigned long long>(load(commit_sync_unlocked_ns_)),
-                 static_cast<unsigned long long>(load(commit_reacquire_ns_)),
-                 static_cast<unsigned long long>(load(commit_publish_unique_ns_)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_frames)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_tickets)), histogram,
-                 static_cast<unsigned long long>(load(diagnostics_->commit_encode_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_prepare_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_calls)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_bytes)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_calls)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_install_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->commit_publish_ns)),
-                 static_cast<unsigned long long>(load(execute_max_ns_[0])),
-                 static_cast<unsigned long long>(load(execute_max_ns_[1])),
-                 static_cast<unsigned long long>(load(execute_max_ns_[2])),
-                 static_cast<unsigned long long>(load(execute_max_ns_[3])),
-                 static_cast<unsigned long long>(load(execute_shared_wait_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_ready_wait_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_initial_unique_wait_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_publish_unique_wait_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_prepare_unique_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_sync_unlocked_max_ns_)),
-                 static_cast<unsigned long long>(load(commit_publish_unique_max_ns_)),
-                 static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_max_ns)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_index_latest_routes)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_index_historical_routes)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_live_base_candidates)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_live_summary_skips)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_live_summary_words)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_overlay_addition_ids)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_overlay_removal_ids)),
-                 static_cast<unsigned long long>(load(diagnostics_->current_base_bit_flips)),
-                 static_cast<unsigned long long>(load(current_base_row_order_comparisons_)),
-                 static_cast<unsigned long long>(load(execute_inflight_[0])),
-                 static_cast<unsigned long long>(load(execute_inflight_[1])),
-                 static_cast<unsigned long long>(load(execute_inflight_[2])),
-                 static_cast<unsigned long long>(load(execute_inflight_[3])),
-                 static_cast<unsigned long long>(phase_code), phase_name, usage.ru_minflt, usage.ru_majflt,
-                 usage.ru_maxrss);
+    std::fprintf(
+        stderr,
+        "DELTA_DIAGNOSTICS report=%s prepared_clone_count=%llu prepared_clone_ns=%llu "
+        "execute_txn_calls=%llu execute_point_dml_calls=%llu execute_scan_join_aggregate_calls=%llu "
+        "execute_other_calls=%llu execute_txn_wall_ns=%llu execute_point_dml_wall_ns=%llu "
+        "execute_scan_join_aggregate_wall_ns=%llu execute_other_wall_ns=%llu execute_shared_wait_ns=%llu "
+        "execute_shared_calls=%llu state_unique_commit_wait_ns=%llu state_unique_commit_batches=%llu "
+        "peak_inflight_execute=%llu writer_turnstile_wait_ns=%llu "
+        "immutable_reads=%llu immutable_bytes=%llu immutable_pread_ns=%llu immutable_decode_ns=%llu "
+        "private_hits=%llu version_hits=%llu base_hits=%llu sidecar_base_entries=%llu sidecar_overlay_refs=%llu "
+        "join_parameterized_queries=%llu join_fallback_queries=%llu ordered_early_stop=%llu "
+        "join_outer_indexed_queries=%llu join_outer_candidates=%llu join_outer_full_scan_rows=%llu "
+        "join_inferred_literal_components=%llu join_inferred_literal_probes=%llu "
+        "ordered_stream_queries=%llu ordered_materialize_queries=%llu "
+        "commit_queue_wait_ns=%llu commit_ready_wait_ns=%llu commit_leader_reacquire_wait_ns=%llu "
+        "prepare_unique_ns=%llu sync_unlocked_ns=%llu reacquire_ns=%llu publish_unique_ns=%llu "
+        "commit_frames=%llu commit_tickets=%llu commit_batch_hist=%s commit_encode_ns=%llu "
+        "commit_prepare_ns=%llu wal_pwrite_calls=%llu wal_pwrite_bytes=%llu wal_pwrite_ns=%llu "
+        "wal_fdatasync_calls=%llu wal_fdatasync_ns=%llu commit_install_ns=%llu commit_publish_ns=%llu "
+        "execute_txn_max_ns=%llu execute_point_dml_max_ns=%llu execute_scan_join_aggregate_max_ns=%llu "
+        "execute_other_max_ns=%llu execute_shared_wait_max_ns=%llu commit_ready_wait_max_ns=%llu "
+        "initial_unique_wait_max_ns=%llu publish_unique_wait_max_ns=%llu prepare_unique_max_ns=%llu "
+        "sync_unlocked_max_ns=%llu publish_unique_max_ns=%llu wal_fdatasync_max_ns=%llu "
+        "current_index_latest_routes=%llu current_index_historical_routes=%llu "
+        "current_live_base_candidates=%llu current_live_summary_skips=%llu current_live_summary_words=%llu "
+        "current_overlay_addition_ids=%llu current_overlay_removal_ids=%llu current_base_bit_flips=%llu "
+        "current_base_row_order_comparisons=%llu maintenance_busy_samples=%llu maintenance_pause_ns=%llu "
+        "maintenance_forced_progress=%llu maintenance_builder_wall_ns=%llu maintenance_debt_before_bytes=%llu "
+        "maintenance_debt_after_bytes=%llu "
+        "execute_txn_inflight=%llu execute_point_dml_inflight=%llu "
+        "execute_scan_join_aggregate_inflight=%llu execute_other_inflight=%llu "
+        "commit_phase_code=%llu commit_phase=%s "
+        "minor_faults=%ld major_faults=%ld max_rss_kb=%ld\n",
+        periodic ? "periodic" : "final", static_cast<unsigned long long>(load(prepared_clone_count_)),
+        static_cast<unsigned long long>(load(prepared_clone_ns_)),
+        static_cast<unsigned long long>(load(execute_calls_[0])),
+        static_cast<unsigned long long>(load(execute_calls_[1])),
+        static_cast<unsigned long long>(load(execute_calls_[2])),
+        static_cast<unsigned long long>(load(execute_calls_[3])), static_cast<unsigned long long>(load(execute_ns_[0])),
+        static_cast<unsigned long long>(load(execute_ns_[1])), static_cast<unsigned long long>(load(execute_ns_[2])),
+        static_cast<unsigned long long>(load(execute_ns_[3])),
+        static_cast<unsigned long long>(load(execute_shared_wait_ns_)),
+        static_cast<unsigned long long>(load(execute_shared_calls_)),
+        static_cast<unsigned long long>(load(state_unique_commit_wait_ns_)),
+        static_cast<unsigned long long>(load(state_unique_commit_batches_)),
+        static_cast<unsigned long long>(load(peak_inflight_execute_)),
+        static_cast<unsigned long long>(load(writer_turnstile_wait_ns_)),
+        static_cast<unsigned long long>(load(diagnostics_->immutable_reads)),
+        static_cast<unsigned long long>(load(diagnostics_->immutable_bytes)),
+        static_cast<unsigned long long>(load(diagnostics_->immutable_pread_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->immutable_decode_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->private_hits)),
+        static_cast<unsigned long long>(load(diagnostics_->version_hits)),
+        static_cast<unsigned long long>(load(diagnostics_->base_hits)),
+        static_cast<unsigned long long>(load(sidecar_base_entries_)),
+        static_cast<unsigned long long>(load(sidecar_overlay_refs_)),
+        static_cast<unsigned long long>(load(join_parameterized_)),
+        static_cast<unsigned long long>(load(join_fallback_)),
+        static_cast<unsigned long long>(load(ordered_early_stop_)),
+        static_cast<unsigned long long>(load(join_outer_indexed_)),
+        static_cast<unsigned long long>(load(join_outer_candidates_)),
+        static_cast<unsigned long long>(load(join_outer_full_scan_rows_)),
+        static_cast<unsigned long long>(load(join_inferred_literal_components_)),
+        static_cast<unsigned long long>(load(join_inferred_literal_probes_)),
+        static_cast<unsigned long long>(load(ordered_stream_)),
+        static_cast<unsigned long long>(load(ordered_materialize_)),
+        static_cast<unsigned long long>(load(commit_queue_wait_ns_)),
+        static_cast<unsigned long long>(load(commit_ready_wait_ns_)),
+        static_cast<unsigned long long>(load(commit_leader_reacquire_wait_ns_)),
+        static_cast<unsigned long long>(load(commit_prepare_unique_ns_)),
+        static_cast<unsigned long long>(load(commit_sync_unlocked_ns_)),
+        static_cast<unsigned long long>(load(commit_reacquire_ns_)),
+        static_cast<unsigned long long>(load(commit_publish_unique_ns_)),
+        static_cast<unsigned long long>(load(diagnostics_->commit_frames)),
+        static_cast<unsigned long long>(load(diagnostics_->commit_tickets)), histogram,
+        static_cast<unsigned long long>(load(diagnostics_->commit_encode_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->commit_prepare_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_calls)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_bytes)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_pwrite_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_calls)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->commit_install_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->commit_publish_ns)),
+        static_cast<unsigned long long>(load(execute_max_ns_[0])),
+        static_cast<unsigned long long>(load(execute_max_ns_[1])),
+        static_cast<unsigned long long>(load(execute_max_ns_[2])),
+        static_cast<unsigned long long>(load(execute_max_ns_[3])),
+        static_cast<unsigned long long>(load(execute_shared_wait_max_ns_)),
+        static_cast<unsigned long long>(load(commit_ready_wait_max_ns_)),
+        static_cast<unsigned long long>(load(commit_initial_unique_wait_max_ns_)),
+        static_cast<unsigned long long>(load(commit_publish_unique_wait_max_ns_)),
+        static_cast<unsigned long long>(load(commit_prepare_unique_max_ns_)),
+        static_cast<unsigned long long>(load(commit_sync_unlocked_max_ns_)),
+        static_cast<unsigned long long>(load(commit_publish_unique_max_ns_)),
+        static_cast<unsigned long long>(load(diagnostics_->wal_fdatasync_max_ns)),
+        static_cast<unsigned long long>(load(diagnostics_->current_index_latest_routes)),
+        static_cast<unsigned long long>(load(diagnostics_->current_index_historical_routes)),
+        static_cast<unsigned long long>(load(diagnostics_->current_live_base_candidates)),
+        static_cast<unsigned long long>(load(diagnostics_->current_live_summary_skips)),
+        static_cast<unsigned long long>(load(diagnostics_->current_live_summary_words)),
+        static_cast<unsigned long long>(load(diagnostics_->current_overlay_addition_ids)),
+        static_cast<unsigned long long>(load(diagnostics_->current_overlay_removal_ids)),
+        static_cast<unsigned long long>(load(diagnostics_->current_base_bit_flips)),
+        static_cast<unsigned long long>(load(current_base_row_order_comparisons_)),
+        static_cast<unsigned long long>(load(maintenance_busy_samples_)),
+        static_cast<unsigned long long>(load(maintenance_pause_ns_)),
+        static_cast<unsigned long long>(load(maintenance_forced_progress_)),
+        static_cast<unsigned long long>(load(maintenance_builder_wall_ns_)),
+        static_cast<unsigned long long>(load(maintenance_debt_before_bytes_)),
+        static_cast<unsigned long long>(load(maintenance_debt_after_bytes_)),
+        static_cast<unsigned long long>(load(execute_inflight_[0])),
+        static_cast<unsigned long long>(load(execute_inflight_[1])),
+        static_cast<unsigned long long>(load(execute_inflight_[2])),
+        static_cast<unsigned long long>(load(execute_inflight_[3])), static_cast<unsigned long long>(phase_code),
+        phase_name, usage.ru_minflt, usage.ru_majflt, usage.ru_maxrss);
 }
 
 std::array<size_t, 3> DeltaDatabase::IndexProbeCensusForTest(const DeltaSession& session) const {
@@ -888,7 +1003,8 @@ std::array<size_t, 3> DeltaDatabase::CurrentIndexCensusForTest() const {
             count += ids.size();
         return count;
     };
-    return {current_base_row_order_comparisons_.load(std::memory_order_relaxed), refs(overlay_), refs(current_overlay_)};
+    return {current_base_row_order_comparisons_.load(std::memory_order_relaxed), refs(overlay_),
+            refs(current_overlay_)};
 }
 
 size_t DeltaDatabase::SidecarValidationCountForTest() const {
@@ -938,6 +1054,8 @@ std::unique_ptr<DeltaDatabase> DeltaDatabase::Open(const std::string& directory)
     auto result = std::unique_ptr<DeltaDatabase>(new DeltaDatabase(epoch_si_poc::CheckpointDb::Open(directory)));
     result->directory_ = directory;
     result->LoadCatalog();
+    result->CleanupStagedSidecarOrphans();
+    result->CleanupGenerationSidecarOrphans();
     for (const auto& [name, schema] : result->tables_) {
         bool rebuild = false;
         for (const auto& index : schema.indexes)
@@ -969,9 +1087,8 @@ std::unique_ptr<DeltaDatabase> DeltaDatabase::Open(const std::string& directory)
                     uint64_t first = 0, last = sidecar->second.count;
                     while (first < last) {
                         const uint64_t middle = first + (last - first) / 2;
-                        const uint32_t candidate = GetLeAt<uint32_t>(
-                            mapped + sidecar->second.row_order_offset +
-                            middle * kSidecarRowOrderEntryBytes);
+                        const uint32_t candidate = GetLeAt<uint32_t>(mapped + sidecar->second.row_order_offset +
+                                                                     middle * kSidecarRowOrderEntryBytes);
                         const uint64_t candidate_id = GetLeAt<uint64_t>(
                             mapped + kSidecarHeaderBytes + static_cast<uint64_t>(candidate) * kSidecarEntryBytes + 8);
                         if (candidate_id < id.local_id)
@@ -981,13 +1098,13 @@ std::unique_ptr<DeltaDatabase> DeltaDatabase::Open(const std::string& directory)
                     }
                     if (first < sidecar->second.count) {
                         ordinal = GetLeAt<uint32_t>(mapped + sidecar->second.row_order_offset +
-                                                   first * kSidecarRowOrderEntryBytes);
-                        const uint64_t begin = GetLeAt<uint64_t>(
-                            mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes);
-                        const uint64_t end = ordinal + 1 == sidecar->second.count
-                                                 ? sidecar->second.key_bytes
-                                                 : GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
-                                                                     (ordinal + 1) * kSidecarEntryBytes);
+                                                    first * kSidecarRowOrderEntryBytes);
+                        const uint64_t begin =
+                            GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes);
+                        const uint64_t end =
+                            ordinal + 1 == sidecar->second.count
+                                ? sidecar->second.key_bytes
+                                : GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + (ordinal + 1) * kSidecarEntryBytes);
                         const uint8_t* keys = mapped + kSidecarHeaderBytes + sidecar->second.count * kSidecarEntryBytes;
                         is_base = end - begin == key.size() && std::memcmp(keys + begin, key.data(), key.size()) == 0;
                     }
@@ -1164,6 +1281,7 @@ void DeltaDatabase::LoadCatalog() {
     next_table_id_ = next_table;
     next_constraint_id_ = next_constraint;
     catalog_generation_ = generation;
+    catalog_generation_snapshot_.store(generation, std::memory_order_release);
 }
 
 const DeltaDatabase::TableSchema& DeltaDatabase::Table(const std::string& name) const {
@@ -1202,8 +1320,8 @@ void DeltaDatabase::SetCurrentBaseBit(SidecarDescriptor& descriptor, uint64_t lo
         const uint64_t middle = first + (last - first) / 2;
         const uint32_t candidate =
             GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + middle * kSidecarRowOrderEntryBytes);
-        const uint64_t candidate_id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
-                                                         static_cast<uint64_t>(candidate) * kSidecarEntryBytes + 8);
+        const uint64_t candidate_id =
+            GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + static_cast<uint64_t>(candidate) * kSidecarEntryBytes + 8);
         if (candidate_id < local_id)
             first = middle + 1;
         else
@@ -1211,9 +1329,10 @@ void DeltaDatabase::SetCurrentBaseBit(SidecarDescriptor& descriptor, uint64_t lo
     }
     if (first == descriptor.count)
         return;
-    const uint32_t ordinal = GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
-    const uint64_t found_id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
-                                                static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+    const uint32_t ordinal =
+        GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
+    const uint64_t found_id =
+        GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
     if (found_id != local_id)
         return;
     const size_t word = ordinal / 64;
@@ -1257,8 +1376,8 @@ void DeltaDatabase::ApplyCurrentBaseState(const TableSchema& schema, epoch_si_po
         const uint64_t middle = first + (last - first) / 2;
         const uint32_t ordinal =
             GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + middle * kSidecarRowOrderEntryBytes);
-        const uint64_t id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
-                                              static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+        const uint64_t id =
+            GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
         if (diagnostics_)
             ++current_base_row_order_comparisons_;
         if (id < local_id)
@@ -1268,9 +1387,10 @@ void DeltaDatabase::ApplyCurrentBaseState(const TableSchema& schema, epoch_si_po
     }
     if (first == descriptor.count)
         return;
-    const uint32_t ordinal = GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
-    const uint64_t id = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes +
-                                          static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
+    const uint32_t ordinal =
+        GetLeAt<uint32_t>(mapped + descriptor.row_order_offset + first * kSidecarRowOrderEntryBytes);
+    const uint64_t id =
+        GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + static_cast<uint64_t>(ordinal) * kSidecarEntryBytes + 8);
     if (id != local_id)
         return;
     const uint64_t begin = GetLeAt<uint64_t>(mapped + kSidecarHeaderBytes + ordinal * kSidecarEntryBytes);
@@ -1367,8 +1487,8 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
     bool leader = false;
     try {
         std::unique_lock<std::mutex> queue_lock(commit_mutex_);
-        const auto queue_wait_started = diagnostics_ ? std::chrono::steady_clock::now()
-                                                     : std::chrono::steady_clock::time_point{};
+        const auto queue_wait_started =
+            diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         commit_slot_available_.wait(queue_lock, [&] { return commit_queue_.size() < kCommitQueueLimit; });
         if (diagnostics_)
             commit_queue_wait_ns_.fetch_add(NsSince(queue_wait_started), std::memory_order_relaxed);
@@ -1386,15 +1506,14 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
         session.removed_overlay.clear();
         session.private_insert_ids.clear();
         session.explicit_txn = false;
-        session.admission.reset();
         throw;
     }
     if (leader)
         DrainCommitQueue();
     {
         std::unique_lock<std::mutex> queue_lock(commit_mutex_);
-        const auto ready_wait_started = diagnostics_ ? std::chrono::steady_clock::now()
-                                                     : std::chrono::steady_clock::time_point{};
+        const auto ready_wait_started =
+            diagnostics_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ticket->ready.wait(queue_lock, [&] { return ticket->done; });
         if (diagnostics_) {
             const uint64_t elapsed = NsSince(ready_wait_started);
@@ -1407,7 +1526,6 @@ void DeltaDatabase::Commit(DeltaSession& session, std::shared_lock<std::shared_m
     session.removed_overlay.clear();
     session.private_insert_ids.clear();
     session.explicit_txn = false;
-    session.admission.reset();
     if (ticket->error)
         std::rethrow_exception(ticket->error);
     if (ticket->result.status != epoch_si_poc::CommitStatus::kCommitted) {
@@ -1573,9 +1691,7 @@ void DeltaDatabase::Abort(DeltaSession& session) noexcept {
     if (abort_lock_attempt_hook_for_test_)
         abort_lock_attempt_hook_for_test_();
     std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
-    std::shared_lock<std::shared_mutex> admission;
-    if (!session.admission)
-        admission = LockExecutionShared();
+    auto admission = LockExecutionShared();
     auto state_lock = LockStateShared();
     AbortLocked(session);
 }
@@ -1592,15 +1708,440 @@ void DeltaDatabase::AbortLocked(DeltaSession& session) noexcept {
     session.overlay.clear();
     session.removed_overlay.clear();
     session.private_insert_ids.clear();
-    session.admission.reset();
 }
 
 void DeltaDatabase::Checkpoint() {
+    std::lock_guard<std::mutex> builder_lock(snapshot_builder_mutex_);
     auto admission = LockExecutionUnique();
     std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
     auto state_lock = LockStateUnique();
     RequireUsable();
     CheckpointSidecars();
+}
+
+DeltaDatabase::MaintenanceResult DeltaDatabase::MaintenanceTick() {
+    std::lock_guard<std::mutex> builder_lock(snapshot_builder_mutex_);
+    if (maintenance_cancel_.load(std::memory_order_acquire))
+        return MaintenanceResult::kCancelled;
+    const auto durable_wal_bytes = [&] {
+        std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+        auto state_lock = LockStateShared();
+        RequireUsable();
+        return db_.durable_wal_bytes();
+    };
+    const size_t before = durable_wal_bytes();
+    maintenance_debt_before_bytes_.store(before, std::memory_order_relaxed);
+    TryReclaimRetiredGenerations();
+    if (maintenance_cancel_.load(std::memory_order_acquire))
+        return MaintenanceResult::kCancelled;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        auto state_lock = LockStateShared();
+        RequireUsable();
+        if (before < maintenance_hard_threshold_ &&
+            (before < maintenance_next_trigger_bytes_ || now < maintenance_cooldown_until_))
+            return MaintenanceResult::kReclaimed;
+    }
+    bool has_dirty_tables = false;
+    {
+        auto admission = LockExecutionUnique();
+        std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+        auto state_lock = LockStateUnique();
+        RequireUsable();
+        has_dirty_tables = !db_.engine().DirtyTableIds().empty();
+        if (!has_dirty_tables)
+            CutWalOnlyLocked();
+    }
+    if (has_dirty_tables)
+        BuildSnapshotBasesLocked();
+    const size_t after = durable_wal_bytes();
+    maintenance_debt_after_bytes_.store(after, std::memory_order_relaxed);
+    if (maintenance_cancel_.load(std::memory_order_acquire))
+        return MaintenanceResult::kCancelled;
+    maintenance_next_trigger_bytes_ = after > std::numeric_limits<size_t>::max() - maintenance_soft_threshold_
+                                          ? std::numeric_limits<size_t>::max()
+                                          : after + maintenance_soft_threshold_;
+    maintenance_cooldown_until_ = std::chrono::steady_clock::now() + maintenance_cooldown_;
+    return MaintenanceResult::kCheckpointed;
+}
+
+void DeltaDatabase::StopMaintenance() noexcept {
+    maintenance_cancel_.store(true, std::memory_order_release);
+}
+
+void DeltaDatabase::CutWalOnlyLocked() {
+    const auto source_before_rotation = db_.engine().current_source_;
+    if (!source_before_rotation || source_before_rotation->identity == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("source identity exhausted");
+    if (retired_sources_.size() == retired_sources_.max_size())
+        throw std::overflow_error("retired source queue exhausted");
+    retired_sources_.reserve(retired_sources_.size() + 1);
+    const auto boundary = db_.RotateWalAtGate(rotation_crash_point_for_test_);
+    const auto source = db_.engine().current_source_;
+    if (source != source_before_rotation)
+        throw std::logic_error("WAL-only cut source is unavailable");
+    RetiredSource retired_source;
+    retired_source.source = source;
+    retired_source.installed_source_identity = source->identity + 1;
+    auto prepared = db_.PrepareSnapshotPublication(boundary, source->identity, {});
+    db_.PublishSnapshotPublication(std::move(prepared));
+    try {
+        retired_sources_.push_back(std::move(retired_source));
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void DeltaDatabase::SetMaintenanceThresholdsForTest(size_t soft_bytes, size_t hard_bytes) {
+    if (soft_bytes == 0 || soft_bytes > hard_bytes)
+        throw std::invalid_argument("invalid maintenance thresholds");
+    std::lock_guard<std::mutex> lock(snapshot_builder_mutex_);
+    maintenance_soft_threshold_ = soft_bytes;
+    maintenance_hard_threshold_ = hard_bytes;
+    maintenance_next_trigger_bytes_ = soft_bytes;
+}
+
+void DeltaDatabase::SetMaintenanceCooldownForTest(std::chrono::milliseconds cooldown) {
+    if (cooldown.count() < 0)
+        throw std::invalid_argument("invalid maintenance cooldown");
+    std::lock_guard<std::mutex> lock(snapshot_builder_mutex_);
+    maintenance_cooldown_ = cooldown;
+}
+
+void DeltaDatabase::TryReclaimRetiredGenerations() noexcept {
+    if (retired_sources_.empty())
+        return;
+    try {
+        if (std::any_of(retired_sources_.begin(), retired_sources_.end(),
+                        [](const RetiredSource& retired) { return !retired.source.expired(); }))
+            return;
+        std::map<epoch_si_poc::TableId, epoch_si_poc::CheckpointDb::TableRef> latest_tables;
+        for (const RetiredSource& retired : retired_sources_)
+            for (const auto& table : retired.tables)
+                latest_tables[table.table_id] = table;
+        std::map<epoch_si_poc::TableId, epoch_si_poc::Epoch> cuts;
+        for (const auto& [table_id, table] : latest_tables)
+            cuts.emplace(table_id, table.visible_from);
+
+        epoch_si_poc::EpochSiEngine::RetiredGenerationState retired_state;
+        std::vector<RetiredSource> retired_tokens;
+        bool collect_tables = false;
+        {
+            auto admission = LockExecutionUnique();
+            std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+            auto state_lock = LockStateUnique();
+            RequireUsable();
+            if (std::any_of(retired_sources_.begin(), retired_sources_.end(),
+                            [](const RetiredSource& retired) { return !retired.source.expired(); }) ||
+                !db_.engine().current_source_ ||
+                db_.engine().current_source_->identity != retired_sources_.back().installed_source_identity)
+                return;
+            for (const auto& [table_id, table] : latest_tables) {
+                if (db_.TableGeneration(table_id) != std::optional<uint64_t>(table.file_generation) ||
+                    db_.TableVisibleFrom(table_id) != std::optional<epoch_si_poc::Epoch>(table.visible_from))
+                    return;
+            }
+            collect_tables = !retired_tables_collected_;
+            auto prepared = db_.engine().PrepareGenerationCollapseStep(cuts, retired_collapse_cursor_);
+            retired_state = db_.engine().InstallGenerationCollapse(std::move(prepared), &retired_collapse_cursor_);
+            if (retired_collapse_cursor_.done) {
+                retired_tokens.swap(retired_sources_);
+                retired_collapse_cursor_ = {};
+                retired_tables_collected_ = false;
+            }
+        }
+        try {
+            if (retired_state_release_hook_for_test_)
+                retired_state_release_hook_for_test_();
+        } catch (...) {
+        }
+        retired_state = {};
+        retired_tokens.clear();
+        if (collect_tables) {
+            db_.GarbageCollectExcludedTables();
+            retired_tables_collected_ = !retired_sources_.empty();
+        }
+    } catch (...) {
+    }
+}
+
+void DeltaDatabase::BuildSnapshotBases() {
+    std::lock_guard<std::mutex> builder_lock(snapshot_builder_mutex_);
+    BuildSnapshotBasesLocked();
+}
+
+void DeltaDatabase::BuildSnapshotBasesLocked() {
+    const auto builder_started = std::chrono::steady_clock::now();
+    const auto record_builder_wall = [this, builder_started](void*) {
+        maintenance_builder_wall_ns_.fetch_add(NsSince(builder_started), std::memory_order_relaxed);
+    };
+    std::unique_ptr<void, decltype(record_builder_wall)> builder_wall_guard(this, record_builder_wall);
+
+    // Probe the exclusive gate only at existing builder work boundaries.  A
+    // shared probe would coexist with foreground readers and falsely report
+    // idle; the unique probe also avoids sleeping while holding any gate.
+    const auto cooperate_with_foreground = [&]() {
+        constexpr auto kPauseSlice = std::chrono::milliseconds(1);
+        constexpr auto kPauseLimit = std::chrono::milliseconds(25);
+        const auto pause_started = std::chrono::steady_clock::now();
+        for (;;) {
+            std::unique_lock<std::shared_mutex> probe(execution_gate_, std::defer_lock);
+            if (probe.try_lock()) {
+                maintenance_pause_ns_.fetch_add(NsSince(pause_started), std::memory_order_relaxed);
+                return true;
+            }
+            maintenance_busy_samples_.fetch_add(1, std::memory_order_relaxed);
+            if (maintenance_cancel_.load(std::memory_order_acquire)) {
+                maintenance_pause_ns_.fetch_add(NsSince(pause_started), std::memory_order_relaxed);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() - pause_started >= kPauseLimit) {
+                maintenance_pause_ns_.fetch_add(NsSince(pause_started), std::memory_order_relaxed);
+                maintenance_forced_progress_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            std::this_thread::sleep_for(kPauseSlice);
+        }
+    };
+
+    if (!cooperate_with_foreground())
+        return;
+    TryReclaimRetiredGenerations();
+    constexpr size_t kRowsPerBatch = 1024;
+    constexpr size_t kBytesPerBatch = 8U << 20;
+    constexpr size_t kProbesPerBatch = 2048;
+    std::optional<epoch_si_poc::EpochSiEngine::SnapshotPin> pin;
+    epoch_si_poc::Epoch cut = 0;
+    uint64_t source_identity = 0;
+    uint64_t catalog_generation = 0;
+    uint64_t rotation_generation = 0;
+    uint64_t target_generation = 0;
+    epoch_si_poc::CheckpointDb::SnapshotCutBoundary boundary;
+    std::vector<std::pair<epoch_si_poc::TableId, epoch_si_poc::EpochSiEngine::SnapshotCursor>> cursors;
+    std::map<epoch_si_poc::TableId, TableSchema> snapshot_schemas;
+    CommittedOverlay retired_frozen_overlay;
+    CommittedOverlay retired_frozen_current_overlay;
+    bool overlay_frozen = false;
+    bool source_published = false;
+    const auto recover = [&](DeltaDatabase*) noexcept {
+        if (source_published)
+            std::terminate();
+        if (overlay_frozen) {
+            try {
+                auto admission = LockExecutionUnique();
+                std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+                auto state_lock = LockStateUnique();
+                overlay_.merge(frozen_overlay_);
+                current_overlay_.merge(frozen_current_overlay_);
+                overlay_frozen = false;
+            } catch (...) {
+                std::terminate();
+            }
+        }
+        cursors.clear();
+        pin.reset();
+        TryReclaimRetiredGenerations();
+    };
+    std::unique_ptr<DeltaDatabase, decltype(recover)> recovery_guard(this, recover);
+    {
+        auto admission = LockExecutionUnique();
+        std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+        auto state_lock = LockStateUnique();
+        RequireUsable();
+        if (maintenance_cancel_.load(std::memory_order_acquire))
+            return;
+        // A recovered database has no in-memory dirty-table history.  Every
+        // catalog table still backed by the legacy row image must be folded
+        // into the new base before advancing the global base epoch; otherwise
+        // replay would skip its WAL segment at the new boundary.
+        std::set<epoch_si_poc::TableId> snapshot_tables = db_.engine().DirtyTableIds();
+        for (const auto& [table_name, schema] : tables_) {
+            (void)table_name;
+            if (!db_.engine().current_source_->immutable_tables->count(schema.id))
+                snapshot_tables.insert(schema.id);
+        }
+        if (snapshot_tables.empty())
+            return;
+        pin.emplace(db_.engine().PinSnapshot());
+        boundary = db_.RotateWalAtGate(rotation_crash_point_for_test_);
+        cut = boundary.epoch;
+        if (!frozen_overlay_.empty() || !frozen_current_overlay_.empty())
+            throw std::logic_error("snapshot overlay generation is already frozen");
+        frozen_overlay_.swap(overlay_);
+        frozen_current_overlay_.swap(current_overlay_);
+        overlay_frozen = true;
+        rotation_generation = db_.generation();
+        if (rotation_generation == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("snapshot generation exhausted");
+        target_generation = rotation_generation + 1;
+        source_identity = db_.engine().current_source_->identity;
+        catalog_generation = catalog_generation_;
+        for (const epoch_si_poc::TableId table_id : snapshot_tables) {
+            const auto schema = table_by_id_.find(table_id);
+            if (schema == table_by_id_.end())
+                throw std::logic_error("snapshot table schema missing");
+            snapshot_schemas.emplace(table_id, *schema->second);
+            cursors.emplace_back(table_id, db_.engine().BeginSnapshotCursor(*pin, table_id, kRowsPerBatch,
+                                                                            kBytesPerBatch, kProbesPerBatch));
+        }
+    }
+
+    epoch_si_poc::CheckpointDb::SnapshotArtifact artifact;
+    std::vector<StagedSidecarArtifact> staged_sidecars;
+    std::map<epoch_si_poc::TableId, std::vector<std::pair<epoch_si_poc::RowId, epoch_si_poc::Row>>> observed;
+    for (auto& [table_id, cursor] : cursors) {
+        auto writer = db_.BeginSnapshotTableBase(table_id, cut);
+        auto schema = snapshot_schemas.at(table_id);
+        std::vector<StreamingSidecarPtr> sidecar_builders;
+        sidecar_builders.reserve(schema.indexes.size());
+        for (const auto& index : schema.indexes)
+            sidecar_builders.push_back(BeginStreamingSidecar(schema, index, target_generation, cut));
+        for (;;) {
+            if (!cooperate_with_foreground())
+                return;
+            if (maintenance_cancel_.load(std::memory_order_acquire))
+                return;
+            epoch_si_poc::EpochSiEngine::SnapshotStateBatch state;
+            {
+                auto state_lock = LockStateShared();
+                RequireUsable();
+                state = cursor.ProbeState();
+            }
+            auto batch = cursor.FinishBatch(std::move(state));
+            if (snapshot_rows_hook_for_test_)
+                observed[table_id].insert(observed[table_id].end(), batch.rows.begin(), batch.rows.end());
+            for (const auto& [row_id, row] : batch.rows) {
+                const auto cells = DecodeRow(schema, row);
+                for (size_t n = 0; n < sidecar_builders.size(); ++n) {
+                    const auto key = EncodeKey(schema, schema.indexes[n], cells);
+                    AddStreamingSidecar(sidecar_builders[n].get(),
+                                        std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+                                        row_id.local_id);
+                }
+            }
+            db_.AppendSnapshotRows(writer, std::move(batch.rows));
+            if (snapshot_io_hook_for_test_)
+                snapshot_io_hook_for_test_();
+            if (!batch.has_more)
+                break;
+        }
+        for (size_t index_ordinal = 0; index_ordinal < sidecar_builders.size(); ++index_ordinal) {
+            if (!cooperate_with_foreground())
+                return;
+            if (sidecar_finish_hook_for_test_)
+                sidecar_finish_hook_for_test_(index_ordinal);
+            auto& builder = sidecar_builders[index_ordinal];
+            try {
+                staged_sidecars.push_back(FinishStreamingSidecar(builder.get(), cooperate_with_foreground));
+            } catch (const detail::SidecarSortCancelled&) {
+                return;
+            }
+        }
+        if (sidecar_artifact_hook_for_test_) {
+            std::vector<std::array<uint64_t, 4>> headers;
+            for (size_t n = staged_sidecars.size() - sidecar_builders.size(); n < staged_sidecars.size(); ++n) {
+                std::array<uint8_t, kSidecarHeaderBytes> bytes{};
+                std::ifstream input(staged_sidecars[n].path, std::ios::binary);
+                input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+                headers.push_back({GetLeAt<uint64_t>(bytes.data() + 48), GetLeAt<uint64_t>(bytes.data() + 32),
+                                   GetLeAt<uint64_t>(bytes.data() + 40), GetLeAt<uint64_t>(bytes.data() + 24)});
+            }
+            sidecar_artifact_hook_for_test_(table_id, headers);
+        }
+        db_.FinishSnapshotTableBase(writer, pin->next_local_id(table_id), artifact);
+    }
+    if (snapshot_rows_hook_for_test_)
+        snapshot_rows_hook_for_test_(cut, observed);
+
+    auto prepared_artifacts = db_.AdoptForPublication(std::move(artifact));
+    {
+        auto admission = LockExecutionUnique();
+        std::unique_lock<std::mutex> commit_epoch_lock(commit_epoch_gate_);
+        auto state_lock = LockStateUnique();
+        RequireUsable();
+        if (maintenance_cancel_.load(std::memory_order_acquire))
+            return;
+        if (catalog_generation_ != catalog_generation || db_.generation() != rotation_generation ||
+            !db_.engine().current_source_ || db_.engine().current_source_->identity != source_identity)
+            throw std::logic_error("snapshot catalog changed during build");
+        std::map<epoch_si_poc::TableId, epoch_si_poc::CheckpointDb::TableRef> table_refs;
+        for (const auto& ref : prepared_artifacts.tables_)
+            table_refs.emplace(ref.table_id, ref);
+        size_t expected_sidecars = 0;
+        for (const auto& [table_id, schema] : snapshot_schemas) {
+            const auto ref = table_refs.find(table_id);
+            if (ref == table_refs.end() || ref->second.file_generation != target_generation ||
+                ref->second.visible_from != cut)
+                throw std::logic_error("snapshot table generation changed during build");
+            expected_sidecars += schema.indexes.size();
+        }
+        if (staged_sidecars.size() != expected_sidecars)
+            throw std::logic_error("snapshot sidecar cohort is incomplete");
+        for (auto& sidecar : staged_sidecars) {
+            const auto schema = snapshot_schemas.find(sidecar.table_id);
+            const auto ref = table_refs.find(sidecar.table_id);
+            const bool known_index =
+                schema != snapshot_schemas.end() &&
+                std::any_of(schema->second.indexes.begin(), schema->second.indexes.end(),
+                            [&](const Index& index) { return index.constraint_id == sidecar.constraint_id; });
+            if (!known_index || ref == table_refs.end() || sidecar.generation != ref->second.file_generation ||
+                sidecar.snapshot_epoch != cut || sidecar.count != ref->second.row_count)
+                throw std::logic_error("snapshot sidecar cohort identity changed");
+            sidecar.Promote(SidecarGenerationName(sidecar.table_id, sidecar.constraint_id, sidecar.generation),
+                            directory_);
+        }
+        if (!staged_sidecars.empty()) {
+            while (fsync(staged_sidecars.front().directory_fd) != 0)
+                if (errno != EINTR)
+                    throw std::system_error(errno, std::generic_category(), "sync promoted sidecar directory");
+        }
+        std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> prepared_sidecars;
+        for (const auto& artifact : staged_sidecars) {
+            const auto& schema = snapshot_schemas.at(artifact.table_id);
+            const auto index = std::find_if(schema.indexes.begin(), schema.indexes.end(), [&](const Index& candidate) {
+                return candidate.constraint_id == artifact.constraint_id;
+            });
+            if (index == schema.indexes.end() ||
+                !prepared_sidecars.emplace(index->constraint_id, PrepareSidecarDescriptor(schema, *index, artifact))
+                     .second)
+                throw std::logic_error("duplicate snapshot sidecar");
+        }
+        auto prepared = db_.PrepareSnapshotPublication(boundary, source_identity, std::move(prepared_artifacts));
+        RetiredSource retired_source;
+        retired_source.source = db_.engine().current_source_;
+        retired_source.installed_source_identity = source_identity + 1;
+        retired_source.tables = prepared.artifacts_.tables_;
+        if (retired_sources_.size() == retired_sources_.max_size())
+            throw std::overflow_error("retired source queue exhausted");
+        retired_sources_.reserve(retired_sources_.size() + 1);
+        db_.PublishSnapshotPublication(std::move(prepared));
+        source_published = true;
+        try {
+            retired_sources_.push_back(std::move(retired_source));
+            retired_collapse_cursor_ = {};
+            retired_tables_collected_ = false;
+        } catch (...) {
+            std::terminate();
+        }
+        InstallSnapshotSidecars(prepared_sidecars);
+        retired_frozen_overlay.swap(frozen_overlay_);
+        retired_frozen_current_overlay.swap(frozen_current_overlay_);
+        overlay_frozen = false;
+        for (auto& sidecar : staged_sidecars)
+            sidecar.Keep();
+    }
+    cursors.clear();
+    pin.reset();
+    try {
+        if (retired_state_release_hook_for_test_)
+            retired_state_release_hook_for_test_();
+    } catch (...) {
+    }
+    retired_frozen_overlay.clear();
+    retired_frozen_current_overlay.clear();
+    TryReclaimRetiredGenerations();
+    CleanupGenerationSidecarOrphans();
+    recovery_guard.release();
 }
 
 std::array<uint64_t, 4> DeltaDatabase::RotateWalForTest() {
@@ -1613,9 +2154,8 @@ std::array<uint64_t, 4> DeltaDatabase::RotateWalForTest() {
 }
 
 uint64_t DeltaDatabase::CatalogGeneration() const {
-    auto state_lock = LockStateShared();
     RequireUsable();
-    return catalog_generation_;
+    return catalog_generation_snapshot_.load(std::memory_order_acquire);
 }
 
 size_t DeltaDatabase::WalFrameCountForTest() const {
@@ -1712,6 +2252,355 @@ std::vector<uint8_t> DeltaDatabase::EncodeKey(const TableSchema& schema, const I
     return key;
 }
 
+struct DeltaDatabase::StreamingSidecarBuilder {
+    DeltaDatabase& database;
+    TableSchema schema;
+    Index index;
+    uint64_t generation;
+    epoch_si_poc::Epoch snapshot_epoch;
+    int directory_fd = -1;
+    int entries_fd = -1;
+    int keys_fd = -1;
+    int row_order_fd = -1;
+    int spool_fd = -1;
+    std::string prefix;
+    std::string entries_name;
+    std::string keys_name;
+    std::string row_order_name;
+    std::string spool_name;
+    std::string staged_name;
+    std::map<std::string, std::pair<dev_t, ino_t>> owned;
+    std::unique_ptr<detail::SidecarSorter> sorter;
+    std::unique_ptr<detail::SidecarSorter> row_sorter;
+    uint64_t count = 0;
+    uint64_t key_bytes = 0;
+    uint32_t entries_crc = 0xffffffffU;
+    uint32_t keys_crc = 0xffffffffU;
+
+    StreamingSidecarBuilder(DeltaDatabase& database, const TableSchema& schema, const Index& index, uint64_t generation,
+                            epoch_si_poc::Epoch snapshot_epoch)
+        : database(database), schema(schema), index(index), generation(generation), snapshot_epoch(snapshot_epoch),
+          prefix(MakePrefix(schema, index, generation, snapshot_epoch)) {
+        directory_fd = open(database.directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "open staged sidecar directory");
+        entries_name = prefix + ".entries";
+        keys_name = prefix + ".keys";
+        row_order_name = prefix + ".roworder";
+        spool_name = prefix + ".spool";
+        staged_name = prefix;
+        try {
+            entries_fd = Create(entries_name);
+            keys_fd = Create(keys_name);
+            row_order_fd = Create(row_order_name);
+            spool_fd = Create(spool_name);
+        } catch (...) {
+            Cleanup();
+            throw;
+        }
+    }
+    ~StreamingSidecarBuilder() {
+        Cleanup();
+    }
+    StreamingSidecarBuilder(const StreamingSidecarBuilder&) = delete;
+    StreamingSidecarBuilder& operator=(const StreamingSidecarBuilder&) = delete;
+    static std::string MakePrefix(const TableSchema& schema, const Index& index, uint64_t generation,
+                                  epoch_si_poc::Epoch epoch) {
+        const uint64_t serial = staged_sidecar_sequence.fetch_add(1, std::memory_order_relaxed);
+        return "deltaidx-staged." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id) + ".g" +
+               std::to_string(generation) + ".e" + std::to_string(epoch) + "." + std::to_string(getpid()) + "." +
+               std::to_string(serial);
+    }
+    std::string Token(const char* suffix) {
+        if (prefix.empty())
+            prefix = MakePrefix(schema, index, generation, snapshot_epoch);
+        return prefix + "." + suffix;
+    }
+    int Create(const std::string& name) {
+        int fd = openat(directory_fd, name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create staged sidecar section");
+        struct stat status {};
+        if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)) {
+            close(fd);
+            throw std::runtime_error("staged sidecar section is not regular");
+        }
+        owned.emplace(name, std::make_pair(status.st_dev, status.st_ino));
+        return fd;
+    }
+    static void WriteAll(int fd, const void* data, size_t bytes) {
+        const auto* input = static_cast<const uint8_t*>(data);
+        while (bytes) {
+            const ssize_t written = write(fd, input, bytes);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                throw std::system_error(errno, std::generic_category(), "write staged sidecar");
+            input += written;
+            bytes -= static_cast<size_t>(written);
+        }
+    }
+    void Add(std::string_view key, uint64_t local_id) {
+        if (key.size() > std::numeric_limits<uint32_t>::max())
+            throw std::runtime_error("staged sidecar key too large");
+        std::array<uint8_t, 12> header{};
+        PutLeAt<uint32_t>(header, 0, static_cast<uint32_t>(key.size()));
+        PutLeAt<uint64_t>(header, 4, local_id);
+        WriteAll(spool_fd, header.data(), header.size());
+        WriteAll(spool_fd, key.data(), key.size());
+    }
+    StagedSidecarArtifact Finish(const std::function<bool()>& progress = {}) {
+        sorter = std::make_unique<detail::SidecarSorter>(database.directory_, prefix + ".sort");
+        if (lseek(spool_fd, 0, SEEK_SET) < 0)
+            throw std::system_error(errno, std::generic_category(), "rewind staged sidecar spool");
+        std::array<uint8_t, 12> record_header{};
+        size_t progress_units = 0;
+        const auto progress_step = [&] {
+            if (++progress_units < 4096)
+                return true;
+            progress_units = 0;
+            return !progress || progress();
+        };
+        while (true) {
+            if (database.maintenance_cancel_.load(std::memory_order_acquire))
+                throw detail::SidecarSortCancelled();
+            size_t header_bytes = 0;
+            while (header_bytes < record_header.size()) {
+                ssize_t got = read(spool_fd, record_header.data() + header_bytes, record_header.size() - header_bytes);
+                if (got < 0 && errno == EINTR)
+                    continue;
+                if (got == 0)
+                    break;
+                if (got < 0)
+                    throw std::system_error(errno, std::generic_category(), "read staged sidecar spool");
+                header_bytes += static_cast<size_t>(got);
+            }
+            ssize_t got = static_cast<ssize_t>(header_bytes);
+            if (got == 0)
+                break;
+            if (got != static_cast<ssize_t>(record_header.size()))
+                throw std::runtime_error("truncated staged sidecar spool");
+            const uint32_t key_size = GetLeAt<uint32_t>(record_header.data());
+            const uint64_t local_id = GetLeAt<uint64_t>(record_header.data() + 4);
+            std::string key(key_size, '\0');
+            size_t key_bytes_read = 0;
+            while (key_bytes_read < key.size()) {
+                ssize_t n = read(spool_fd, key.data() + key_bytes_read, key.size() - key_bytes_read);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n <= 0)
+                    throw std::runtime_error("truncated staged sidecar spool");
+                key_bytes_read += static_cast<size_t>(n);
+            }
+            sorter->Add(std::move(key), local_id);
+            if (!progress_step())
+                throw detail::SidecarSortCancelled();
+        }
+        const auto cancelled = [&] {
+            if (database.maintenance_cancel_.load(std::memory_order_acquire))
+                return true;
+            return !progress_step();
+        };
+        sorter->Finish(
+            [&](std::string_view key, uint64_t local_id) {
+                if (count == std::numeric_limits<uint32_t>::max() || key_bytes > kMaxSidecarBytes - key.size())
+                    throw std::runtime_error("staged sidecar size overflow");
+                std::array<uint8_t, kSidecarEntryBytes> entry{};
+                PutLeAt<uint64_t>(entry, 0, key_bytes);
+                PutLeAt<uint64_t>(entry, 8, local_id);
+                WriteAll(entries_fd, entry.data(), entry.size());
+                WriteAll(keys_fd, key.data(), key.size());
+                entries_crc = UpdateCrc32(entries_crc, entry.data(), entry.size());
+                keys_crc = UpdateCrc32(keys_crc, reinterpret_cast<const uint8_t*>(key.data()), key.size());
+                std::vector<uint8_t> encoded_id;
+                PutBe<uint64_t>(encoded_id, local_id);
+                if (!row_sorter)
+                    row_sorter = std::make_unique<detail::SidecarSorter>(database.directory_, prefix + ".rowsort");
+                row_sorter->Add(std::string_view(reinterpret_cast<const char*>(encoded_id.data()), encoded_id.size()),
+                                count);
+                key_bytes += key.size();
+                ++count;
+            },
+            cancelled);
+        uint32_t row_crc = 0xffffffffU;
+        uint64_t row_count = 0;
+        std::string previous;
+        if (!row_sorter)
+            row_sorter = std::make_unique<detail::SidecarSorter>(database.directory_, prefix + ".rowsort");
+        row_sorter->Finish(
+            [&](std::string_view, uint64_t ordinal) {
+                if (ordinal > std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error("staged sidecar ordinal overflow");
+                std::array<uint8_t, sizeof(uint32_t)> value{};
+                PutLeAt<uint32_t>(value, 0, static_cast<uint32_t>(ordinal));
+                WriteAll(row_order_fd, value.data(), value.size());
+                row_crc = UpdateCrc32(row_crc, value.data(), value.size());
+                ++row_count;
+            },
+            cancelled);
+        if (row_count != count)
+            throw std::runtime_error("staged sidecar row count mismatch");
+        const uint64_t keys_offset = kSidecarHeaderBytes + count * kSidecarEntryBytes;
+        const uint64_t row_offset = AlignUp(keys_offset + key_bytes, alignof(uint32_t));
+        const uint64_t row_bytes = count * kSidecarRowOrderEntryBytes;
+        const uint64_t total = row_offset + row_bytes;
+        if (total > kMaxSidecarBytes)
+            throw std::runtime_error("staged sidecar exceeds size limit");
+        SidecarHeader header{kSidecarMagic,
+                             kSidecarFormatVersion,
+                             kSidecarHeaderBytes,
+                             kSidecarEntryBytes,
+                             schema.id,
+                             index.constraint_id,
+                             generation,
+                             snapshot_epoch,
+                             count,
+                             total,
+                             key_bytes,
+                             row_offset,
+                             ~entries_crc,
+                             ~keys_crc,
+                             ~row_crc,
+                             0};
+        auto encoded = EncodeSidecarHeader(header);
+        header.header_crc = Crc32(encoded.data(), kSidecarHeaderCrcOffset);
+        encoded = EncodeSidecarHeader(header);
+        staged_name = prefix;
+        int staged_fd = Create(staged_name);
+        if (ftruncate(staged_fd, static_cast<off_t>(total)) != 0)
+            throw std::system_error(errno, std::generic_category(), "size staged sidecar");
+        Copy(entries_fd, staged_fd, count * kSidecarEntryBytes, kSidecarHeaderBytes, progress_step);
+        Copy(keys_fd, staged_fd, key_bytes, keys_offset, progress_step);
+        Copy(row_order_fd, staged_fd, row_bytes, row_offset, progress_step);
+        std::array<uint8_t, 3> zeros{};
+        for (uint64_t offset = keys_offset + key_bytes; offset < row_offset; offset += zeros.size())
+            WriteAt(staged_fd, zeros.data(), static_cast<size_t>(std::min<uint64_t>(zeros.size(), row_offset - offset)),
+                    offset);
+        WriteAt(staged_fd, encoded.data(), encoded.size(), 0);
+        if (fsync(staged_fd) != 0)
+            throw std::system_error(errno, std::generic_category(), "flush staged sidecar");
+        struct stat status {};
+        if (fstat(staged_fd, &status) != 0 ||
+            !database.ValidateSidecarFd(schema, index, staged_fd, false, generation, snapshot_epoch,
+                                        std::make_pair(status.st_dev, status.st_ino)))
+            throw std::runtime_error("staged sidecar validation failed");
+        Remove(entries_name, entries_fd);
+        Remove(keys_name, keys_fd);
+        Remove(row_order_name, row_order_fd);
+        Remove(spool_name, spool_fd);
+        struct stat final_status {};
+        if (fstat(staged_fd, &final_status) != 0)
+            throw std::system_error(errno, std::generic_category(), "stat staged sidecar");
+        close(staged_fd);
+        staged_fd = -1;
+        owned.erase(staged_name);
+        StagedSidecarArtifact result{directory_fd,
+                                     staged_name,
+                                     database.directory_ + "/" + staged_name,
+                                     final_status.st_dev,
+                                     final_status.st_ino,
+                                     schema.id,
+                                     index.constraint_id,
+                                     generation,
+                                     snapshot_epoch,
+                                     count};
+        directory_fd = -1;
+        staged_name.clear();
+        return result;
+    }
+
+private:
+    void Copy(int source, int target, uint64_t bytes, uint64_t offset, const std::function<bool()>& progress) {
+        std::array<uint8_t, 1U << 16> buffer{};
+        uint64_t progress_bytes = 0;
+        for (uint64_t position = 0; position < bytes;) {
+            size_t amount = static_cast<size_t>(std::min<uint64_t>(buffer.size(), bytes - position));
+            size_t got_bytes = 0;
+            while (got_bytes < amount) {
+                ssize_t got = pread(source, buffer.data() + got_bytes, amount - got_bytes,
+                                    static_cast<off_t>(position + got_bytes));
+                if (got < 0 && errno == EINTR)
+                    continue;
+                if (got <= 0)
+                    throw std::runtime_error("truncated staged sidecar section");
+                got_bytes += static_cast<size_t>(got);
+            }
+            WriteAt(target, buffer.data(), amount, offset + position);
+            position += amount;
+            progress_bytes += amount;
+            if (progress_bytes >= (4U << 20)) {
+                progress_bytes = 0;
+                if (progress && !progress())
+                    throw detail::SidecarSortCancelled();
+            }
+        }
+    }
+    static void WriteAt(int fd, const void* data, size_t bytes, uint64_t offset) {
+        const auto* input = static_cast<const uint8_t*>(data);
+        while (bytes) {
+            ssize_t written = pwrite(fd, input, bytes, static_cast<off_t>(offset));
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                throw std::system_error(errno, std::generic_category(), "write staged sidecar");
+            input += written;
+            bytes -= static_cast<size_t>(written);
+            offset += static_cast<size_t>(written);
+        }
+    }
+    void Remove(const std::string& name, int& fd) noexcept {
+        if (fd >= 0)
+            close(std::exchange(fd, -1));
+        auto found = owned.find(name);
+        if (found == owned.end())
+            return;
+        struct stat status {};
+        if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 &&
+            status.st_dev == found->second.first && status.st_ino == found->second.second)
+            if (unlinkat(directory_fd, name.c_str(), 0) == 0)
+                owned.erase(found);
+    }
+    void Cleanup() noexcept {
+        if (directory_fd < 0)
+            return;
+        if (entries_fd >= 0)
+            close(std::exchange(entries_fd, -1));
+        if (keys_fd >= 0)
+            close(std::exchange(keys_fd, -1));
+        if (row_order_fd >= 0)
+            close(std::exchange(row_order_fd, -1));
+        if (spool_fd >= 0)
+            close(std::exchange(spool_fd, -1));
+        for (auto& [name, identity] : owned) {
+            struct stat status {};
+            if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 &&
+                status.st_dev == identity.first && status.st_ino == identity.second)
+                unlinkat(directory_fd, name.c_str(), 0);
+        }
+        close(directory_fd);
+        directory_fd = entries_fd = keys_fd = row_order_fd = spool_fd = -1;
+    }
+};
+
+DeltaDatabase::StreamingSidecarPtr DeltaDatabase::BeginStreamingSidecar(const TableSchema& schema, const Index& index,
+                                                                        uint64_t generation,
+                                                                        epoch_si_poc::Epoch snapshot_epoch) {
+    return StreamingSidecarPtr(new StreamingSidecarBuilder(*this, schema, index, generation, snapshot_epoch));
+}
+
+void DeltaDatabase::AddStreamingSidecar(StreamingSidecarBuilder* builder, std::string_view key, uint64_t local_id) {
+    builder->Add(key, local_id);
+}
+
+DeltaDatabase::StagedSidecarArtifact DeltaDatabase::FinishStreamingSidecar(StreamingSidecarBuilder* builder,
+                                                                           const std::function<bool()>& progress) {
+    return builder->Finish(progress);
+}
+
+void DeltaDatabase::StreamingSidecarDeleter::operator()(StreamingSidecarBuilder* builder) const noexcept {
+    delete builder;
+}
+
 std::string DeltaDatabase::DistinctKey(const Column& column, const Cell& cell) const {
     std::string key(1, static_cast<char>(column.type));
     const auto append = [&](uint32_t value) {
@@ -1729,6 +2618,231 @@ std::string DeltaDatabase::DistinctKey(const Column& column, const Cell& cell) c
     } else
         key += cell.text;
     return key;
+}
+
+DeltaDatabase::StagedSidecarArtifact
+DeltaDatabase::BuildStagedSidecarForTest(const TableSchema& schema, const Index& index,
+                                         const std::vector<SidecarBuildEntry>& entries, uint64_t generation,
+                                         uint64_t snapshot_epoch) {
+    const int directory_fd = open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open staged sidecar directory");
+    const uint64_t serial = staged_sidecar_sequence.fetch_add(1, std::memory_order_relaxed);
+    const std::string prefix = "deltaidx-staged." + std::to_string(schema.id) + "." +
+                               std::to_string(index.constraint_id) + ".g" + std::to_string(generation) + ".e" +
+                               std::to_string(snapshot_epoch) + "." + std::to_string(getpid()) + "." +
+                               std::to_string(serial);
+    const std::string entries_name = prefix + ".entries";
+    const std::string keys_name = prefix + ".keys";
+    const std::string row_order_name = prefix + ".roworder";
+    const std::string staged_name = prefix;
+    const std::string staged_path = directory_ + "/" + staged_name;
+    int entries_fd = -1;
+    int keys_fd = -1;
+    int row_order_fd = -1;
+    int staged_fd = -1;
+    std::map<std::string, std::pair<dev_t, ino_t>> owned_files;
+    auto remember = [&](const std::string& name, int fd) {
+        struct stat status {};
+        if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode))
+            throw std::runtime_error("staged sidecar section is not regular");
+        owned_files.emplace(name, std::make_pair(status.st_dev, status.st_ino));
+    };
+    auto remove_owned = [&](const std::string& name, int& fd) noexcept {
+        const auto found = owned_files.find(name);
+        if (fd >= 0)
+            close(std::exchange(fd, -1));
+        if (found == owned_files.end())
+            return;
+        struct stat status {};
+        if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(status.st_mode) &&
+            status.st_dev == found->second.first && status.st_ino == found->second.second)
+            (void)unlinkat(directory_fd, name.c_str(), 0);
+    };
+    auto cleanup_all = [&]() noexcept {
+        remove_owned(entries_name, entries_fd);
+        remove_owned(keys_name, keys_fd);
+        remove_owned(row_order_name, row_order_fd);
+        remove_owned(staged_name, staged_fd);
+    };
+    auto write_all = [](int fd, const void* data, size_t size) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        while (size != 0) {
+            const ssize_t written = write(fd, bytes, size);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                throw std::system_error(errno, std::generic_category(), "write staged sidecar");
+            bytes += written;
+            size -= static_cast<size_t>(written);
+        }
+    };
+    auto copy_file = [&](int source, int target, uint64_t bytes, uint64_t target_offset) {
+        std::array<uint8_t, 1U << 16> buffer{};
+        uint64_t offset = 0;
+        while (offset < bytes) {
+            const size_t amount = static_cast<size_t>(std::min<uint64_t>(buffer.size(), bytes - offset));
+            size_t done = 0;
+            while (done < amount) {
+                const ssize_t read_bytes =
+                    pread(source, buffer.data() + done, amount - done, static_cast<off_t>(offset + done));
+                if (read_bytes < 0 && errno == EINTR)
+                    continue;
+                if (read_bytes <= 0)
+                    throw std::runtime_error("truncated staged sidecar section");
+                done += static_cast<size_t>(read_bytes);
+            }
+            size_t written = 0;
+            while (written < amount) {
+                const ssize_t n = pwrite(target, buffer.data() + written, amount - written,
+                                         static_cast<off_t>(target_offset + offset + written));
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n <= 0)
+                    throw std::system_error(errno, std::generic_category(), "write staged sidecar section");
+                written += static_cast<size_t>(n);
+            }
+            offset += amount;
+        }
+    };
+    auto write_at_all = [&](int fd, const void* data, size_t size, uint64_t offset) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        while (size != 0) {
+            const ssize_t written = pwrite(fd, bytes, size, static_cast<off_t>(offset));
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                throw std::system_error(errno, std::generic_category(), "write staged sidecar");
+            bytes += written;
+            size -= static_cast<size_t>(written);
+            offset += static_cast<size_t>(written);
+        }
+    };
+    try {
+        entries_fd =
+            openat(directory_fd, entries_name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (entries_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create staged sidecar entries");
+        remember(entries_name, entries_fd);
+        keys_fd = openat(directory_fd, keys_name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (keys_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create staged sidecar keys");
+        remember(keys_name, keys_fd);
+        row_order_fd =
+            openat(directory_fd, row_order_name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (row_order_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create staged sidecar row order");
+        remember(row_order_name, row_order_fd);
+
+        detail::SidecarSorter first(directory_, prefix + ".sort");
+        for (const auto& entry : entries)
+            first.Add(std::string_view(reinterpret_cast<const char*>(entry.key.data()), entry.key.size()),
+                      entry.local_id);
+        detail::SidecarSorter row_sorter(directory_, prefix + ".rowsort");
+        uint64_t count = 0;
+        uint64_t key_bytes = 0;
+        uint32_t entries_crc = 0xffffffffU;
+        uint32_t keys_crc = 0xffffffffU;
+        first.Finish([&](std::string_view key, uint64_t local_id) {
+            if (count == std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error("staged sidecar entry count overflow");
+            if (key.size() > kMaxRowBytes || key_bytes > kMaxSidecarBytes - key.size())
+                throw std::runtime_error("staged sidecar key bytes overflow");
+            std::array<uint8_t, kSidecarEntryBytes> entry_bytes{};
+            PutLeAt<uint64_t>(entry_bytes, 0, key_bytes);
+            PutLeAt<uint64_t>(entry_bytes, 8, local_id);
+            write_all(entries_fd, entry_bytes.data(), entry_bytes.size());
+            write_all(keys_fd, key.data(), key.size());
+            entries_crc = UpdateCrc32(entries_crc, entry_bytes.data(), entry_bytes.size());
+            keys_crc = UpdateCrc32(keys_crc, reinterpret_cast<const uint8_t*>(key.data()), key.size());
+            std::vector<uint8_t> sortable_id;
+            PutBe<uint64_t>(sortable_id, local_id);
+            row_sorter.Add(std::string_view(reinterpret_cast<const char*>(sortable_id.data()), sortable_id.size()),
+                           count);
+            key_bytes += key.size();
+            ++count;
+        });
+        uint32_t row_order_crc = 0xffffffffU;
+        uint64_t row_count = 0;
+        std::string previous_row_key;
+        row_sorter.Finish([&](std::string_view row_key, uint64_t ordinal) {
+            if (row_key == previous_row_key)
+                throw std::runtime_error("duplicate staged sidecar local id");
+            previous_row_key.assign(row_key.data(), row_key.size());
+            if (ordinal > std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error("staged sidecar ordinal overflow");
+            std::array<uint8_t, sizeof(uint32_t)> bytes{};
+            PutLeAt<uint32_t>(bytes, 0, static_cast<uint32_t>(ordinal));
+            write_all(row_order_fd, bytes.data(), bytes.size());
+            row_order_crc = UpdateCrc32(row_order_crc, bytes.data(), bytes.size());
+            ++row_count;
+        });
+        if (row_count != count)
+            throw std::runtime_error("staged sidecar row order count mismatch");
+        const uint64_t keys_offset = kSidecarHeaderBytes + count * kSidecarEntryBytes;
+        const uint64_t row_order_offset = AlignUp(keys_offset + key_bytes, alignof(uint32_t));
+        const uint64_t row_order_bytes = count * kSidecarRowOrderEntryBytes;
+        const uint64_t total_bytes = row_order_offset + row_order_bytes;
+        if (total_bytes > kMaxSidecarBytes)
+            throw std::runtime_error("staged sidecar exceeds size limit");
+        SidecarHeader header{kSidecarMagic,
+                             kSidecarFormatVersion,
+                             kSidecarHeaderBytes,
+                             kSidecarEntryBytes,
+                             schema.id,
+                             index.constraint_id,
+                             generation,
+                             snapshot_epoch,
+                             count,
+                             total_bytes,
+                             key_bytes,
+                             row_order_offset,
+                             ~entries_crc,
+                             ~keys_crc,
+                             ~row_order_crc,
+                             0};
+        auto encoded = EncodeSidecarHeader(header);
+        header.header_crc = Crc32(encoded.data(), kSidecarHeaderCrcOffset);
+        encoded = EncodeSidecarHeader(header);
+        staged_fd = openat(directory_fd, staged_name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (staged_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create staged sidecar");
+        remember(staged_name, staged_fd);
+        if (ftruncate(staged_fd, static_cast<off_t>(total_bytes)) != 0)
+            throw std::system_error(errno, std::generic_category(), "size staged sidecar");
+        copy_file(entries_fd, staged_fd, count * kSidecarEntryBytes, kSidecarHeaderBytes);
+        copy_file(keys_fd, staged_fd, key_bytes, keys_offset);
+        copy_file(row_order_fd, staged_fd, row_order_bytes, row_order_offset);
+        std::array<uint8_t, 3> padding{};
+        if (row_order_offset > keys_offset + key_bytes)
+            for (uint64_t offset = keys_offset + key_bytes; offset < row_order_offset; offset += padding.size())
+                write_at_all(staged_fd, padding.data(),
+                             static_cast<size_t>(std::min<uint64_t>(padding.size(), row_order_offset - offset)),
+                             offset);
+        write_at_all(staged_fd, encoded.data(), encoded.size(), 0);
+        if (fsync(staged_fd) != 0)
+            throw std::system_error(errno, std::generic_category(), "flush staged sidecar");
+        struct stat staged_identity {};
+        if (fstat(staged_fd, &staged_identity) != 0 ||
+            !ValidateSidecarFd(schema, index, staged_fd, false, generation, snapshot_epoch,
+                               std::make_pair(staged_identity.st_dev, staged_identity.st_ino)))
+            throw std::runtime_error("staged sidecar validation failed");
+        remove_owned(entries_name, entries_fd);
+        remove_owned(keys_name, keys_fd);
+        remove_owned(row_order_name, row_order_fd);
+        struct stat staged_stat {};
+        if (fstat(staged_fd, &staged_stat) != 0)
+            throw std::system_error(errno, std::generic_category(), "stat staged sidecar");
+        close(staged_fd);
+        staged_fd = -1;
+        return StagedSidecarArtifact{directory_fd,       staged_name, staged_path,         staged_stat.st_dev,
+                                     staged_stat.st_ino, schema.id,   index.constraint_id, generation,
+                                     snapshot_epoch,     count};
+    } catch (...) {
+        cleanup_all();
+        close(directory_fd);
+        throw;
+    }
 }
 
 void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
@@ -1840,14 +2954,11 @@ void DeltaDatabase::BuildSidecars(const TableSchema& schema, std::vector<std::ve
     }
 }
 
-bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& index) {
-    const std::string path =
-        directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id);
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        sidecars_.erase(index.constraint_id);
-        return false;
-    }
+bool DeltaDatabase::ValidateSidecarFd(const TableSchema& schema, const Index& index, int fd, bool install,
+                                      std::optional<uint64_t> expected_generation,
+                                      std::optional<uint64_t> expected_snapshot_epoch,
+                                      std::optional<std::pair<dev_t, ino_t>> expected_identity) {
+    const bool staged = expected_identity.has_value();
     ++sidecar_validation_count_;
     const auto read_exact = [&](void* output, size_t bytes, uint64_t offset) {
         auto* out = static_cast<uint8_t*>(output);
@@ -1864,23 +2975,28 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
     };
     std::array<uint8_t, kSidecarHeaderBytes> header_bytes{};
     struct stat st {};
-    const auto generation = db_.TableGeneration(schema.id);
+    const auto generation = expected_generation ? expected_generation : db_.TableGeneration(schema.id);
     const auto visible_from = db_.TableVisibleFrom(schema.id);
     const bool read_header = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
                              static_cast<uint64_t>(st.st_size) >= header_bytes.size() &&
                              read_exact(header_bytes.data(), header_bytes.size(), 0);
     const SidecarHeader header = read_header ? DecodeSidecarHeader(header_bytes.data()) : SidecarHeader{};
-    const bool header_valid =
-        generation && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && visible_from && read_header &&
-        header.magic == kSidecarMagic && header.format_version == kSidecarFormatVersion &&
-        header.header_bytes == kSidecarHeaderBytes && header.entry_bytes == kSidecarEntryBytes &&
-        GetLeAt<uint32_t>(header_bytes.data() + 28) == 0 && header.table_id == schema.id &&
-        header.constraint_id == index.constraint_id && header.generation == *generation &&
-        *visible_from <= header.snapshot_epoch && header.snapshot_epoch <= db_.engine().published_epoch() &&
-        header.total_bytes == static_cast<uint64_t>(st.st_size) && header.total_bytes <= kMaxSidecarBytes &&
-        header.count <= std::numeric_limits<uint32_t>::max() &&
-        header.total_bytes <= std::numeric_limits<size_t>::max() &&
-        header.header_crc == Crc32(header_bytes.data(), kSidecarHeaderCrcOffset);
+    const bool identity_valid =
+        !expected_identity || (st.st_dev == expected_identity->first && st.st_ino == expected_identity->second);
+    const bool header_valid = generation && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+                              (staged || visible_from) && identity_valid && read_header &&
+                              header.magic == kSidecarMagic && header.format_version == kSidecarFormatVersion &&
+                              header.header_bytes == kSidecarHeaderBytes && header.entry_bytes == kSidecarEntryBytes &&
+                              GetLeAt<uint32_t>(header_bytes.data() + 28) == 0 && header.table_id == schema.id &&
+                              header.constraint_id == index.constraint_id && header.generation == *generation &&
+                              (!expected_snapshot_epoch || header.snapshot_epoch == *expected_snapshot_epoch) &&
+                              (!visible_from || *visible_from <= header.snapshot_epoch) &&
+                              (staged || header.snapshot_epoch <= db_.engine().published_epoch()) &&
+                              header.total_bytes == static_cast<uint64_t>(st.st_size) &&
+                              header.total_bytes <= kMaxSidecarBytes &&
+                              header.count <= std::numeric_limits<uint32_t>::max() &&
+                              header.total_bytes <= std::numeric_limits<size_t>::max() &&
+                              header.header_crc == Crc32(header_bytes.data(), kSidecarHeaderCrcOffset);
     uint64_t entry_bytes = 0;
     uint64_t keys_offset = 0;
     uint64_t keys_end = 0;
@@ -1892,10 +3008,9 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
         CheckedAdd(kSidecarHeaderBytes, entry_bytes, &keys_offset) &&
         CheckedAdd(keys_offset, header.key_bytes, &keys_end) &&
         header.count <= std::numeric_limits<uint64_t>::max() / kSidecarRowOrderEntryBytes &&
-        CheckedMultiply(header.count, kSidecarRowOrderEntryBytes, &row_order_bytes) &&
-        keys_end <= kMaxSidecarBytes && row_order_bytes <= kMaxSidecarBytes &&
-        header.row_order_offset >= keys_end && header.row_order_offset - keys_end < alignof(uint32_t) &&
-        header.row_order_offset % alignof(uint32_t) == 0 &&
+        CheckedMultiply(header.count, kSidecarRowOrderEntryBytes, &row_order_bytes) && keys_end <= kMaxSidecarBytes &&
+        row_order_bytes <= kMaxSidecarBytes && header.row_order_offset >= keys_end &&
+        header.row_order_offset - keys_end < alignof(uint32_t) && header.row_order_offset % alignof(uint32_t) == 0 &&
         header.row_order_offset <= kMaxSidecarBytes - row_order_bytes &&
         CheckedAdd(header.row_order_offset, row_order_bytes, &expected_total_bytes) &&
         expected_total_bytes == header.total_bytes;
@@ -1904,8 +3019,7 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
         const size_t padding_bytes = static_cast<size_t>(header.row_order_offset - keys_end);
         std::array<uint8_t, alignof(uint32_t) - 1> padding{};
         valid = read_exact(padding.data(), padding_bytes, keys_end) &&
-                std::all_of(padding.begin(), padding.begin() + padding_bytes,
-                            [](uint8_t byte) { return byte == 0; });
+                std::all_of(padding.begin(), padding.begin() + padding_bytes, [](uint8_t byte) { return byte == 0; });
     }
     std::array<uint8_t, 4096 * kSidecarEntryBytes> chunk{};
     uint64_t done = 0;
@@ -1956,7 +3070,6 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
     void* mapping = MAP_FAILED;
     if (valid)
         mapping = mmap(nullptr, static_cast<size_t>(header.total_bytes), PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
     if (valid && mapping != MAP_FAILED) {
         const auto* mapped = static_cast<const uint8_t*>(mapping);
         uint64_t previous_local_id = 0;
@@ -1974,14 +3087,172 @@ bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& inde
     if (!valid || mapping == MAP_FAILED) {
         if (mapping != MAP_FAILED)
             munmap(mapping, static_cast<size_t>(header.total_bytes));
-        sidecars_.erase(index.constraint_id);
+        if (install)
+            sidecars_.erase(index.constraint_id);
         return false;
     }
-    sidecars_.insert_or_assign(index.constraint_id,
-                               SidecarDescriptor{schema.id, index.constraint_id, *generation, header.snapshot_epoch,
-                                                 header.count, header.key_bytes, header.row_order_offset,
-                                                 static_cast<size_t>(header.total_bytes), mapping});
+    if (install) {
+        sidecars_.insert_or_assign(index.constraint_id,
+                                   SidecarDescriptor{schema.id, index.constraint_id, *generation, header.snapshot_epoch,
+                                                     header.count, header.key_bytes, header.row_order_offset,
+                                                     static_cast<size_t>(header.total_bytes), mapping});
+    } else {
+        munmap(mapping, static_cast<size_t>(header.total_bytes));
+    }
     return true;
+}
+
+DeltaDatabase::SidecarDescriptor DeltaDatabase::PrepareSidecarDescriptor(const TableSchema& schema, const Index& index,
+                                                                         const StagedSidecarArtifact& artifact) {
+    if (artifact.table_id != schema.id || artifact.constraint_id != index.constraint_id)
+        throw std::logic_error("staged sidecar identity mismatch");
+    const int fd = artifact.OpenOwned();
+    try {
+        if (!ValidateSidecarFd(schema, index, fd, false, artifact.generation, artifact.snapshot_epoch,
+                               std::make_pair(artifact.device, artifact.inode)))
+            throw std::runtime_error("promoted sidecar validation failed");
+        std::array<uint8_t, kSidecarHeaderBytes> bytes{};
+        size_t done = 0;
+        while (done < bytes.size()) {
+            const ssize_t count = pread(fd, bytes.data() + done, bytes.size() - done, static_cast<off_t>(done));
+            if (count < 0 && errno == EINTR)
+                continue;
+            if (count <= 0)
+                throw std::runtime_error("promoted sidecar header is truncated");
+            done += static_cast<size_t>(count);
+        }
+        const SidecarHeader header = DecodeSidecarHeader(bytes.data());
+        if (header.count != artifact.count)
+            throw std::runtime_error("promoted sidecar row count changed");
+        void* mapping = mmap(nullptr, static_cast<size_t>(header.total_bytes), PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED)
+            throw std::system_error(errno, std::generic_category(), "map promoted sidecar");
+        try {
+            SidecarDescriptor descriptor{
+                schema.id,    index.constraint_id, artifact.generation,     artifact.snapshot_epoch,
+                header.count, header.key_bytes,    header.row_order_offset, static_cast<size_t>(header.total_bytes),
+                mapping};
+            close(fd);
+            return descriptor;
+        } catch (...) {
+            munmap(mapping, static_cast<size_t>(header.total_bytes));
+            throw;
+        }
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+}
+
+void DeltaDatabase::InstallSnapshotSidecars(
+    std::map<epoch_si_poc::ConstraintId, SidecarDescriptor>& replacements) noexcept {
+    try {
+        for (const auto& [constraint_id, descriptor] : replacements) {
+            (void)descriptor;
+            sidecars_.erase(constraint_id);
+        }
+        sidecars_.merge(replacements);
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void DeltaDatabase::CleanupGenerationSidecarOrphans() noexcept {
+    try {
+        const int directory_fd = open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory_fd < 0)
+            return;
+        const std::regex generated(R"(^deltaidx\.[0-9]+\.[0-9]+\.g[0-9]+$)");
+        bool removed = false;
+        std::error_code iteration_error;
+        for (std::filesystem::directory_iterator it(directory_, iteration_error), end; !iteration_error && it != end;
+             it.increment(iteration_error)) {
+            const std::string name = it->path().filename().string();
+            if (!std::regex_match(name, generated))
+                continue;
+            bool keep = false;
+            for (const auto& [table_name, schema] : tables_) {
+                (void)table_name;
+                const auto generation = db_.TableGeneration(schema.id);
+                if (!generation)
+                    continue;
+                for (const auto& index : schema.indexes)
+                    keep = keep || name == SidecarGenerationName(schema.id, index.constraint_id, *generation);
+            }
+            if (keep)
+                continue;
+            struct stat status {};
+            if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(status.st_mode))
+                continue;
+            const int file_fd = openat(directory_fd, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (file_fd < 0)
+                continue;
+            struct stat opened {};
+            const bool owned = fstat(file_fd, &opened) == 0 && S_ISREG(opened.st_mode) &&
+                               opened.st_dev == status.st_dev && opened.st_ino == status.st_ino;
+            if (owned && unlinkat(directory_fd, name.c_str(), 0) == 0)
+                removed = true;
+            close(file_fd);
+        }
+        if (removed)
+            while (fsync(directory_fd) != 0 && errno == EINTR) {
+            }
+        close(directory_fd);
+    } catch (...) {
+    }
+}
+
+void DeltaDatabase::CleanupStagedSidecarOrphans() noexcept {
+    try {
+        const int directory_fd = open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory_fd < 0)
+            return;
+        const std::regex generated(
+            R"(^deltaidx-staged\.[0-9]+\.[0-9]+\.g[0-9]+\.e[0-9]+\.[0-9]+\.[0-9]+($|\.(entries|keys|roworder|spool)|\.(sort|rowsort)-sort-run-[0-9]+)$)");
+        bool removed = false;
+        std::error_code iteration_error;
+        for (std::filesystem::directory_iterator it(directory_, iteration_error), end; !iteration_error && it != end;
+             it.increment(iteration_error)) {
+            const std::string name = it->path().filename().string();
+            if (!std::regex_match(name, generated))
+                continue;
+            struct stat status {};
+            if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(status.st_mode))
+                continue;
+            const int fd = openat(directory_fd, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (fd < 0)
+                continue;
+            struct stat opened {};
+            const bool owned = fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) && opened.st_dev == status.st_dev &&
+                               opened.st_ino == status.st_ino;
+            close(fd);
+            if (owned && unlinkat(directory_fd, name.c_str(), 0) == 0)
+                removed = true;
+        }
+        if (removed)
+            while (fsync(directory_fd) != 0 && errno == EINTR) {
+            }
+        close(directory_fd);
+    } catch (...) {
+    }
+}
+
+bool DeltaDatabase::ValidateSidecar(const TableSchema& schema, const Index& index) {
+    std::vector<std::string> paths;
+    if (const auto generation = db_.TableGeneration(schema.id))
+        paths.push_back(directory_ + "/" + SidecarGenerationName(schema.id, index.constraint_id, *generation));
+    paths.push_back(directory_ + "/deltaidx." + std::to_string(schema.id) + "." + std::to_string(index.constraint_id));
+    for (const auto& path : paths) {
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0)
+            continue;
+        const bool valid = ValidateSidecarFd(schema, index, fd, true, std::nullopt, std::nullopt);
+        close(fd);
+        if (valid)
+            return true;
+    }
+    sidecars_.erase(index.constraint_id);
+    return false;
 }
 
 void DeltaDatabase::RebuildSidecars(const TableSchema& schema) {
@@ -2232,6 +3503,28 @@ void DeltaDatabase::VisitOrderedIndexInterval(
     session.census.last_overlay_refs_examined = 0;
     session.census.last_overlay_refs_copied = 0;
     session.census.last_overlay_order_ops = 0;
+    if (session.txn && session.txn->source_ != db_.engine().current_source_) {
+        // ponytail: historical generations materialize and sort; add generation-pinned sidecars only if this
+        // becomes measurable outside the latest-snapshot ranking path.
+        std::vector<std::pair<EncodedKey, epoch_si_poc::RowId>> rows;
+        db_.engine().VisitScan(*session.txn, schema.id, [&](epoch_si_poc::RowId id, const epoch_si_poc::RowImage& row) {
+            const auto key = EncodeKey(schema, index, DecodeRow(schema, row));
+            if (key >= first_key && (last_key.empty() || key < last_key))
+                rows.emplace_back(key, id);
+        });
+        std::sort(rows.begin(), rows.end());
+        *usable = true;
+        if (reverse) {
+            for (auto it = rows.rbegin(); it != rows.rend(); ++it)
+                if (!visitor(it->first, it->second))
+                    break;
+        } else {
+            for (const auto& [key, id] : rows)
+                if (!visitor(key, id))
+                    break;
+        }
+        return;
+    }
     const auto descriptor = sidecars_.find(index.constraint_id);
     if (descriptor == sidecars_.end())
         return;
@@ -2403,10 +3696,15 @@ void DeltaDatabase::VisitOrderedIndexInterval(
     };
     advance_base();
     const auto& committed_overlay = latest_snapshot ? current_overlay_ : overlay_;
-    OverlayRangeCursor<CommittedOverlay> committed(committed_overlay, schema.id, index.constraint_id, first_key, last_key,
-                                                   reverse, session.census.last_overlay_nodes_probed,
+    OverlayRangeCursor<CommittedOverlay> committed(committed_overlay, schema.id, index.constraint_id, first_key,
+                                                   last_key, reverse, session.census.last_overlay_nodes_probed,
                                                    session.census.last_row_ids_probed,
                                                    session.census.last_overlay_refs_examined);
+    const auto& frozen_committed_overlay = latest_snapshot ? frozen_current_overlay_ : frozen_overlay_;
+    OverlayRangeCursor<CommittedOverlay> frozen(frozen_committed_overlay, schema.id, index.constraint_id, first_key,
+                                                last_key, reverse, session.census.last_overlay_nodes_probed,
+                                                session.census.last_row_ids_probed,
+                                                session.census.last_overlay_refs_examined);
     OverlayRangeCursor<DeltaOverlay> local(session.overlay, schema.id, index.constraint_id, first_key, last_key,
                                            reverse, session.census.last_overlay_nodes_probed,
                                            session.census.last_row_ids_probed,
@@ -2420,15 +3718,19 @@ void DeltaDatabase::VisitOrderedIndexInterval(
         };
         if (base_valid)
             consider(base_current);
+        if (frozen.valid())
+            consider({frozen.key(), frozen.id()});
         if (committed.valid())
             consider({committed.key(), committed.id()});
         if (local.valid())
             consider({local.key(), local.id()});
         if (!selected)
             break;
-        enum class Source { Base, Committed, Local } source;
+        enum class Source { Base, Frozen, Committed, Local } source;
         if (base_valid && base_current == *selected) {
             source = Source::Base;
+        } else if (frozen.valid() && std::pair{frozen.key(), frozen.id()} == *selected) {
+            source = Source::Frozen;
         } else if (committed.valid() && std::pair{committed.key(), committed.id()} == *selected) {
             source = Source::Committed;
         } else {
@@ -2441,6 +3743,8 @@ void DeltaDatabase::VisitOrderedIndexInterval(
         emitted = std::move(selected);
         if (source == Source::Base) {
             advance_base();
+        } else if (source == Source::Frozen) {
+            frozen.Advance();
         } else if (source == Source::Committed)
             committed.Advance();
         else
@@ -3230,7 +4534,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
 
 bool DeltaDatabase::ExecutePrepared(const DeltaPreparedProgram& program, const DeltaParameterFrame& parameters,
                                     DeltaSession& session, QueryResultSink* sink) {
-    if (!program.tree_ || program.catalog_generation_ != CatalogGeneration())
+    if (!program.tree_)
         throw std::runtime_error("stale Delta prepared statement");
     PreparedParameterScope parameter_scope(parameters);
     return ExecuteImpl(program.tree_.get(), session, sink, program.catalog_generation_);
@@ -3241,8 +4545,6 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
     if (!tree)
         return false;
     std::lock_guard<std::mutex> operation_lock(session.operation_mutex);
-    if (expected_catalog_generation != 0 && expected_catalog_generation != CatalogGeneration())
-        throw std::runtime_error("stale Delta prepared statement");
     const DiagnosticOperation diagnostic_operation = ClassifyDiagnosticOperation(tree->type);
     const bool counted_execution = diagnostics_ != nullptr;
     const auto execute_started =
@@ -3269,14 +4571,24 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
     }
     const bool exclusive = tree->type == ast::AstType::StaticCheckpoint || tree->type == ast::AstType::CreateTable ||
                            tree->type == ast::AstType::CreateIndex || tree->type == ast::AstType::LoadStmt;
-    if (exclusive && session.admission)
+    const bool catalog_mutation = tree->type == ast::AstType::CreateTable || tree->type == ast::AstType::CreateIndex;
+    const bool snapshot_builder_operation = tree->type == ast::AstType::StaticCheckpoint ||
+                                            tree->type == ast::AstType::CreateIndex ||
+                                            tree->type == ast::AstType::LoadStmt;
+    if (exclusive && session.txn)
         throw std::runtime_error("Delta schema/checkpoint operation inside transaction");
+    std::unique_lock<std::mutex> snapshot_builder_lock(snapshot_builder_mutex_, std::defer_lock);
+    if (snapshot_builder_operation && !snapshot_builder_lock.try_lock()) {
+        if (snapshot_builder_wait_hook_for_test_)
+            snapshot_builder_wait_hook_for_test_();
+        snapshot_builder_lock.lock();
+    }
     std::unique_lock<std::shared_mutex> exclusive_admission;
     std::shared_lock<std::shared_mutex> statement_admission;
     std::unique_lock<std::mutex> exclusive_commit_epoch_gate;
     if (exclusive)
         exclusive_admission = LockExecutionUnique();
-    else if (!session.admission)
+    else
         statement_admission = LockExecutionShared();
     if (exclusive)
         exclusive_commit_epoch_gate = std::unique_lock<std::mutex>(commit_epoch_gate_);
@@ -3295,6 +4607,10 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             execute_shared_calls_.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    RequireUsable();
+    if (expected_catalog_generation != 0 &&
+        expected_catalog_generation != catalog_generation_snapshot_.load(std::memory_order_acquire))
+        throw std::runtime_error("stale Delta prepared statement");
     ExecutionCensus census;
     struct ExecutionDiagnosticsScope {
         DeltaDatabase* database;
@@ -3315,7 +4631,7 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             database->sidecar_base_entries_.fetch_add(census->base_entries, std::memory_order_relaxed);
             database->sidecar_overlay_refs_.fetch_add(census->overlay_refs, std::memory_order_relaxed);
             database->join_parameterized_probes_.fetch_add(census->parameterized_join_probes,
-                                                            std::memory_order_relaxed);
+                                                           std::memory_order_relaxed);
             if (census->join_parameterized)
                 database->join_parameterized_.fetch_add(1, std::memory_order_relaxed);
             if (census->join_fallback)
@@ -3335,14 +4651,10 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             if (census->ordered_materialize)
                 database->ordered_materialize_.fetch_add(1, std::memory_order_relaxed);
         }
-    } diagnostics_scope{this,
-                        &session,
-                        diagnostic_operation,
-                        &census,
-                        execute_started,
-                        counted_execution};
+    } diagnostics_scope{this, &session, diagnostic_operation, &census, execute_started, counted_execution};
     session.census = {};
-    RequireUsable();
+    if (catalog_mutation && db_.engine().active_transaction_count() != 0)
+        throw std::runtime_error("Delta catalog mutation requires no active transaction");
     if (execute_lock_hook_for_test_)
         execute_lock_hook_for_test_();
     if (tree->type == ast::AstType::ShowTables) {
@@ -3360,7 +4672,6 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             throw std::runtime_error("transaction already active");
         session.txn.emplace(db_.engine().Begin());
         session.explicit_txn = true;
-        session.admission.emplace(std::move(statement_admission));
         return false;
     }
     if (tree->type == ast::AstType::TxnCommit) {
@@ -3417,6 +4728,7 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             table_by_id_.emplace(schema.id, &schema);
         next_table_id_ = next_table;
         catalog_generation_ = generation;
+        catalog_generation_snapshot_.store(generation, std::memory_order_release);
         return false;
     }
     if (tree->type == ast::AstType::CreateIndex) {
@@ -3448,6 +4760,7 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
             table_by_id_.emplace(schema.id, &schema);
         next_constraint_id_ = next_constraint;
         catalog_generation_ = generation;
+        catalog_generation_snapshot_.store(generation, std::memory_order_release);
         try {
             // A declared index over WAL-only rows needs a tablebase generation before it can persist.
             CheckpointSidecars();
@@ -4451,7 +5764,8 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
                     if (!private_insert) {
                         for (const auto& index : schema.indexes)
                             AppendOverlay(session.removed_overlay,
-                                          {schema.id, index.constraint_id, EncodeKey(schema, index, cells)}, row_id.local_id);
+                                          {schema.id, index.constraint_id, EncodeKey(schema, index, cells)},
+                                          row_id.local_id);
                     }
                     db_.engine().Erase(txn, row_id);
                     continue;
@@ -4525,8 +5839,8 @@ bool DeltaDatabase::ExecuteImpl(const ast::TreeNode* tree, DeltaSession& session
                         continue;
                     RemoveOverlay(session.overlay, schema, index, cells, row_id);
                     if (!private_insert)
-                        AppendOverlay(session.removed_overlay,
-                                      {schema.id, index.constraint_id, old_key}, row_id.local_id);
+                        AppendOverlay(session.removed_overlay, {schema.id, index.constraint_id, old_key},
+                                      row_id.local_id);
                     AppendOverlay(session.overlay, {schema.id, index.constraint_id, new_key}, row_id.local_id);
                 }
                 db_.engine().PutImage(txn, row_id, EncodeRow(schema, next));
