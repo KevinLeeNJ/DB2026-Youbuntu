@@ -247,7 +247,7 @@ SERVER_PID=$!
 wait_port 30
 load_start=$SECONDS
 "$GO_BINARY" --command load \
-    --port "$PORT" --isolation "$ISOLATION" \
+    --port "$PORT" --isolation "$ISOLATION" --timeout "${LOAD_SQL_BUDGET_SECONDS}s" \
     --data-dir "$DATA_DIR" --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
     --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
 load_elapsed=$((SECONDS - load_start))

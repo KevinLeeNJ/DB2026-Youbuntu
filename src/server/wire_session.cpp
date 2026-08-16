@@ -51,6 +51,9 @@ void serve_wire_session(DatabaseInstance& database, int fd) {
         while (wire_protocol::read_frame(fd, frame)) {
             try {
                 handle_client_frame(database, fd, frame, session, prepared);
+            } catch (const deltakernel::DeltaTransactionAbort& exception) {
+                abort_session(database, session, nullptr);
+                wire_protocol::write_frame(fd, Tag::TRANSACTION_ABORT, make_error_payload(exception.what()));
             } catch (TransactionAbortException& exception) {
                 abort_session(database, session, nullptr);
                 wire_protocol::write_frame(fd, Tag::TRANSACTION_ABORT, make_error_payload(exception.GetInfo()));

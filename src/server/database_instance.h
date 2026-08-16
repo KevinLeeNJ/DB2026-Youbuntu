@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include <cstddef>
 #include <string>
 
+#include "deltakernel/delta_database.h"
+
 #include "analyze/analyze.h"
 #include "execution/execution_manager.h"
 #include "index/ix_manager.h"
@@ -30,10 +32,10 @@ See the Mulan PSL v2 for more details. */
 
 inline constexpr size_t SERVER_BUFFER_POOL_PAGES = (size_t{3} << 30) / PAGE_SIZE;
 
-// The concrete process composition root. Declaration order is dependency
-// order; C++ destroys it in reverse, so TransactionManager joins GC before
-// the catalog, buffer pool, and disk objects it uses are destroyed.
-struct DatabaseInstance {
+// Legacy engine ownership stays together: declaration order is dependency
+// order, so TransactionManager joins GC before the catalog, buffer pool, and
+// disk objects it uses are destroyed.
+struct LegacyDatabase {
     DiskManager disk_manager;
     BufferPoolManager buffer_pool_manager{SERVER_BUFFER_POOL_PAGES, &disk_manager};
     RmManager rm_manager{&disk_manager, &buffer_pool_manager};
@@ -47,6 +49,11 @@ struct DatabaseInstance {
     QlManager ql_manager{&sm_manager, &txn_manager};
     Analyze analyze{&sm_manager};
     RecoveryManager recovery{&disk_manager, &buffer_pool_manager, &sm_manager, &log_manager};
+};
+
+// Exactly one on-disk format is constructed for each DatabaseInstance.
+struct DatabaseInstance {
+    std::unique_ptr<deltakernel::DeltaDatabase> delta_database;
 
     void open_and_recover(const std::string& db_name);
     ~DatabaseInstance() {
@@ -56,7 +63,16 @@ struct DatabaseInstance {
         }
     }
     void close();
+    bool is_delta() const {
+        return delta_database != nullptr;
+    }
+    bool has_legacy() const {
+        return legacy_database != nullptr;
+    }
+    LegacyDatabase& legacy();
+    const LegacyDatabase& legacy() const;
 
 private:
+    std::unique_ptr<LegacyDatabase> legacy_database;
     bool open_{false};
 };

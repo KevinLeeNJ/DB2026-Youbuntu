@@ -40,9 +40,13 @@ void ServerRuntime::client_handler(int fd, std::uint64_t worker_id) {
 }
 
 void ServerRuntime::start_checkpoint() {
+    if (database_.is_delta()) {
+        return;
+    }
     checkpoint_stop_.store(false, std::memory_order_release);
     checkpoint_thread_ = std::thread([this] {
-        CheckpointManager checkpoint_mgr(&database_.txn_manager, &database_.sm_manager, &database_.log_manager);
+        auto& legacy = database_.legacy();
+        CheckpointManager checkpoint_mgr(&legacy.txn_manager, &legacy.sm_manager, &legacy.log_manager);
         while (!checkpoint_stop_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (!checkpoint_stop_.load(std::memory_order_acquire)) {

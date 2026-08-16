@@ -14,8 +14,9 @@ See the Mulan PSL v2 for more details. */
 namespace wire_session_internal {
 struct BatchExecutionContext {
     BatchExecutionContext(DatabaseInstance& database, SessionState& session)
-        : context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager),
-          catalog_guard(database.sm_manager.acquire_catalog_shared()) {
+        : context(&database.legacy().lock_manager, &database.legacy().log_manager, nullptr,
+                  &database.legacy().txn_manager),
+          catalog_guard(database.legacy().sm_manager.acquire_catalog_shared()) {
         reset_for_operation(session, nullptr);
     }
 
@@ -54,10 +55,10 @@ struct BatchExecutionContext {
 void SetTransaction(DatabaseInstance& database, SessionState& session, Context* context) {
     Transaction* txn = session.running_transaction();
     if (txn == nullptr) {
-        txn = database.txn_manager.get_transaction(session.txn_id);
+        txn = database.legacy().txn_manager.get_transaction(session.txn_id);
         if (txn == nullptr || txn->get_state() == TransactionState::COMMITTED ||
             txn->get_state() == TransactionState::ABORTED) {
-            txn = database.txn_manager.begin(nullptr, context->log_mgr_, context->isolation_level_);
+            txn = database.legacy().txn_manager.begin(nullptr, context->log_mgr_, context->isolation_level_);
             session.txn_id = txn->get_transaction_id();
             txn->set_txn_mode(false);
             txn->set_isolation_level(context->isolation_level_);
@@ -65,7 +66,7 @@ void SetTransaction(DatabaseInstance& database, SessionState& session, Context* 
         session.remember_running_transaction(txn);
     }
     context->txn_ = txn;
-    database.txn_manager.BeginStatement(txn);
+    database.legacy().txn_manager.BeginStatement(txn);
 }
 
 template <typename Execute>
@@ -82,7 +83,7 @@ ExecutionOutcome execute_operation(DatabaseInstance& database, SessionState& ses
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
             context.txn_->get_state() != TransactionState::COMMITTED &&
             context.txn_->get_state() != TransactionState::ABORTED) {
-            database.txn_manager.commit(context.txn_, context.log_mgr_);
+            database.legacy().txn_manager.commit(context.txn_, context.log_mgr_);
             // commit may already have freed the transaction object.
             session.forget_running_transaction();
             session.txn_id = INVALID_TXN_ID;
@@ -102,12 +103,16 @@ ExecutionOutcome execute_operation(DatabaseInstance& database, SessionState& ses
 }
 
 void abort_session(DatabaseInstance& database, SessionState& session, Context* context) {
+    if (database.is_delta()) {
+        database.delta_database->Abort(session.delta_session);
+        return;
+    }
     Transaction* txn = context == nullptr ? nullptr : context->txn_;
     if (txn == nullptr) {
         txn = session.running_transaction();
     }
     if (txn == nullptr && session.txn_id != INVALID_TXN_ID) {
-        txn = database.txn_manager.get_transaction(session.txn_id);
+        txn = database.legacy().txn_manager.get_transaction(session.txn_id);
     }
     // Clear every owner before physical undo: abort may throw after changing
     // transaction state, and a later protocol cleanup must not retry it.
@@ -118,7 +123,7 @@ void abort_session(DatabaseInstance& database, SessionState& session, Context* c
     }
     if (txn != nullptr && txn->get_state() != TransactionState::ABORTED &&
         txn->get_state() != TransactionState::COMMITTED) {
-        database.txn_manager.abort(txn, &database.log_manager);
+        database.legacy().txn_manager.abort(txn, &database.legacy().log_manager);
     }
 }
 
@@ -129,7 +134,7 @@ bool end_explicit_transaction(DatabaseInstance& database, PlanTag tag, SessionSt
     Transaction* txn = context.txn_;
     if (tag == T_Transaction_commit) {
         if (txn != nullptr) {
-            database.txn_manager.commit(txn, context.log_mgr_);
+            database.legacy().txn_manager.commit(txn, context.log_mgr_);
         }
         session.forget_running_transaction();
         session.txn_id = INVALID_TXN_ID;
@@ -140,7 +145,7 @@ bool end_explicit_transaction(DatabaseInstance& database, PlanTag tag, SessionSt
     session.txn_id = INVALID_TXN_ID;
     context.txn_ = nullptr;
     if (txn != nullptr) {
-        database.txn_manager.abort(txn, context.log_mgr_);
+        database.legacy().txn_manager.abort(txn, context.log_mgr_);
     }
     return true;
 }
@@ -152,7 +157,7 @@ ExecutionOutcome execute_plan(DatabaseInstance& database, std::unique_ptr<Plan> 
     if (end_explicit_transaction(database, plan->tag, session, context)) {
         return {false, catalog_changed};
     }
-    return {database.ql_manager.execute(std::move(plan), &session.txn_id, &context, &output), catalog_changed};
+    return {database.legacy().ql_manager.execute(std::move(plan), &session.txn_id, &context, &output), catalog_changed};
 }
 
 ExecutionOutcome execute_tree_with_catalog_guard(DatabaseInstance& database, std::unique_ptr<ast::TreeNode> parse_tree,
@@ -164,8 +169,8 @@ ExecutionOutcome execute_tree_with_catalog_guard(DatabaseInstance& database, std
     const bool starts_transaction =
         parsed_type != ast::AstType::StaticCheckpoint && parsed_type != ast::AstType::LoadStmt;
     return execute_operation(database, session, context, output, starts_transaction, [&] {
-        std::unique_ptr<Query> query = database.analyze.do_analyze(std::move(parse_tree));
-        std::unique_ptr<Plan> plan = database.optimizer.plan_query(std::move(query), &context);
+        std::unique_ptr<Query> query = database.legacy().analyze.do_analyze(std::move(parse_tree));
+        std::unique_ptr<Plan> plan = database.legacy().optimizer.plan_query(std::move(query), &context);
         return execute_plan(database, std::move(plan), session, context, output);
     });
 }
@@ -174,7 +179,8 @@ ExecutionOutcome execute_tree(DatabaseInstance& database, std::unique_ptr<ast::T
                               SessionState& session, QueryResultSink* result_sink) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
-    Context context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager);
+    Context context(&database.legacy().lock_manager, &database.legacy().log_manager, nullptr,
+                    &database.legacy().txn_manager);
     ExecutionOutput output{response.data(), &offset, false, result_sink, &session.output_file_enabled};
     if (parse_tree == nullptr) {
         return {};
@@ -186,16 +192,19 @@ ExecutionOutcome execute_tree(DatabaseInstance& database, std::unique_ptr<ast::T
             active->get_state() != TransactionState::ABORTED) {
             throw RMDBError("structural DDL and LOAD are not allowed inside an explicit transaction");
         }
-        auto guard = database.sm_manager.acquire_catalog_exclusive();
+        auto guard = database.legacy().sm_manager.acquire_catalog_exclusive();
         return execute_tree_with_catalog_guard(database, std::move(parse_tree), session, output, context);
     }
-    auto guard = database.sm_manager.acquire_catalog_shared();
+    auto guard = database.legacy().sm_manager.acquire_catalog_shared();
     return execute_tree_with_catalog_guard(database, std::move(parse_tree), session, output, context);
 }
 
 ExecutionOutcome execute_sql(DatabaseInstance& database, const std::string& sql, SessionState& session,
                              QueryResultSink* result_sink) {
     auto parse_tree = ast::parse_sql(sql);
+    if (database.is_delta()) {
+        return {database.delta_database->Execute(std::move(parse_tree), session.delta_session, result_sink), false};
+    }
     return execute_tree(database, std::move(parse_tree), session, result_sink);
 }
 
@@ -230,37 +239,68 @@ void handle_batch(DatabaseInstance& database, int fd, Reader& reader, SessionSta
 
     std::uint16_t failed = 0xffff;
     std::uint16_t executed = 0;
+    const auto make_bindings = [](const Operation& operation) {
+        std::vector<std::unique_ptr<ast::Value>> values;
+        values.reserve(operation.values.size());
+        for (const auto& value : operation.values) {
+            if (value.type != operation.statement->parameters[values.size()])
+                throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+            if (!value.present) {
+                values.push_back(std::make_unique<ast::NullLit>());
+                continue;
+            }
+            if (value.type == Type::INT32)
+                values.push_back(std::make_unique<ast::IntLit>(value.int32));
+            else if (value.type == Type::FLOAT32) {
+                float number;
+                std::memcpy(&number, &value.float_bits, sizeof(number));
+                values.push_back(std::make_unique<ast::FloatLit>(number));
+            } else
+                values.push_back(std::make_unique<ast::StringLit>(value.text));
+        }
+        return values;
+    };
+
+    if (database.is_delta()) {
+        BatchResultBuilder result;
+        try {
+            for (std::uint16_t i = 0; i < operation_count; ++i) {
+                auto* statement = operations[i].statement;
+                if (statement->catalog_generation != database.delta_database->CatalogGeneration())
+                    revalidate_prepared(database, *statement, session.isolation);
+                result.begin_operation(i);
+                const bool query = database.delta_database->Execute(
+                    ast::clone_bound_tree(*statement->template_tree, make_bindings(operations[i])),
+                    session.delta_session, &result);
+                result.finish_operation(query);
+                ++executed;
+            }
+        } catch (const deltakernel::DeltaTransactionAbort& exception) {
+            failed = executed;
+            abort_session(database, session, nullptr);
+            wire_protocol::write_frame(fd, Tag::BATCH_RESULT,
+                                       result.failure(executed, 1, failed, diagnostic(exception)));
+            return;
+        } catch (const std::exception& exception) {
+            failed = executed;
+            abort_session(database, session, nullptr);
+            wire_protocol::write_frame(fd, Tag::BATCH_RESULT,
+                                       result.failure(executed, 2, failed, diagnostic(exception)));
+            return;
+        }
+        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, result.success(executed));
+        return;
+    }
+
     BatchExecutionContext batch(database, session);
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
             batch.reset_for_operation(session, &batch.result);
-            const auto make_bindings = [&]() {
-                std::vector<std::unique_ptr<ast::Value>> values;
-                values.reserve(operations[i].values.size());
-                for (const auto& value : operations[i].values) {
-                    if (value.type != prepared_statement->parameters[values.size()])
-                        throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
-                    if (!value.present) {
-                        // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
-                        values.push_back(std::make_unique<ast::NullLit>());
-                        continue;
-                    }
-                    if (value.type == Type::INT32)
-                        values.push_back(std::make_unique<ast::IntLit>(value.int32));
-                    else if (value.type == Type::FLOAT32) {
-                        float number;
-                        std::memcpy(&number, &value.float_bits, sizeof(number));
-                        values.push_back(std::make_unique<ast::FloatLit>(number));
-                    } else
-                        values.push_back(std::make_unique<ast::StringLit>(value.text));
-                }
-                return values;
-            };
             execute_operation(database, session, batch.context, batch.output, true, [&] {
-                if (prepared_statement->catalog_generation != database.sm_manager.get_catalog_generation() ||
+                if (prepared_statement->catalog_generation != database.legacy().sm_manager.get_catalog_generation() ||
                     prepared_statement->database_identity !=
-                        database.sm_manager.get_database_identity_under_catalog_guard()) {
+                        database.legacy().sm_manager.get_database_identity_under_catalog_guard()) {
                     revalidate_prepared(database, *prepared_statement, session.isolation);
                 }
                 const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
@@ -268,13 +308,13 @@ void handle_batch(DatabaseInstance& database, int fd, Reader& reader, SessionSta
                 batch.result.begin_operation(i);
                 bool is_query;
                 if (prepared_fast_path) {
-                    is_query = database.ql_manager.execute_prepared(*prepared_statement->descriptor,
-                                                                    make_parameter_frame(operations[i].values),
-                                                                    &batch.context, &batch.output);
+                    is_query = database.legacy().ql_manager.execute_prepared(*prepared_statement->descriptor,
+                                                                             make_parameter_frame(operations[i].values),
+                                                                             &batch.context, &batch.output);
                 } else {
-                    auto query = database.analyze.do_analyze(
-                        ast::clone_bound_tree(*prepared_statement->template_tree, make_bindings()));
-                    auto plan = database.optimizer.plan_query(std::move(query), &batch.context);
+                    auto query = database.legacy().analyze.do_analyze(
+                        ast::clone_bound_tree(*prepared_statement->template_tree, make_bindings(operations[i])));
+                    auto plan = database.legacy().optimizer.plan_query(std::move(query), &batch.context);
                     is_query = execute_plan(database, std::move(plan), session, batch.context, batch.output).query;
                 }
                 batch.result.finish_operation(is_query);

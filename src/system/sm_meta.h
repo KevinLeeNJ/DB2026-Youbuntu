@@ -39,6 +39,10 @@ struct ColMeta {
     int null_byte = -1;
     uint8_t null_mask = 0;
 
+    // Derived rows may carry variable-width CHAR bytes without storage padding.
+    // False preserves the legacy fixed-width record convention.
+    bool value_length_is_exact = false;
+
     friend std::ostream& operator<<(std::ostream& os, const ColMeta& col) {
         // ColMeta中有各个基本类型的变量，然后调用重载的这些变量的操作符<<（具体实现逻辑在defs.h）
         return os << col.tab_name << ' ' << col.name << ' ' << col.type << ' ' << col.len << ' ' << col.offset << ' '

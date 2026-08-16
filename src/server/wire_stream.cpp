@@ -57,7 +57,10 @@ std::vector<Value> protocol_row(const std::vector<ColMeta>& columns, const char*
             float number = read_float(cell);
             std::memcpy(&value.float_bits, &number, sizeof(value.float_bits));
         } else {
-            value.text.assign(cell, strnlen(cell, column.len));
+            const std::size_t length = column.value_length_is_exact
+                                           ? static_cast<std::size_t>(column.len)
+                                           : strnlen(cell, static_cast<std::size_t>(column.len));
+            value.text.assign(cell, length);
         }
         row.push_back(std::move(value));
     }
@@ -103,7 +106,7 @@ void BatchResultBuilder::append_row(const std::vector<ColMeta>& columns, const c
         const bool present = !is_null(data, column);
         const char* cell = data + column.offset;
         const Type type = protocol_type(column.type);
-        const std::size_t encoded_size = type == Type::CHAR && present
+        const std::size_t encoded_size = type == Type::CHAR && present && !column.value_length_is_exact
                                              ? strnlen(cell, static_cast<std::size_t>(column.len))
                                              : static_cast<std::size_t>(column.len);
         wire_protocol::encode_raw_value(writer_, type, present, cell, encoded_size);

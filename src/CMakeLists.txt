@@ -13,6 +13,7 @@ add_subdirectory(replacer)
 add_subdirectory(transaction)
 add_subdirectory(recovery)
 add_subdirectory(protocol)
+add_subdirectory(deltakernel)
 add_subdirectory(test)
 
 
@@ -26,7 +27,7 @@ add_executable(rmdb
     server/wire_session.cpp
     server/wire_stream.cpp
     server/server_runtime.cpp)
-target_link_libraries(rmdb parser execution pthread planner analyze wire_protocol)
+target_link_libraries(rmdb parser execution pthread planner analyze wire_protocol deltakernel)
 
 # Offline post-recovery structural verifier used by crash-consistency tests.
 add_executable(rmdb_verify rmdb_verify.cpp)

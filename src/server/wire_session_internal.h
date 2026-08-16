@@ -68,6 +68,7 @@ struct SessionState {
     txn_id_t txn_id = INVALID_TXN_ID;
     IsolationLevel isolation = DEFAULT_ISOLATION_LEVEL;
     bool output_file_enabled = false;
+    deltakernel::DeltaSession delta_session;
 
     // Every operation used to resolve txn_id through TransactionManager's global
     // txn_map under a single process-wide mutex; at 50 connections and 57

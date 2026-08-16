@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
+#include "common/csv.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
@@ -40,58 +41,6 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     const int record_size = fh->get_file_hdr().record_size;
     const auto& cols = tab.cols;
 
-    // CSV files may use CRLF line endings; strip a trailing '\r' from each line.
-    auto strip_cr = [](std::string& s) {
-        if (!s.empty() && s.back() == '\r') {
-            s.pop_back();
-        }
-    };
-
-    // 就地按 RFC 4180 切分一行，结果是指向 line 内部的 NUL 结尾字段。
-    // 解引号只会删字符，所以写指针永不超过读指针，可以原地改写；末尾多留的
-    // 一个字节用于给最后一个字段写 NUL。不支持引号内换行（TPC-C 数据不含换行，
-    // Go 的 encoding/csv 也只在字段含 , " \n 时才加引号）。
-    auto split_csv_line = [](std::string& s, std::vector<const char*>& out) {
-        out.clear();
-        s.push_back('\0');
-        char* write = s.data();
-        const char* read = s.data();
-        const char* end = s.data() + s.size() - 1;
-        while (true) {
-            char* field_begin = write;
-            if (read < end && *read == '"') {
-                ++read; // 起始引号
-                while (read < end) {
-                    if (*read != '"') {
-                        *write++ = *read++;
-                        continue;
-                    }
-                    if (read + 1 < end && read[1] == '"') {
-                        *write++ = '"'; // "" 还原成一个 "
-                        read += 2;
-                        continue;
-                    }
-                    ++read; // 结束引号
-                    break;
-                }
-                while (read < end && *read != ',') {
-                    ++read; // 容忍结束引号与逗号之间的多余字符
-                }
-            } else {
-                while (read < end && *read != ',') {
-                    *write++ = *read++;
-                }
-            }
-            *write++ = '\0';
-            out.push_back(field_begin);
-            if (read >= end) {
-                break;
-            }
-            ++read; // 跳过字段分隔符
-        }
-        s.pop_back();
-    };
-
     // 复用的字段指针数组：提到循环外，省掉每行一次 malloc/free。
     std::vector<const char*> fields;
     fields.reserve(cols.size() * 2);
@@ -104,8 +53,8 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     if (!std::getline(infile, line)) {
         throw RMDBError("load file is empty: " + file_path);
     }
-    strip_cr(line);
-    split_csv_line(line, fields);
+    rmdb_csv::StripCr(line);
+    rmdb_csv::SplitLineInPlace(line, fields);
 
     // 行尾逗号（"a,b,c,"）按 RFC 4180 会多切出一个空字段。数据行多出来的尾部字段
     // 无害（下面按列序取前 cols.size() 个），但表头行一多一个字段就会让下面的
@@ -238,11 +187,11 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     }
     while (std::getline(infile, line)) {
         ++line_no;
-        strip_cr(line);
+        rmdb_csv::StripCr(line);
         if (line.empty()) {
             continue; // skip trailing blank lines
         }
-        split_csv_line(line, fields);
+        rmdb_csv::SplitLineInPlace(line, fields);
         emit_row(line_no);
     }
 

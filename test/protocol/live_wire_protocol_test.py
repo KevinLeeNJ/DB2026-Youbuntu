@@ -276,15 +276,22 @@ class WireClient:
 
 
 class Server:
-    def __init__(self, binary):
+    def __init__(self, binary, env_overrides=None, require_sql_readiness=True):
         self.binary = os.path.abspath(binary)
         self.root = tempfile.mkdtemp(prefix="rmdb-live-wire-")
         self.port = find_free_port()
         self.process = None
+        self.env_overrides = env_overrides or {}
+        self.require_sql_readiness = require_sql_readiness
 
     def start(self):
         env = os.environ.copy()
         env["RMDB_PORT"] = str(self.port)
+        for key, value in self.env_overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         self.process = subprocess.Popen(
             [self.binary, "db"],
             cwd=self.root,
@@ -300,7 +307,8 @@ class Server:
                 raise ProtocolFailure("rmdb exited before becoming ready")
             try:
                 client = WireClient(self.port)
-                client.readiness_probe()
+                if self.require_sql_readiness:
+                    client.readiness_probe()
                 client.close()
                 return
             except (OSError, EOFError, ProtocolFailure) as error:
@@ -1413,7 +1421,7 @@ def test_connection_churn_then_sigterm_restarts(server):
 
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
-    server = Server(sys.argv[1])
+    server = Server(sys.argv[1], {"RMDB_STORAGE_ENGINE": "legacy"})
     try:
         server.start()
         test_sigint_drains_connected_client_and_restarts(server)

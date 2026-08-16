@@ -11,7 +11,36 @@ See the Mulan PSL v2 for more details. */
 
 #include "server/wire_session_internal.h"
 
+#include <optional>
+
 namespace wire_session_internal {
+namespace {
+deltakernel::DeltaValueType delta_type(Type type) {
+    switch (type) {
+    case Type::INT32:
+        return deltakernel::DeltaValueType::Int;
+    case Type::FLOAT32:
+        return deltakernel::DeltaValueType::Float;
+    case Type::CHAR:
+        return deltakernel::DeltaValueType::Char;
+    default:
+        throw wire_protocol::ProtocolError("unsupported prepared parameter type");
+    }
+}
+
+Type protocol_type(deltakernel::DeltaValueType type) {
+    switch (type) {
+    case deltakernel::DeltaValueType::Int:
+        return Type::INT32;
+    case deltakernel::DeltaValueType::Float:
+        return Type::FLOAT32;
+    case deltakernel::DeltaValueType::Char:
+        return Type::CHAR;
+    }
+    throw wire_protocol::ProtocolError("unsupported Delta result type");
+}
+} // namespace
+
 ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
     std::vector<::Value> values;
     values.reserve(wire_values.size());
@@ -63,12 +92,34 @@ std::vector<std::unique_ptr<ast::Value>> make_typed_parameter_nodes(const std::v
 PreparedStatement inspect_prepared(DatabaseInstance& database, std::uint16_t id, bool query,
                                    std::vector<Type> parameters, std::unique_ptr<ast::TreeNode> template_tree,
                                    IsolationLevel isolation) {
-    Context context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager);
-    context.isolation_level_ = isolation;
     auto typed_parameters = make_typed_parameter_nodes(parameters);
     auto bound = ast::clone_bound_tree(*template_tree, typed_parameters);
-    std::unique_ptr<Query> query_tree = database.analyze.do_analyze(std::move(bound));
-    std::unique_ptr<Plan> plan = database.optimizer.plan_query(std::move(query_tree), &context);
+    if (database.is_delta()) {
+        std::vector<deltakernel::DeltaValueType> declared_parameters;
+        declared_parameters.reserve(parameters.size());
+        for (Type type : parameters)
+            declared_parameters.push_back(delta_type(type));
+        const auto description = database.delta_database->DescribePrepared(*bound, declared_parameters);
+        if (description.query != query)
+            throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
+        PreparedStatement result;
+        result.id = id;
+        result.query = query;
+        result.template_tree = std::move(template_tree);
+        result.parameters = std::move(parameters);
+        result.names = description.names;
+        result.result_types.reserve(description.types.size());
+        for (deltakernel::DeltaValueType type : description.types)
+            result.result_types.push_back(protocol_type(type));
+        result.catalog_generation = description.catalog_generation;
+        return result;
+    }
+
+    Context context(&database.legacy().lock_manager, &database.legacy().log_manager, nullptr,
+                    &database.legacy().txn_manager);
+    context.isolation_level_ = isolation;
+    std::unique_ptr<Query> query_tree = database.legacy().analyze.do_analyze(std::move(bound));
+    std::unique_ptr<Plan> plan = database.legacy().optimizer.plan_query(std::move(query_tree), &context);
     const bool actual_query = plan->tag == T_select;
     if (actual_query != query)
         throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
@@ -77,8 +128,8 @@ PreparedStatement inspect_prepared(DatabaseInstance& database, std::uint16_t id,
     result.query = query;
     result.template_tree = std::move(template_tree);
     result.parameters = std::move(parameters);
-    result.database_identity = database.sm_manager.get_database_identity_under_catalog_guard();
-    result.catalog_generation = database.sm_manager.get_catalog_generation();
+    result.database_identity = database.legacy().sm_manager.get_database_identity_under_catalog_guard();
+    result.catalog_generation = database.legacy().sm_manager.get_catalog_generation();
     PreparedStatementKind statement_kind = PreparedStatementKind::Unsupported;
     if (plan->tag == T_select) {
         statement_kind = PreparedStatementKind::Select;
@@ -88,7 +139,7 @@ PreparedStatement inspect_prepared(DatabaseInstance& database, std::uint16_t id,
         statement_kind = PreparedStatementKind::Update;
     }
     if (actual_query) {
-        auto [output_names, result_schema] = database.ql_manager.inspect_select_plan(*plan, &context);
+        auto [output_names, result_schema] = database.legacy().ql_manager.inspect_select_plan(*plan, &context);
         result.names = output_names;
         for (const auto& column : result_schema) {
             result.result_types.push_back(column.type == TYPE_INT     ? Type::INT32
@@ -141,7 +192,9 @@ void handle_prepare_set(DatabaseInstance& database, int fd, Reader& reader, Sess
     if (count == 0 || count > 256) {
         throw wire_protocol::ProtocolError("invalid prepared statement count");
     }
-    auto catalog_guard = database.sm_manager.acquire_catalog_shared();
+    std::optional<SmManager::CatalogSharedGuard> catalog_guard;
+    if (!database.is_delta())
+        catalog_guard.emplace(database.legacy().sm_manager.acquire_catalog_shared());
     std::vector<PreparedStatement> pending;
     std::unordered_map<std::uint16_t, bool> ids;
     for (std::uint16_t i = 0; i < count; ++i) {
@@ -265,10 +318,13 @@ void handle_prepare_set(DatabaseInstance& database, int fd, Reader& reader, Sess
         pending.push_back(std::move(statement));
     }
     reader.require_end();
-    if (database.sm_manager.get_catalog_generation() != pending.front().catalog_generation ||
-        database.sm_manager.get_database_identity_under_catalog_guard() != pending.front().database_identity) {
+    if (database.is_delta()) {
+        if (database.delta_database->CatalogGeneration() != pending.front().catalog_generation)
+            throw wire_protocol::ProtocolError("catalog changed during PREPARE_SET");
+    } else if (database.legacy().sm_manager.get_catalog_generation() != pending.front().catalog_generation ||
+               database.legacy().sm_manager.get_database_identity_under_catalog_guard() !=
+                   pending.front().database_identity)
         throw wire_protocol::ProtocolError("catalog changed during PREPARE_SET");
-    }
     const auto response = prepare_set(pending);
     std::unordered_map<std::uint16_t, PreparedStatement> replacement;
     replacement.reserve(pending.size());
