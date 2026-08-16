@@ -12,13 +12,23 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 #include "defs.h"
 #include "errors.h"
 #include "record/rm_defs.h"
+
+inline int checked_int_cast(double value) {
+    if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) ||
+        value > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw RMDBError("integer value out of range");
+    }
+    return static_cast<int>(value);
+}
 
 struct TabCol {
     std::string tab_name;
@@ -30,10 +40,10 @@ struct TabCol {
 };
 
 struct Value {
-    ColType type; // type of value
+    ColType type = TYPE_INT; // type of value
     bool is_null = false;
     union {
-        int int_val;      // int value
+        int int_val = 0;  // int value
         double float_val; // SQL FLOAT value
     };
     std::string str_val; // string value
@@ -134,6 +144,9 @@ inline CompOp swap_comp_op(CompOp op) {
     case OP_LIKE:
     case OP_IN:
     case OP_BETWEEN:
+    case OP_IS_NULL:
+    case OP_IS_NOT_NULL:
+    case OP_EXISTS:
         throw InternalError("Cannot swap non-comparison predicate");
     }
     throw InternalError("Unexpected comparison operator");

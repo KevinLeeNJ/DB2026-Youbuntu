@@ -86,11 +86,16 @@ private:
      * @param src_cols 分支列元数据。
      * @return 按本节点列布局构造的新记录。
      */
-    RmRecord convert_record(const RmRecord& src_rec, const std::vector<ColMeta>& src_cols) const {
+    RmRecord convert_record(const RmRecord& src_rec, const std::vector<ColMeta>& src_cols,
+                            const std::vector<bool>& nulls) const {
         RmRecord dst_rec(static_cast<int>(len_));
         for (size_t i = 0; i < cols_.size(); ++i) {
             const auto& dst_col = cols_[i];
             const auto& src_col = src_cols[i];
+            if (i < nulls.size() && nulls[i]) {
+                std::memset(dst_rec.data + dst_col.offset, 0, static_cast<size_t>(dst_col.len));
+                continue;
+            }
             copy_cell(dst_rec.data + dst_col.offset, dst_col, src_rec.data + src_col.offset, src_col);
         }
         return dst_rec;
@@ -129,8 +134,9 @@ private:
                 if (rec == nullptr) {
                     continue;
                 }
-                branch_tuples[branch_idx].push_back(convert_record(*rec, branch_cols));
-                branch_nulls[branch_idx].push_back(branch->nulls());
+                const auto& nulls = branch->nulls();
+                branch_tuples[branch_idx].push_back(convert_record(*rec, branch_cols, nulls));
+                branch_nulls[branch_idx].push_back(nulls);
             }
         }
         if (branches_.empty()) {
@@ -152,46 +158,66 @@ private:
             return std::make_pair(std::move(unique_tuples), std::move(unique_nulls));
         };
 
-        tuples_ = std::move(branch_tuples[0]);
-        tuple_nulls_ = std::move(branch_nulls[0]);
-        for (size_t branch_idx = 1; branch_idx < branches_.size(); ++branch_idx) {
-            QuerySetOperator op = QuerySetOperator::UNION;
-            if (branch_idx - 1 < operators_.size()) {
-                op = operators_[branch_idx - 1];
-            }
+        using Relation = std::pair<std::vector<RmRecord>, std::vector<std::vector<bool>>>;
+        auto apply_operation = [&](Relation left, Relation right, QuerySetOperator op, bool keep_duplicates) {
             if (op == QuerySetOperator::UNION) {
-                // UNION ALL 保留拼接结果；普通 UNION 在每次合并后去重。
-                bool keep_duplicates = branch_idx - 1 < union_all_.size() && union_all_[branch_idx - 1];
-                for (auto& tuple : branch_tuples[branch_idx]) {
-                    tuples_.push_back(std::move(tuple));
+                for (auto& tuple : right.first) {
+                    left.first.push_back(std::move(tuple));
                 }
-                for (auto& nulls : branch_nulls[branch_idx]) {
-                    tuple_nulls_.push_back(std::move(nulls));
+                for (auto& nulls : right.second) {
+                    left.second.push_back(std::move(nulls));
                 }
-                if (!keep_duplicates) {
-                    auto unique = deduplicate(std::move(tuples_), std::move(tuple_nulls_));
-                    tuples_ = std::move(unique.first);
-                    tuple_nulls_ = std::move(unique.second);
-                }
-                continue;
+                return keep_duplicates ? std::move(left) : deduplicate(std::move(left.first), std::move(left.second));
             }
 
-            // INTERSECT/EXCEPT 都以去重后的左、右集合为输入。
-            auto left = deduplicate(std::move(tuples_), std::move(tuple_nulls_));
-            auto right = deduplicate(std::move(branch_tuples[branch_idx]), std::move(branch_nulls[branch_idx]));
+            left = deduplicate(std::move(left.first), std::move(left.second));
+            right = deduplicate(std::move(right.first), std::move(right.second));
             std::unordered_set<std::string> right_keys;
             for (size_t i = 0; i < right.first.size(); ++i) {
                 right_keys.insert(make_key(right.first[i], right.second[i]));
             }
+            Relation result;
             for (size_t i = 0; i < left.first.size(); ++i) {
                 bool present = right_keys.find(make_key(left.first[i], left.second[i])) != right_keys.end();
-                if ((op == QuerySetOperator::INTERSECT && present) ||
-                    (op == QuerySetOperator::EXCEPT && !present)) {
-                    tuples_.push_back(std::move(left.first[i]));
-                    tuple_nulls_.push_back(std::move(left.second[i]));
+                if ((op == QuerySetOperator::INTERSECT && present) || (op == QuerySetOperator::EXCEPT && !present)) {
+                    result.first.push_back(std::move(left.first[i]));
+                    result.second.push_back(std::move(left.second[i]));
                 }
             }
+            return result;
+        };
+
+        auto take_branch = [&](size_t index) {
+            return Relation{std::move(branch_tuples[index]), std::move(branch_nulls[index])};
+        };
+
+        Relation result;
+        bool have_result = false;
+        size_t branch_idx = 0;
+        while (branch_idx < branches_.size()) {
+            const size_t term_start = branch_idx;
+            Relation term = take_branch(branch_idx);
+            while (branch_idx < operators_.size() && operators_[branch_idx] == QuerySetOperator::INTERSECT) {
+                term =
+                    apply_operation(std::move(term), take_branch(branch_idx + 1), QuerySetOperator::INTERSECT, false);
+                ++branch_idx;
+            }
+
+            if (!have_result) {
+                result = std::move(term);
+                have_result = true;
+            } else {
+                const size_t op_index = term_start - 1;
+                const QuerySetOperator op =
+                    op_index < operators_.size() ? operators_[op_index] : QuerySetOperator::UNION;
+                const bool keep_duplicates =
+                    op == QuerySetOperator::UNION && op_index < union_all_.size() && union_all_[op_index];
+                result = apply_operation(std::move(result), std::move(term), op, keep_duplicates);
+            }
+            ++branch_idx;
         }
+        tuples_ = std::move(result.first);
+        tuple_nulls_ = std::move(result.second);
         materialized_ = true;
     }
 

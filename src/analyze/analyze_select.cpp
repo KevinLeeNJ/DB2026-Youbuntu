@@ -12,6 +12,42 @@ See the Mulan PSL v2 for more details. */
 
 namespace analyze_internal {
 
+namespace {
+
+template <typename Visitor> void visit_expr(const QueryExpr& expr, Visitor&& visitor) {
+    visitor(expr);
+    if (expr.lhs != nullptr)
+        visit_expr(*expr.lhs, visitor);
+    if (expr.rhs != nullptr)
+        visit_expr(*expr.rhs, visitor);
+    if (expr.rhs_upper != nullptr)
+        visit_expr(*expr.rhs_upper, visitor);
+    for (const auto& operand : expr.operands)
+        visit_expr(*operand, visitor);
+    for (const auto& arg : expr.window_args)
+        visit_expr(*arg, visitor);
+    for (const auto& partition_expr : expr.window_partition_by)
+        visit_expr(*partition_expr, visitor);
+    for (const auto& order_expr : expr.window_order_by)
+        visit_expr(*order_expr, visitor);
+    for (const auto& clause : expr.case_when) {
+        visit_expr(*clause.first, visitor);
+        visit_expr(*clause.second, visitor);
+    }
+    if (expr.else_expr != nullptr)
+        visit_expr(*expr.else_expr, visitor);
+    for (const auto& value : expr.rhs_values)
+        visit_expr(*value, visitor);
+}
+
+bool contains_aggregate(const QueryExpr& expr) {
+    bool found = false;
+    visit_expr(expr, [&](const QueryExpr& node) { found = found || node.type == QueryExprType::AGGREGATE; });
+    return found;
+}
+
+} // namespace
+
 void append_star_projection(Query& query, const std::vector<ColMeta>& all_cols) {
     for (const auto& col : all_cols) {
         SelectItem item;
@@ -135,6 +171,13 @@ void validate_group_by(Query& query) {
             throw RMDBError("HAVING contains a non-aggregated column that is not in GROUP BY");
         }
     }
+    if (query.having_expr != nullptr) {
+        visit_expr(*query.having_expr, [&](const QueryExpr& expr) {
+            if (expr.type == QueryExprType::COLUMN && !contains_group_col(query.group_by_cols, expr.col)) {
+                throw RMDBError("HAVING contains a non-aggregated column that is not in GROUP BY");
+            }
+        });
+    }
 }
 
 void validate_select_without_group_by(const Query& query) {
@@ -158,6 +201,13 @@ void validate_select_without_group_by(const Query& query) {
             throw RMDBError("HAVING cannot reference plain columns without GROUP BY");
         }
     }
+    if (query.having_expr != nullptr) {
+        visit_expr(*query.having_expr, [](const QueryExpr& expr) {
+            if (expr.type == QueryExprType::COLUMN) {
+                throw RMDBError("HAVING cannot reference plain columns without GROUP BY");
+            }
+        });
+    }
 }
 
 void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols) {
@@ -170,13 +220,25 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols) {
 
     rebuild_select_outputs(query, all_cols);
     validate_having(query, all_cols);
+    if (query.having_expr != nullptr) {
+        normalize_query_expr(*query.having_expr, all_cols);
+        if (contains_window_expr(*query.having_expr)) {
+            throw RMDBError("window functions are not allowed in HAVING");
+        }
+        if (!is_boolean_query_expr(*query.having_expr) || infer_expr_type(*query.having_expr, all_cols) != TYPE_INT) {
+            throw RMDBError("HAVING expression must be boolean");
+        }
+        query.has_aggregate = query.has_aggregate || contains_aggregate(*query.having_expr);
+    }
     validate_order_by(query, all_cols);
 
-    if (!query.having_conds.empty() && query.group_by_cols.empty() && !query.has_aggregate) {
+    if ((!query.having_conds.empty() || query.having_expr != nullptr) && query.group_by_cols.empty() &&
+        !query.has_aggregate) {
         throw RMDBError("HAVING requires GROUP BY or aggregate expressions");
     }
 
-    if (query.has_select_star && (query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty())) {
+    if (query.has_select_star && (query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty() ||
+                                  query.having_expr != nullptr)) {
         throw RMDBError("SELECT * cannot be combined with aggregate, GROUP BY, or HAVING");
     }
 

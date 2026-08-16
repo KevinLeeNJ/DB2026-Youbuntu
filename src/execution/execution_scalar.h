@@ -152,15 +152,6 @@ inline int compare_cells(const CellValue& lhs, const CellValue& rhs) {
     if (lhs.type != rhs.type) {
         throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
     }
-    if (lhs.type == TYPE_STRING || lhs.type == TYPE_DATETIME) {
-        if (lhs.str_val < rhs.str_val) {
-            return -1;
-        }
-        if (lhs.str_val > rhs.str_val) {
-            return 1;
-        }
-        return 0;
-    }
     if (lhs.int_val < rhs.int_val) {
         return -1;
     }

@@ -353,6 +353,9 @@ void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols)
                 throw InternalError("CASE expression is missing an operand");
             }
             normalize_query_expr(*clause.first, all_cols);
+            if (!is_boolean_query_expr(*clause.first)) {
+                throw RMDBError("CASE WHEN expression must be boolean");
+            }
             normalize_query_expr(*clause.second, all_cols);
         }
         if (expr.else_expr != nullptr) {
@@ -381,6 +384,21 @@ void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols)
     }
 }
 
+bool is_null_query_expr(const QueryExpr& expr) {
+    if (expr.type == QueryExprType::VALUE) {
+        return expr.value.is_null;
+    }
+    if (expr.type != QueryExprType::CASE_EXPR) {
+        return false;
+    }
+    for (const auto& clause : expr.case_when) {
+        if (!is_null_query_expr(*clause.second)) {
+            return false;
+        }
+    }
+    return expr.else_expr == nullptr || is_null_query_expr(*expr.else_expr);
+}
+
 ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_cols) {
     switch (expr.type) {
     case QueryExprType::COLUMN: {
@@ -407,6 +425,7 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
             return col_meta->type;
         }
         }
+        throw InternalError("Unexpected aggregate type");
     case QueryExprType::WINDOW:
         switch (expr.window_func) {
         case WindowFuncType::ROW_NUMBER:
@@ -423,6 +442,7 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
         case WindowFuncType::AVG:
             return TYPE_FLOAT;
         }
+        throw InternalError("Unexpected window function type");
     case QueryExprType::ARITHMETIC: {
         if (expr.lhs == nullptr || expr.rhs == nullptr) {
             throw InternalError("Arithmetic expression is missing an operand");
@@ -440,8 +460,11 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
     case QueryExprType::CASE_EXPR: {
         ColType result_type = TYPE_INT;
         bool have_result = false;
-        for (const auto& clause : expr.case_when) {
-            ColType clause_type = infer_expr_type(*clause.second, all_cols);
+        auto merge_result = [&](const QueryExpr& result) {
+            if (is_null_query_expr(result)) {
+                return;
+            }
+            ColType clause_type = infer_expr_type(result, all_cols);
             if (!have_result) {
                 result_type = clause_type;
                 have_result = true;
@@ -453,36 +476,35 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
                     result_type = TYPE_FLOAT;
                 }
             }
+        };
+        for (const auto& clause : expr.case_when) {
+            merge_result(*clause.second);
         }
         if (expr.else_expr != nullptr) {
-            ColType else_type = infer_expr_type(*expr.else_expr, all_cols);
-            if (!have_result) {
-                result_type = else_type;
-                have_result = true;
-            } else if (result_type != else_type) {
-                if (!can_cast_types(result_type, else_type)) {
-                    throw IncompatibleTypeError(coltype2str(result_type), coltype2str(else_type));
-                }
-                if (result_type == TYPE_INT && else_type == TYPE_FLOAT) {
-                    result_type = TYPE_FLOAT;
-                }
-            }
+            merge_result(*expr.else_expr);
         }
         return result_type;
     }
     case QueryExprType::SUBQUERY:
-        if (expr.subquery == nullptr || expr.subquery->union_cols.empty() && expr.subquery->select_items.size() != 1) {
+        if (expr.subquery == nullptr || expr.subquery->output_cols.size() != 1) {
             throw RMDBError("Scalar subquery must return exactly one column");
         }
-        if (expr.subquery->is_union) {
-            if (expr.subquery->union_cols.size() != 1) {
-                throw RMDBError("Scalar subquery must return exactly one column");
-            }
-            return expr.subquery->union_cols[0].type;
-        }
-        return infer_expr_type(expr.subquery->select_items.front().expr, all_cols);
+        return expr.subquery->output_cols[0].type;
     }
     throw InternalError("Unexpected query expression type");
+}
+
+bool is_boolean_query_expr(const QueryExpr& expr) {
+    if (expr.type == QueryExprType::PREDICATE) {
+        return true;
+    }
+    if (expr.type == QueryExprType::VALUE) {
+        return expr.value.type == TYPE_INT;
+    }
+    return expr.type == QueryExprType::LOGICAL && !expr.operands.empty() &&
+           std::all_of(expr.operands.begin(), expr.operands.end(), [](const std::shared_ptr<QueryExpr>& operand) {
+               return operand != nullptr && is_boolean_query_expr(*operand);
+           });
 }
 
 bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {

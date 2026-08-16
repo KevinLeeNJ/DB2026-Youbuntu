@@ -24,23 +24,8 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
-struct TestExecutorQueryExpr {
-    QueryExprType type = QueryExprType::COLUMN;
-    TabCol col;
-    AggExpr agg;
-    Value val;
-    Value value;
-    std::string display_name;
-};
-
-struct TestExecutorHavingCondition {
-    TestExecutorQueryExpr lhs;
-    CompOp op = OP_EQ;
-    bool is_rhs_val = false;
-    bool is_rhs_value = false;
-    TestExecutorQueryExpr rhs_expr;
-    Value rhs_val;
-};
+using TestExecutorQueryExpr = QueryExpr;
+using TestExecutorHavingCondition = HavingCondition;
 
 class FakeExecutor : public AbstractExecutor {
 public:
@@ -241,7 +226,6 @@ TestExecutorHavingCondition make_having_with_literal(const TestExecutorQueryExpr
     cond.lhs = lhs;
     cond.op = op;
     cond.is_rhs_val = true;
-    cond.is_rhs_value = true;
     cond.rhs_val = rhs;
     return cond;
 }
@@ -354,6 +338,7 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
     EXPECT_EQ(read_int(*row, 0), 0);
     EXPECT_EQ(read_int(*row, 4), 0);
     EXPECT_DOUBLE_EQ(read_float(*row, 8), 0.0);
+    EXPECT_EQ(exec.nulls(), std::vector<bool>({false, true, true}));
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());

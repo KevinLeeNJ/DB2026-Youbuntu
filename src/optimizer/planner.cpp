@@ -37,8 +37,7 @@ bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
 
 bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
     return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.is_distinct == rhs.is_distinct &&
-           lhs.display_name == rhs.display_name &&
-           (lhs.is_star || same_tab_col(lhs.col, rhs.col));
+           lhs.display_name == rhs.display_name && (lhs.is_star || same_tab_col(lhs.col, rhs.col));
 }
 
 bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
@@ -50,13 +49,13 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return same_tab_col(lhs.col, rhs.col);
     case QueryExprType::VALUE:
         return lhs.value.type == rhs.value.type && lhs.value.is_null == rhs.value.is_null &&
-               (lhs.value.is_null ||
-                (lhs.value.type == TYPE_INT && lhs.value.int_val == rhs.value.int_val) ||
+               (lhs.value.is_null || (lhs.value.type == TYPE_INT && lhs.value.int_val == rhs.value.int_val) ||
                 (lhs.value.type == TYPE_FLOAT && lhs.value.float_val == rhs.value.float_val) ||
                 ((lhs.value.type == TYPE_STRING || lhs.value.type == TYPE_DATETIME) &&
                  lhs.value.str_val == rhs.value.str_val));
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+               lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
     case QueryExprType::WINDOW:
         if (lhs.window_func != rhs.window_func || lhs.window_args.size() != rhs.window_args.size() ||
@@ -88,6 +87,11 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return lhs.arithmetic_op == rhs.arithmetic_op && lhs.lhs != nullptr && lhs.rhs != nullptr &&
                rhs.lhs != nullptr && rhs.rhs != nullptr && same_query_expr(*lhs.lhs, *rhs.lhs) &&
                same_query_expr(*lhs.rhs, *rhs.rhs);
+    case QueryExprType::LOGICAL:
+    case QueryExprType::CASE_EXPR:
+    case QueryExprType::PREDICATE:
+    case QueryExprType::SUBQUERY:
+        return false;
     }
     return false;
 }
@@ -123,13 +127,22 @@ std::string condition_sort_key(const Condition& cond) {
     case OP_BETWEEN:
         key += cond.negated ? " NOT BETWEEN " : " BETWEEN ";
         break;
+    case OP_IS_NULL:
+        key += " IS NULL";
+        break;
+    case OP_IS_NOT_NULL:
+        key += " IS NOT NULL";
+        break;
+    case OP_EXISTS:
+        key += " EXISTS";
+        break;
     }
     if (cond.is_rhs_val) {
         if (cond.op == OP_IN) {
             for (const auto& value : cond.rhs_vals) {
-                key += value.type == TYPE_INT ? std::to_string(value.int_val)
-                                              : value.type == TYPE_FLOAT ? std::to_string(value.float_val)
-                                                                          : value.str_val;
+                key += value.type == TYPE_INT     ? std::to_string(value.int_val)
+                       : value.type == TYPE_FLOAT ? std::to_string(value.float_val)
+                                                  : value.str_val;
                 key += ",";
             }
             return key;
@@ -205,14 +218,30 @@ void attach_display_names(Plan* plan, const std::unordered_map<std::string, std:
 }
 
 void append_agg_expr_if_needed(std::vector<AggExpr>& agg_exprs, const QueryExpr& expr) {
-    if (expr.type != QueryExprType::AGGREGATE) {
+    if (expr.type == QueryExprType::AGGREGATE) {
+        auto pos = std::find_if(agg_exprs.begin(), agg_exprs.end(),
+                                [&](const AggExpr& agg_expr) { return same_agg_expr(agg_expr, expr.agg); });
+        if (pos == agg_exprs.end()) {
+            agg_exprs.push_back(expr.agg);
+        }
         return;
     }
-    auto pos = std::find_if(agg_exprs.begin(), agg_exprs.end(),
-                            [&](const AggExpr& agg_expr) { return same_agg_expr(agg_expr, expr.agg); });
-    if (pos == agg_exprs.end()) {
-        agg_exprs.push_back(expr.agg);
+    if (expr.lhs != nullptr)
+        append_agg_expr_if_needed(agg_exprs, *expr.lhs);
+    if (expr.rhs != nullptr)
+        append_agg_expr_if_needed(agg_exprs, *expr.rhs);
+    if (expr.rhs_upper != nullptr)
+        append_agg_expr_if_needed(agg_exprs, *expr.rhs_upper);
+    for (const auto& operand : expr.operands)
+        append_agg_expr_if_needed(agg_exprs, *operand);
+    for (const auto& clause : expr.case_when) {
+        append_agg_expr_if_needed(agg_exprs, *clause.first);
+        append_agg_expr_if_needed(agg_exprs, *clause.second);
     }
+    if (expr.else_expr != nullptr)
+        append_agg_expr_if_needed(agg_exprs, *expr.else_expr);
+    for (const auto& value : expr.rhs_values)
+        append_agg_expr_if_needed(agg_exprs, *value);
 }
 
 std::vector<AggExpr> collect_aggregate_exprs(const Query& query) {
@@ -228,11 +257,15 @@ std::vector<AggExpr> collect_aggregate_exprs(const Query& query) {
             append_agg_expr_if_needed(agg_exprs, cond.rhs_expr);
         }
     }
+    if (query.having_expr != nullptr) {
+        append_agg_expr_if_needed(agg_exprs, *query.having_expr);
+    }
     return agg_exprs;
 }
 
 bool needs_aggregate_plan(const Query& query) {
-    return query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty();
+    return query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty() ||
+           query.having_expr != nullptr;
 }
 
 std::string get_select_item_output_name(const SelectItem& item) {
@@ -261,8 +294,7 @@ bool has_value_equality(const std::vector<Condition>& conds, const std::string& 
 bool has_value_range(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
     return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
         bool is_range = cond.op == OP_LT || cond.op == OP_GT || cond.op == OP_LE || cond.op == OP_GE;
-        return cond.is_rhs_val && is_range && cond.lhs_col.tab_name == tab_name &&
-               cond.lhs_col.col_name == col_name;
+        return cond.is_rhs_val && is_range && cond.lhs_col.tab_name == tab_name && cond.lhs_col.col_name == col_name;
     });
 }
 
@@ -427,6 +459,7 @@ std::unique_ptr<Query> clone_query(const Query& source) {
     result->output_names = source.output_names;
     result->is_union = source.is_union;
     result->union_cols = source.union_cols;
+    result->output_cols = source.output_cols;
     result->union_alias = source.union_alias;
     result->union_all = source.union_all;
     result->set_operators = source.set_operators;
@@ -471,6 +504,9 @@ std::unique_ptr<Query> clone_query(const Query& source) {
     }
     if (source.where_expr != nullptr) {
         result->where_expr = std::make_shared<QueryExpr>(clone_query_expr(*source.where_expr));
+    }
+    if (source.having_expr != nullptr) {
+        result->having_expr = std::make_shared<QueryExpr>(clone_query_expr(*source.having_expr));
     }
     result->set_clauses.reserve(source.set_clauses.size());
     for (const auto& clause : source.set_clauses) {
@@ -1136,9 +1172,8 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
             joined = std::make_unique<JoinPlan>(T_NestLoop, std::move(right_plan), std::move(joined), curr_join_conds,
                                                 join_type);
         } else {
-            auto join_plan =
-                std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan), curr_join_conds,
-                                            join_type, std::move(curr_join_exprs));
+            auto join_plan = std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan),
+                                                        curr_join_conds, join_type, std::move(curr_join_exprs));
             if (!inlj_index_col_names.empty()) {
                 join_plan->inlj_left_col_ = inlj_left_col;
                 join_plan->inlj_right_col_ = inlj_right_col;
@@ -1320,6 +1355,9 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
             prepare_subquery_plans(cond.rhs_expr, context);
         }
     }
+    if (query->having_expr != nullptr) {
+        prepare_subquery_plans(*query->having_expr, context);
+    }
     for (auto& join_exprs : query->join_on_exprs) {
         for (auto& join_expr : join_exprs) {
             if (join_expr != nullptr) {
@@ -1337,6 +1375,9 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
     if (needs_aggregate_plan(*query)) {
         plannerRoot = std::make_unique<AggregatePlan>(T_Aggregate, std::move(plannerRoot), query->group_by_cols,
                                                       collect_aggregate_exprs(*query), query->having_conds);
+    }
+    if (query->having_expr != nullptr) {
+        plannerRoot = std::make_unique<FilterPlan>(T_Filter, std::move(plannerRoot), query->having_expr);
     }
 
     std::vector<QueryExpr> window_exprs;
@@ -1371,9 +1412,9 @@ std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query,
         branch_plans.push_back(generate_select_plan(std::move(branch_query), context));
     }
 
-    std::unique_ptr<Plan> plannerRoot = std::make_unique<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols,
-                                                                     query->output_names, query->union_all,
-                                                                     query->set_operators);
+    std::unique_ptr<Plan> plannerRoot =
+        std::make_unique<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols, query->output_names,
+                                    query->union_all, query->set_operators);
 
     plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
     plannerRoot = generate_limit_plan(query.get(), std::move(plannerRoot));

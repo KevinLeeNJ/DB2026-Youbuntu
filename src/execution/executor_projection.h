@@ -54,7 +54,8 @@ private:
         switch (expr.type) {
         case QueryExprType::COLUMN: {
             auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
-                return (expr.col.tab_name.empty() || col.tab_name == expr.col.tab_name) && col.name == expr.col.col_name;
+                return (expr.col.tab_name.empty() || col.tab_name == expr.col.tab_name) &&
+                       col.name == expr.col.col_name;
             });
             return pos == source_cols.end() ? static_cast<int>(sizeof(int)) : pos->len;
         }
@@ -65,9 +66,8 @@ private:
             return pos == source_cols.end() ? static_cast<int>(sizeof(int)) : pos->len;
         }
         case QueryExprType::WINDOW: {
-            auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
-                return col.name == expr.window_result_name;
-            });
+            auto pos = std::find_if(source_cols.begin(), source_cols.end(),
+                                    [&](const ColMeta& col) { return col.name == expr.window_result_name; });
             return pos == source_cols.end() ? static_cast<int>(sizeof(int)) : pos->len;
         }
         case QueryExprType::VALUE:
@@ -91,7 +91,9 @@ private:
             return len;
         }
         case QueryExprType::SUBQUERY:
-            return sizeof(int);
+            return expr.subquery != nullptr && expr.subquery->output_cols.size() == 1
+                       ? expr.subquery->output_cols[0].len
+                       : sizeof(int);
         }
         return sizeof(int);
     }
@@ -106,7 +108,8 @@ private:
         switch (expr.type) {
         case QueryExprType::COLUMN: {
             auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
-                return (expr.col.tab_name.empty() || col.tab_name == expr.col.tab_name) && col.name == expr.col.col_name;
+                return (expr.col.tab_name.empty() || col.tab_name == expr.col.tab_name) &&
+                       col.name == expr.col.col_name;
             });
             return pos == source_cols.end() ? TYPE_INT : pos->type;
         }
@@ -117,9 +120,8 @@ private:
             return pos == source_cols.end() ? TYPE_INT : pos->type;
         }
         case QueryExprType::WINDOW: {
-            auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
-                return col.name == expr.window_result_name;
-            });
+            auto pos = std::find_if(source_cols.begin(), source_cols.end(),
+                                    [&](const ColMeta& col) { return col.name == expr.window_result_name; });
             return pos == source_cols.end() ? TYPE_INT : pos->type;
         }
         case QueryExprType::VALUE:
@@ -143,7 +145,9 @@ private:
             }
             return expr.else_expr == nullptr ? TYPE_INT : expression_type(*expr.else_expr, source_cols);
         case QueryExprType::SUBQUERY:
-            return TYPE_INT;
+            return expr.subquery != nullptr && expr.subquery->output_cols.size() == 1
+                       ? expr.subquery->output_cols[0].type
+                       : TYPE_INT;
         }
         return TYPE_INT;
     }
@@ -164,14 +168,12 @@ private:
         }
         switch (col.type) {
         case TYPE_INT:
-            *reinterpret_cast<int*>(destination + col.offset) = value.cell.type == TYPE_FLOAT
-                                                                      ? static_cast<int>(value.cell.float_val)
-                                                                      : value.cell.int_val;
+            *reinterpret_cast<int*>(destination + col.offset) =
+                value.cell.type == TYPE_FLOAT ? checked_int_cast(value.cell.float_val) : value.cell.int_val;
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<double*>(destination + col.offset) = value.cell.type == TYPE_FLOAT
-                                                                        ? value.cell.float_val
-                                                                        : value.cell.int_val;
+            *reinterpret_cast<double*>(destination + col.offset) =
+                value.cell.type == TYPE_FLOAT ? value.cell.float_val : value.cell.int_val;
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

@@ -254,8 +254,7 @@ private:
         if (lhs.is_null || rhs.is_null) {
             return null_value(lhs.cell.type == TYPE_FLOAT || rhs.cell.type == TYPE_FLOAT ? TYPE_FLOAT : TYPE_INT);
         }
-        if (!execution_scalar::is_numeric_type(lhs.cell.type) ||
-            !execution_scalar::is_numeric_type(rhs.cell.type)) {
+        if (!execution_scalar::is_numeric_type(lhs.cell.type) || !execution_scalar::is_numeric_type(rhs.cell.type)) {
             throw IncompatibleTypeError(coltype2str(lhs.cell.type), coltype2str(rhs.cell.type));
         }
         bool floating = lhs.cell.type == TYPE_FLOAT || rhs.cell.type == TYPE_FLOAT;
@@ -286,7 +285,7 @@ private:
         if (floating) {
             result.cell.float_val = value;
         } else {
-            result.cell.int_val = static_cast<int>(value);
+            result.cell.int_val = checked_int_cast(value);
         }
         return result;
     }
@@ -324,10 +323,6 @@ private:
      * @return 首个满足条件的 THEN 值、ELSE 值，或带有推断类型的 NULL。
      */
     EvaluatedValue evaluate_case(const QueryExpr& expr, const RmRecord& rec) const {
-        ColType result_type = TYPE_INT;
-        if (!expr.case_when.empty() && expr.case_when.front().second != nullptr) {
-            result_type = evaluate(*expr.case_when.front().second, rec).cell.type;
-        }
         // WHEN 的 NULL/UNKNOWN 不算真，只有 is_true() 返回 true 才选择对应 THEN。
         for (const auto& clause : expr.case_when) {
             if (is_true(evaluate(*clause.first, rec))) {
@@ -337,7 +332,7 @@ private:
         if (expr.else_expr != nullptr) {
             return evaluate(*expr.else_expr, rec);
         }
-        return null_value(result_type);
+        return null_value();
     }
 
     /**
@@ -357,6 +352,9 @@ private:
         auto values = (*subquery_runner_)(*expr.subquery_plan, rec, cols_, nulls_);
         if (values.empty()) {
             return null_value();
+        }
+        if (values.size() != 1) {
+            throw RMDBError("Scalar subquery returned more than one row");
         }
         return values.front();
     }
@@ -443,8 +441,7 @@ private:
                         subquery_runner_ == nullptr) {
                         throw InternalError("IN predicate has an invalid subquery");
                     }
-                    subquery_values =
-                        (*subquery_runner_)(*expr.rhs->subquery_plan, rec, cols_, nulls_);
+                    subquery_values = (*subquery_runner_)(*expr.rhs->subquery_plan, rec, cols_, nulls_);
                 }
                 auto compare_values = [&](const EvaluatedValue& value) {
                     TruthValue current = compare_one(value, OP_EQ);
@@ -520,10 +517,10 @@ private:
             return truth_value(result);
         }
 
-        EvaluatedValue rhs = expr.rhs == nullptr ? null_value() :
-                                                   (expr.rhs->type == QueryExprType::SUBQUERY
-                                                        ? scalar_subquery(*expr.rhs, rec)
-                                                        : evaluate(*expr.rhs, rec));
+        EvaluatedValue rhs = expr.rhs == nullptr
+                                 ? null_value()
+                                 : (expr.rhs->type == QueryExprType::SUBQUERY ? scalar_subquery(*expr.rhs, rec)
+                                                                              : evaluate(*expr.rhs, rec));
         return truth_value(compare_one(rhs, expr.predicate_op));
     }
 
@@ -554,8 +551,12 @@ public:
         switch (expr.type) {
         case QueryExprType::COLUMN:
             return evaluate_column(expr, rec);
-        case QueryExprType::AGGREGATE:
-            throw InternalError("Aggregate expressions must be evaluated by AggregateExecutor");
+        case QueryExprType::AGGREGATE: {
+            QueryExpr output;
+            output.type = QueryExprType::COLUMN;
+            output.col.col_name = expr.display_name.empty() ? expr.agg.display_name : expr.display_name;
+            return evaluate_column(output, rec);
+        }
         case QueryExprType::WINDOW: {
             if (expr.window_result_name.empty()) {
                 throw InternalError("Window expression has not been materialized");

@@ -74,7 +74,7 @@ template <typename ExprPtrT> TabCol extract_ast_column(const ExprPtrT& expr_node
 
 template <typename SelectStmtT, typename Converter>
 void populate_select_items_from_ast(Query& query, const SelectStmtT& stmt, const std::vector<ColMeta>& all_cols,
-                                     Converter&& converter) {
+                                    Converter&& converter) {
     query.select_items.clear();
     query.has_select_star = stmt.has_select_star;
 
@@ -148,6 +148,14 @@ void populate_having_from_ast(Query& query, const SelectStmtT& stmt, Converter&&
             case ast::SV_OP_BETWEEN:
                 cond.op = OP_BETWEEN;
                 break;
+            case ast::SV_OP_IS_NULL:
+                cond.op = OP_IS_NULL;
+                break;
+            case ast::SV_OP_IS_NOT_NULL:
+                cond.op = OP_IS_NOT_NULL;
+                break;
+            case ast::SV_OP_EXISTS:
+                throw InternalError("EXISTS must use the recursive HAVING expression");
             }
             for (const auto& raw_value : raw_cond->rhs_list) {
                 auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
@@ -157,6 +165,8 @@ void populate_having_from_ast(Query& query, const SelectStmtT& stmt, Converter&&
                 cond.rhs_vals.push_back(convert_ast_value_node(rhs_val));
             }
             if (!cond.rhs_vals.empty()) {
+                cond.is_rhs_val = true;
+            } else if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL) {
                 cond.is_rhs_val = true;
             } else if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;

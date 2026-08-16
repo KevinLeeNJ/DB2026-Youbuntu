@@ -91,6 +91,7 @@ private:
     };
 
     struct AggregateState {
+        int64_t rows = 0;
         int64_t count = 0;
         double sum = 0.0;
         bool has_value = false;
@@ -154,8 +155,8 @@ private:
     template <typename T, typename = void> struct has_member_has_rhs_upper : std::false_type {};
 
     template <typename T>
-    struct has_member_has_rhs_upper<T, std::void_t<decltype(std::declval<const T&>().has_rhs_upper)>>
-        : std::true_type {};
+    struct has_member_has_rhs_upper<T, std::void_t<decltype(std::declval<const T&>().has_rhs_upper)>> : std::true_type {
+    };
 
     template <typename T, typename = void> struct has_member_negated : std::false_type {};
 
@@ -267,6 +268,9 @@ private:
         case OP_LIKE:
         case OP_IN:
         case OP_BETWEEN:
+        case OP_IS_NULL:
+        case OP_IS_NOT_NULL:
+        case OP_EXISTS:
             break;
         }
         throw InternalError("Unexpected comparison operator");
@@ -508,7 +512,7 @@ private:
         if (!spec.rhs_values.empty()) {
             return spec;
         }
-        if (cond.is_rhs_value) {
+        if (cond.is_rhs_val) {
             spec.rhs.kind = OperandKind::VALUE;
             spec.rhs.literal.type = cond.rhs_val.type;
             if (cond.rhs_val.type == TYPE_INT) {
@@ -547,6 +551,7 @@ private:
      */
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec,
                                 const std::vector<bool>& nulls) const {
+        ++state.rows;
         CellValue current_value;
         bool current_is_null = false;
         if (!spec.is_star) {
@@ -575,11 +580,13 @@ private:
         case LocalAggType::SUM:
             state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
                                                           : static_cast<double>(current_value.float_val);
+            state.has_value = true;
             break;
         case LocalAggType::AVG:
             state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
                                                           : static_cast<double>(current_value.float_val);
             ++state.count;
+            state.has_value = true;
             break;
         case LocalAggType::MAX:
             if (!state.has_value || compare_cells(current_value, state.value) > 0) {
@@ -610,11 +617,15 @@ private:
         return aggregate_values;
     }
 
+    static bool aggregate_is_null(const AggregateSpec& spec, const AggregateState& state) {
+        return spec.type != LocalAggType::COUNT && !state.has_value;
+    }
+
     /**
      * @brief 计算单个聚合状态的最终结果。
      * @param spec 聚合描述。
      * @param state 已累积的聚合状态。
-     * @return 聚合结果值；空 MIN/MAX 使用输入类型零值。
+     * @return 聚合结果值；无非 NULL 输入时由 aggregate_is_null 标记为 NULL。
      * @throws InternalError 聚合类型未知时抛出。
      */
     CellValue finalize_aggregate(const AggregateSpec& spec, const AggregateState& state) const {
@@ -622,14 +633,14 @@ private:
         case LocalAggType::COUNT: {
             CellValue value;
             value.type = TYPE_INT;
-            value.int_val = static_cast<int>(state.count);
+            value.int_val = checked_int_cast(static_cast<double>(state.count));
             return value;
         }
         case LocalAggType::SUM: {
             CellValue value;
             value.type = spec.input_type;
             if (spec.input_type == TYPE_INT) {
-                value.int_val = static_cast<int>(state.sum);
+                value.int_val = checked_int_cast(state.sum);
             } else {
                 value.float_val = state.sum;
             }
@@ -662,12 +673,13 @@ private:
     ResolvedHavingOperand resolve_having_operand(const HavingOperand& operand,
                                                  const std::vector<CellValue>& group_values,
                                                  const std::vector<bool>& group_nulls,
-                                                 const std::vector<CellValue>& aggregate_values) const {
+                                                 const std::vector<CellValue>& aggregate_values,
+                                                 const std::vector<bool>& aggregate_nulls) const {
         switch (operand.kind) {
         case OperandKind::GROUP_COL:
             return {group_values.at(operand.index), operand.index < group_nulls.size() && group_nulls[operand.index]};
         case OperandKind::AGG_RESULT:
-            return {aggregate_values.at(operand.index), false};
+            return {aggregate_values.at(operand.index), aggregate_nulls.at(operand.index)};
         case OperandKind::VALUE:
             return {operand.literal, false};
         }
@@ -684,18 +696,25 @@ private:
      * IN、BETWEEN 和 LIKE 在此处分别展开处理，其余比较操作使用三路比较结果；
      * 左值或必要的右值为 NULL 时按过滤语义判为不通过。
      */
-    bool passes_having(const std::vector<CellValue>& group_values,
-                       const std::vector<bool>& group_nulls,
-                       const std::vector<CellValue>& aggregate_values) const {
+    bool passes_having(const std::vector<CellValue>& group_values, const std::vector<bool>& group_nulls,
+                       const std::vector<CellValue>& aggregate_values, const std::vector<bool>& aggregate_nulls) const {
         for (const auto& cond : having_conds_) {
-            auto lhs = resolve_having_operand(cond.lhs, group_values, group_nulls, aggregate_values);
+            auto lhs = resolve_having_operand(cond.lhs, group_values, group_nulls, aggregate_values, aggregate_nulls);
+            if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL) {
+                bool matched = cond.op == OP_IS_NULL ? lhs.is_null : !lhs.is_null;
+                if (cond.negated ? matched : !matched) {
+                    return false;
+                }
+                continue;
+            }
             if (lhs.is_null) {
                 return false;
             }
             if (cond.op == OP_IN) {
                 bool matched = false;
                 for (const auto& rhs_operand : cond.rhs_values) {
-                    auto rhs = resolve_having_operand(rhs_operand, group_values, group_nulls, aggregate_values);
+                    auto rhs = resolve_having_operand(rhs_operand, group_values, group_nulls, aggregate_values,
+                                                      aggregate_nulls);
                     if (!rhs.is_null && compare_cells(lhs.value, rhs.value) == 0) {
                         matched = true;
                         break;
@@ -710,8 +729,10 @@ private:
                 if (!cond.has_rhs_upper) {
                     throw InternalError("HAVING BETWEEN predicate is missing its upper bound");
                 }
-                auto lower = resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values);
-                auto upper = resolve_having_operand(cond.rhs_upper, group_values, group_nulls, aggregate_values);
+                auto lower =
+                    resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values, aggregate_nulls);
+                auto upper = resolve_having_operand(cond.rhs_upper, group_values, group_nulls, aggregate_values,
+                                                    aggregate_nulls);
                 bool matched = !lower.is_null && !upper.is_null && compare_cells(lhs.value, lower.value) >= 0 &&
                                compare_cells(lhs.value, upper.value) <= 0;
                 if (cond.negated ? matched : !matched) {
@@ -719,7 +740,7 @@ private:
                 }
                 continue;
             }
-            auto rhs = resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values);
+            auto rhs = resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values, aggregate_nulls);
             if (rhs.is_null) {
                 return false;
             }
@@ -747,7 +768,12 @@ private:
      */
     bool passes_having(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
-        return passes_having(group_state.group_values, group_state.group_nulls, aggregate_values);
+        std::vector<bool> aggregate_nulls;
+        aggregate_nulls.reserve(aggregates_.size());
+        for (size_t i = 0; i < aggregates_.size(); ++i) {
+            aggregate_nulls.push_back(aggregate_is_null(aggregates_[i], group_state.aggregate_states[i]));
+        }
+        return passes_having(group_state.group_values, group_state.group_nulls, aggregate_values, aggregate_nulls);
     }
 
     /**
@@ -799,7 +825,8 @@ private:
      * @param group_nulls 分组列 NULL 标记。
      * @return 初始化后的分组状态。
      */
-    GroupState make_group_state(const std::vector<CellValue>& group_values, const std::vector<bool>& group_nulls = {}) const {
+    GroupState make_group_state(const std::vector<CellValue>& group_values,
+                                const std::vector<bool>& group_nulls = {}) const {
         GroupState state;
         state.group_values = group_values;
         state.group_nulls = group_nulls;
@@ -845,8 +872,7 @@ private:
                     groups_.push_back(make_group_state(key.values, key.nulls));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec,
-                                            child_nulls);
+                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec, child_nulls);
                 }
             }
 
@@ -1038,6 +1064,10 @@ public:
         nulls_.assign(cols_.size(), false);
         for (size_t i = 0; i < groups_[cursor_].group_nulls.size() && i < nulls_.size(); ++i) {
             nulls_[i] = groups_[cursor_].group_nulls[i];
+        }
+        const auto& aggregate_states = groups_[cursor_].aggregate_states;
+        for (size_t i = 0; i < aggregate_states.size(); ++i) {
+            nulls_[group_cols_.size() + i] = aggregate_is_null(aggregates_[i], aggregate_states[i]);
         }
         return materialize_group_result(groups_[cursor_]);
     }

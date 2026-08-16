@@ -200,8 +200,8 @@ private:
         compiled_conds_.clear();
         compiled_conds_.reserve(fed_conds_.size());
         for (const auto& cond : fed_conds_) {
-            has_extended_condition_ = has_extended_condition_ || cond.op == OP_LIKE || cond.op == OP_IN ||
-                                     cond.op == OP_BETWEEN;
+            has_extended_condition_ =
+                has_extended_condition_ || cond.op == OP_LIKE || cond.op == OP_IN || cond.op == OP_BETWEEN;
             CompiledCondition compiled;
             compiled.op = cond.op;
             compiled.lhs = compile_column_operand(cond.lhs_col);
@@ -284,8 +284,8 @@ private:
      * AbstractExecutor::compare/QueryExprEvaluator；纯数值/字符串条件则走预编译
      * 的直接读取路径，避免每次比较都构造临时记录。
      */
-    bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec,
-                      const std::vector<bool>& left_nulls = {}, const std::vector<bool>& right_nulls = {}) {
+    bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec, const std::vector<bool>& left_nulls = {},
+                      const std::vector<bool>& right_nulls = {}) {
         if (has_extended_condition_ || !exprs_.empty() || !left_nulls.empty() || !right_nulls.empty()) {
             RmRecord joined(static_cast<int>(len_));
             std::memcpy(joined.data, left_rec.data, left_tuple_len_);
@@ -428,8 +428,8 @@ private:
         outer_tuples_.clear();
 
         auto append_left_or_right_matches = [&](size_t left_index, size_t right_index) {
-            if (is_condition(left_rows[left_index].first, right_rows[right_index].first,
-                             left_rows[left_index].second, right_rows[right_index].second)) {
+            if (is_condition(left_rows[left_index].first, right_rows[right_index].first, left_rows[left_index].second,
+                             right_rows[right_index].second)) {
                 matched_left[left_index] = true;
                 matched_right[right_index] = true;
                 append_outer_tuple(&left_rows[left_index], &right_rows[right_index], false, false);

@@ -317,9 +317,8 @@ TEST_F(PlannerAggregateTest, generate_select_plan_inserts_window_stage_before_pr
 
 TEST_F(PlannerAggregateTest, generate_select_plan_deduplicates_window_expressions) {
     Analyze analyze(&sm_manager_);
-    auto parse = ast::parse_sql(
-        "select row_number() over (order by score) as first_num, "
-        "row_number() over (order by score) as second_num from grade;");
+    auto parse = ast::parse_sql("select row_number() over (order by score) as first_num, "
+                                "row_number() over (order by score) as second_num from grade;");
     auto query = analyze.do_analyze(std::move(parse));
 
     auto plan = planner_.generate_select_plan(std::move(query), nullptr);

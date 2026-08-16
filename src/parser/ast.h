@@ -314,8 +314,7 @@ struct CaseExpr : public Expr {
 struct SubqueryExpr : public Expr {
     std::unique_ptr<TreeNode> query;
 
-    explicit SubqueryExpr(std::unique_ptr<TreeNode> query_)
-        : Expr(AstType::SubqueryExpr), query(std::move(query_)) {}
+    explicit SubqueryExpr(std::unique_ptr<TreeNode> query_) : Expr(AstType::SubqueryExpr), query(std::move(query_)) {}
 };
 
 struct SelectItem : public TreeNode {
@@ -392,7 +391,8 @@ struct OrderByItem : public TreeNode {
     NullsOrder nulls_order;
 
     OrderByItem(std::unique_ptr<Expr> expr_, OrderByDir orderby_dir_, NullsOrder nulls_order_ = NullsOrder::DEFAULT)
-        : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_), nulls_order(nulls_order_) {}
+        : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_), nulls_order(nulls_order_) {
+    }
 };
 
 struct WindowExpr : public Expr {
@@ -402,8 +402,7 @@ struct WindowExpr : public Expr {
     std::vector<std::unique_ptr<OrderByItem>> order_by;
 
     WindowExpr(WindowFuncType func_, std::vector<std::unique_ptr<Expr>> args_,
-               std::vector<std::unique_ptr<Expr>> partition_by_,
-               std::vector<std::unique_ptr<OrderByItem>> order_by_)
+               std::vector<std::unique_ptr<Expr>> partition_by_, std::vector<std::unique_ptr<OrderByItem>> order_by_)
         : Expr(AstType::WindowExpr), func(func_), args(std::move(args_)), partition_by(std::move(partition_by_)),
           order_by(std::move(order_by_)) {}
 };
@@ -546,9 +545,10 @@ struct JoinExpr : public TreeNode {
     std::unique_ptr<Expr> condition;
     JoinType join_type;
 
-    JoinExpr(TableRef left_, TableRef right_, std::vector<std::unique_ptr<BinaryExpr>> conds_, JoinType type_)
+    JoinExpr(TableRef left_, TableRef right_, std::vector<std::unique_ptr<BinaryExpr>> conds_, JoinType type_,
+             std::unique_ptr<Expr> condition_ = nullptr)
         : TreeNode(AstType::JoinExpr), left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)),
-          join_type(type_) {}
+          condition(std::move(condition_)), join_type(type_) {}
 };
 
 struct SelectStmt : public TreeNode {
@@ -569,19 +569,21 @@ struct SelectStmt : public TreeNode {
     bool has_offset;
     int offset;
     std::unique_ptr<Expr> where_expr;
+    std::unique_ptr<Expr> having_expr;
 
     SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
                bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {}, bool has_distinct_ = false,
-               bool has_offset_ = false, int offset_ = 0, std::unique_ptr<Expr> where_expr_ = nullptr)
+               bool has_offset_ = false, int offset_ = 0, std::unique_ptr<Expr> where_expr_ = nullptr,
+               std::unique_ptr<Expr> having_expr_ = nullptr)
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
           conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
           group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
           has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
           limit(limit_), has_distinct(has_distinct_), has_offset(has_offset_), offset(offset_),
-          where_expr(std::move(where_expr_)) {
+          where_expr(std::move(where_expr_)), having_expr(std::move(having_expr_)) {
         if (!order_by_items.empty()) {
             std::vector<std::unique_ptr<OrderByItem>> order_items;
             order_items.reserve(order_by_items.size());
@@ -612,7 +614,6 @@ struct SelectFromUnionStmt : public TreeNode {
     bool has_sort;
     bool has_limit = false;
     int limit = 0;
-    bool has_distinct = false;
     bool has_offset = false;
     int offset = 0;
 

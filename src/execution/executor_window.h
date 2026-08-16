@@ -174,7 +174,7 @@ private:
         switch (col.type) {
         case TYPE_INT:
             *reinterpret_cast<int*>(destination + col.offset) =
-                value.cell.type == TYPE_FLOAT ? static_cast<int>(value.cell.float_val) : value.cell.int_val;
+                value.cell.type == TYPE_FLOAT ? checked_int_cast(value.cell.float_val) : value.cell.int_val;
             break;
         case TYPE_FLOAT:
             *reinterpret_cast<double*>(destination + col.offset) =
@@ -215,7 +215,7 @@ private:
         if (type == TYPE_FLOAT) {
             result.cell.float_val = value;
         } else {
-            result.cell.int_val = static_cast<int>(value);
+            result.cell.int_val = checked_int_cast(value);
         }
         return result;
     }

@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze_select_internal.h"
 
 #include <algorithm>
+#include <functional>
 #include <unordered_set>
 #include <utility>
 
@@ -133,6 +134,9 @@ void resolve_aliases(Query& query) {
             resolve_alias(cond.rhs_expr, query);
         }
     }
+    if (query.having_expr != nullptr) {
+        resolve_alias(*query.having_expr, query);
+    }
     for (auto& item : query.order_by_items) {
         resolve_alias(item.expr, query);
     }
@@ -225,6 +229,9 @@ void resolve_local_unqualified_columns(Query& query, const std::vector<ColMeta>&
             resolve_local_unqualified_columns(cond.rhs_expr, local_cols);
         }
     }
+    if (query.having_expr != nullptr) {
+        resolve_local_unqualified_columns(*query.having_expr, local_cols);
+    }
     for (auto& item : query.order_by_items) {
         resolve_local_unqualified_columns(item.expr, local_cols);
     }
@@ -248,10 +255,9 @@ bool is_outer_column(const ast::Col* column, const std::vector<ColMeta>& outer_c
     if (outer_aliases.find(column->tab_name) != outer_aliases.end()) {
         return true;
     }
-    return !column->tab_name.empty() &&
-           std::any_of(outer_cols.begin(), outer_cols.end(), [&](const ColMeta& col) {
-               return col.tab_name == column->tab_name;
-           });
+    return !column->tab_name.empty() && std::any_of(outer_cols.begin(), outer_cols.end(), [&](const ColMeta& col) {
+        return col.tab_name == column->tab_name;
+    });
 }
 
 bool is_legacy_condition_expression(const ast::Expr* expression, const std::vector<ColMeta>& outer_cols,
@@ -281,7 +287,7 @@ bool is_legacy_condition_expression(const ast::Expr* expression, const std::vect
         return false;
     }
     if (!std::all_of(condition->rhs_list.begin(), condition->rhs_list.end(),
-                    [](const auto& value) { return dynamic_cast<const ast::Value*>(value.get()) != nullptr; })) {
+                     [](const auto& value) { return dynamic_cast<const ast::Value*>(value.get()) != nullptr; })) {
         return false;
     }
     if (std::any_of(condition->rhs_list.begin(), condition->rhs_list.end(), [](const auto& value) {
@@ -293,8 +299,8 @@ bool is_legacy_condition_expression(const ast::Expr* expression, const std::vect
     if (condition->rhs_upper != nullptr && dynamic_cast<const ast::Value*>(condition->rhs_upper.get()) == nullptr) {
         return false;
     }
-    if (auto rhs_value = dynamic_cast<const ast::Value*>(condition->rhs.get()); rhs_value != nullptr &&
-        rhs_value->type == ast::AstType::NullLit) {
+    if (auto rhs_value = dynamic_cast<const ast::Value*>(condition->rhs.get());
+        rhs_value != nullptr && rhs_value->type == ast::AstType::NullLit) {
         return false;
     }
     if (condition->rhs == nullptr) {
@@ -407,8 +413,7 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                     clause.rhs = convert_sv_value(value);
                 } else {
                     auto rhs_expr = convert_ast_expr(set_clause->rhs_expr.get(), "UPDATE", all_cols, {});
-                    if (rhs_expr.type == QueryExprType::SUBQUERY &&
-                        get_query_output_metas(*rhs_expr.subquery).size() != 1) {
+                    if (rhs_expr.type == QueryExprType::SUBQUERY && rhs_expr.subquery->output_cols.size() != 1) {
                         throw RMDBError("Scalar subquery must return exactly one column");
                     }
                     clause.rhs_expr = std::make_shared<QueryExpr>(std::move(rhs_expr));
@@ -426,8 +431,11 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         }
         get_clause(x->conds, query->conds);
         if (x->where_expr != nullptr && !is_legacy_condition_expression(x->where_expr.get(), {}, {})) {
-            query->where_expr = std::make_shared<QueryExpr>(
-                convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+            query->where_expr =
+                std::make_shared<QueryExpr>(convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+            if (!is_boolean_query_expr(*query->where_expr)) {
+                throw RMDBError("WHERE expression must be boolean");
+            }
         }
         check_clause({x->tab_name}, query->conds);
         break;
@@ -441,8 +449,11 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         if (x->where_expr != nullptr && !is_legacy_condition_expression(x->where_expr.get(), {}, {})) {
             std::vector<ColMeta> all_cols;
             get_all_cols({x->tab_name}, all_cols);
-            query->where_expr = std::make_shared<QueryExpr>(
-                convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+            query->where_expr =
+                std::make_shared<QueryExpr>(convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+            if (!is_boolean_query_expr(*query->where_expr)) {
+                throw RMDBError("WHERE expression must be boolean");
+            }
         }
         check_clause({x->tab_name}, query->conds);
         break;
@@ -456,7 +467,7 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         query->insert_col_names = x->col_names;
         if (x->select != nullptr) {
             query->insert_query = std::shared_ptr<Query>(analyze_subquery(x->select.get(), {}, {}));
-            const auto source_cols = get_query_output_metas(*query->insert_query);
+            const auto& source_cols = query->insert_query->output_cols;
             if (query->insert_col_names.empty()) {
                 if (source_cols.size() != table.cols.size()) {
                     throw InvalidValueCountError();
@@ -471,9 +482,8 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                     if (!seen.insert(name).second) {
                         throw RMDBError("Duplicate INSERT target column: " + name);
                     }
-                    if (std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
-                            return col.name == name;
-                        }) == table.cols.end()) {
+                    if (std::find_if(table.cols.begin(), table.cols.end(),
+                                     [&](const ColMeta& col) { return col.name == name; }) == table.cols.end()) {
                         throw ColumnNotFoundError(name);
                     }
                 }
@@ -495,9 +505,8 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
             query->values.resize(table.cols.size());
             std::vector<bool> filled(table.cols.size(), false);
             for (size_t value_idx = 0; value_idx < x->col_names.size(); ++value_idx) {
-                auto col = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& meta) {
-                    return meta.name == x->col_names[value_idx];
-                });
+                auto col = std::find_if(table.cols.begin(), table.cols.end(),
+                                        [&](const ColMeta& meta) { return meta.name == x->col_names[value_idx]; });
                 if (col == table.cols.end()) {
                     throw ColumnNotFoundError(x->col_names[value_idx]);
                 }
@@ -518,9 +527,9 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     return query;
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_stmt(
-    const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
-    const std::unordered_map<std::string, std::string>& outer_aliases) {
+std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner,
+                                                    const std::vector<ColMeta>& outer_cols,
+                                                    const std::unordered_map<std::string, std::string>& outer_aliases) {
     auto query = std::make_unique<Query>();
     populate_table_refs(*query, x->tabs);
     for (const auto& [alias, table] : outer_aliases) {
@@ -543,9 +552,8 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
         const auto& left_meta = sm_manager_->db_.get_table(join->left.table_name);
         const auto& right_meta = sm_manager_->db_.get_table(join->right.table_name);
         for (const auto& left_col : left_meta.cols) {
-            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(), [&](const ColMeta& col) {
-                return col.name == left_col.name;
-            });
+            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(),
+                                          [&](const ColMeta& col) { return col.name == left_col.name; });
             if (right_col != right_meta.cols.end()) {
                 natural_duplicate_columns.insert(join->right.table_name + "." + right_col->name);
             }
@@ -567,12 +575,18 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
     populate_select_items_from_ast(*query, *x, visible_cols, converter);
     populate_group_by_from_ast(*query, *x);
     populate_having_from_ast(*query, *x, converter);
+    if (x->having_expr != nullptr && x->having_conds.empty()) {
+        query->having_expr = std::make_shared<QueryExpr>(converter(x->having_expr.get(), "HAVING"));
+    }
     populate_order_by_from_ast(*query, *x, converter);
     populate_limit_from_ast(*query, *x);
     if (x->where_expr != nullptr) {
         if (!is_legacy_condition_expression(x->where_expr.get(), outer_cols, outer_aliases)) {
             query->where_expr = std::make_shared<QueryExpr>(
                 convert_ast_expr(x->where_expr.get(), "WHERE", scope_cols, query->table_alias_to_name));
+            if (!is_boolean_query_expr(*query->where_expr)) {
+                throw RMDBError("WHERE expression must be boolean");
+            }
         }
     }
     query->conds.clear();
@@ -586,13 +600,19 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
 
         std::vector<Condition> join_conds;
         std::vector<std::shared_ptr<QueryExpr>> join_exprs;
-        for (const auto& raw_condition : join->conds) {
-            if (is_legacy_condition_expression(raw_condition.get(), outer_cols, outer_aliases)) {
-                append_clause(raw_condition.get(), join_conds);
-                continue;
-            }
+        if (join->condition != nullptr &&
+            !is_legacy_condition_expression(join->condition.get(), outer_cols, outer_aliases)) {
             join_exprs.push_back(std::make_shared<QueryExpr>(
-                convert_ast_expr(raw_condition.get(), "JOIN ON", scope_cols, query->table_alias_to_name)));
+                convert_ast_expr(join->condition.get(), "JOIN ON", scope_cols, query->table_alias_to_name)));
+        } else {
+            for (const auto& raw_condition : join->conds) {
+                if (is_legacy_condition_expression(raw_condition.get(), outer_cols, outer_aliases)) {
+                    append_clause(raw_condition.get(), join_conds);
+                    continue;
+                }
+                join_exprs.push_back(std::make_shared<QueryExpr>(
+                    convert_ast_expr(raw_condition.get(), "JOIN ON", scope_cols, query->table_alias_to_name)));
+            }
         }
         for (auto& condition : join_conds) {
             condition.is_join_on = true;
@@ -610,15 +630,17 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
     for (auto& join_conds : query->join_on_conds) {
         resolve_local_condition_columns(join_conds, all_cols);
     }
-    query->conds.erase(std::remove_if(query->conds.begin(), query->conds.end(), [&](const Condition& cond) {
+    query->conds.erase(
+        std::remove_if(query->conds.begin(), query->conds.end(),
+                       [&](const Condition& cond) {
                            auto is_local_table = [&](const std::string& table) {
-                               return std::find(query->tables.begin(), query->tables.end(), table) != query->tables.end();
+                               return std::find(query->tables.begin(), query->tables.end(), table) !=
+                                      query->tables.end();
                            };
                            auto is_outer_table = [&](const std::string& table) {
                                return outer_aliases.find(table) != outer_aliases.end() ||
-                                      std::any_of(outer_cols.begin(), outer_cols.end(), [&](const ColMeta& col) {
-                                          return col.tab_name == table;
-                                      });
+                                      std::any_of(outer_cols.begin(), outer_cols.end(),
+                                                  [&](const ColMeta& col) { return col.tab_name == table; });
                            };
                            if (!is_local_table(cond.lhs_col.tab_name)) {
                                return is_outer_table(cond.lhs_col.tab_name);
@@ -626,7 +648,7 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
                            return !cond.is_rhs_val && cond.op != OP_IS_NULL && cond.op != OP_IS_NOT_NULL &&
                                   !is_local_table(cond.rhs_col.tab_name) && is_outer_table(cond.rhs_col.tab_name);
                        }),
-                       query->conds.end());
+        query->conds.end());
     check_clause(query->tables, query->conds);
     for (auto& join_conds : query->join_on_conds) {
         check_clause(query->tables, join_conds);
@@ -635,6 +657,9 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
         for (auto& join_expr : join_exprs) {
             resolve_local_unqualified_columns(*join_expr, visible_cols);
             normalize_query_expr(*join_expr, scope_cols);
+            if (!is_boolean_query_expr(*join_expr) || infer_expr_type(*join_expr, scope_cols) != TYPE_INT) {
+                throw RMDBError("JOIN ON expression must be boolean");
+            }
         }
     }
     for (size_t join_idx = 0; join_idx < x->jointree.size(); ++join_idx) {
@@ -645,9 +670,8 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
         const auto& left_meta = sm_manager_->db_.get_table(join->left.table_name);
         const auto& right_meta = sm_manager_->db_.get_table(join->right.table_name);
         for (const auto& left_col : left_meta.cols) {
-            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(), [&](const ColMeta& col) {
-                return col.name == left_col.name;
-            });
+            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(),
+                                          [&](const ColMeta& col) { return col.name == left_col.name; });
             if (right_col == right_meta.cols.end()) {
                 continue;
             }
@@ -671,35 +695,54 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
         }
     }
     validate_select_query(*query, scope_cols);
+    query->output_cols = get_query_output_metas(*query, scope_cols);
     query->parse = std::move(owner);
     return query;
 }
 
-std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
+std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query, const std::vector<ColMeta>& scope_cols) {
     if (query.is_union) {
         return query.union_cols;
     }
-
-    std::vector<ColMeta> all_cols;
-    get_all_cols(query.tables, all_cols);
 
     std::vector<ColMeta> result;
     result.reserve(query.select_items.size());
     size_t offset = 0;
     for (size_t i = 0; i < query.select_items.size(); ++i) {
         const auto& item = query.select_items[i];
-        ColType type = infer_expr_type(item.expr, all_cols);
-        int len = sizeof(int);
-        if (type == TYPE_FLOAT) {
-            len = sizeof(double);
-        } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
-            if (item.expr.type != QueryExprType::COLUMN) {
-                throw RMDBError("UNION only supports string output from columns");
+        ColType type = infer_expr_type(item.expr, scope_cols);
+        std::function<int(const QueryExpr&)> expression_len = [&](const QueryExpr& expr) -> int {
+            ColType expr_type = infer_expr_type(expr, scope_cols);
+            if (expr_type == TYPE_INT) {
+                return sizeof(int);
             }
-            TabCol resolved_col = item.expr.col;
-            const ColMeta* col_meta = resolve_column_meta(all_cols, resolved_col);
-            len = col_meta->len;
-        }
+            if (expr_type == TYPE_FLOAT) {
+                return sizeof(double);
+            }
+            if (expr.type == QueryExprType::COLUMN) {
+                TabCol resolved_col = expr.col;
+                return resolve_column_meta(scope_cols, resolved_col)->len;
+            }
+            if (expr.type == QueryExprType::VALUE) {
+                return std::max<int>(1, expr.value.str_val.size());
+            }
+            if (expr.type == QueryExprType::CASE_EXPR) {
+                int len = 1;
+                for (const auto& clause : expr.case_when) {
+                    len = std::max(len, expression_len(*clause.second));
+                }
+                return expr.else_expr == nullptr ? len : std::max(len, expression_len(*expr.else_expr));
+            }
+            if (expr.type == QueryExprType::SUBQUERY && expr.subquery != nullptr &&
+                expr.subquery->output_cols.size() == 1) {
+                return expr.subquery->output_cols[0].len;
+            }
+            if (expr.type == QueryExprType::WINDOW && !expr.window_args.empty()) {
+                return expression_len(*expr.window_args.front());
+            }
+            return 1;
+        };
+        int len = expression_len(item.expr);
 
         ColMeta col;
         col.tab_name.clear();
@@ -755,18 +798,20 @@ void Analyze::validate_union_order_by(Query& query) {
     }
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(
-    const ast::SelectFromUnionStmt* x, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
-    const std::unordered_map<std::string, std::string>& outer_aliases) {
+std::unique_ptr<Query>
+Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x, std::unique_ptr<ast::TreeNode> owner,
+                                        const std::vector<ColMeta>& outer_cols,
+                                        const std::unordered_map<std::string, std::string>& outer_aliases) {
     return analyze_union_stmt(x->union_stmt.get(), x->alias, x->order_by_items, x->has_limit, x->limit, x->has_offset,
                               x->offset, std::move(owner), outer_cols, outer_aliases);
 }
 
-std::unique_ptr<Query> Analyze::analyze_union_stmt(
-    const ast::UnionStmt* union_stmt, std::string alias,
-    const std::vector<std::unique_ptr<ast::OrderByItem>>& order_by_items, bool has_limit, int limit, bool has_offset,
-    int query_offset, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
-    const std::unordered_map<std::string, std::string>& outer_aliases) {
+std::unique_ptr<Query> Analyze::analyze_union_stmt(const ast::UnionStmt* union_stmt, std::string alias,
+                                                   const std::vector<std::unique_ptr<ast::OrderByItem>>& order_by_items,
+                                                   bool has_limit, int limit, bool has_offset, int query_offset,
+                                                   std::unique_ptr<ast::TreeNode> owner,
+                                                   const std::vector<ColMeta>& outer_cols,
+                                                   const std::unordered_map<std::string, std::string>& outer_aliases) {
     if (union_stmt == nullptr || union_stmt->branches.size() < 2) {
         throw RMDBError("UNION requires at least two SELECT branches");
     }
@@ -823,14 +868,31 @@ std::unique_ptr<Query> Analyze::analyze_union_stmt(
         query->union_branches.push_back(std::move(branch_query));
     }
 
-    query->union_cols = get_query_output_metas(*query->union_branches.front());
+    query->union_cols = query->union_branches.front()->output_cols;
+    std::vector<bool> union_col_is_null;
+    union_col_is_null.reserve(query->union_cols.size());
+    for (const auto& item : query->union_branches.front()->select_items) {
+        union_col_is_null.push_back(is_null_query_expr(item.expr));
+    }
     for (size_t branch_idx = 1; branch_idx < query->union_branches.size(); ++branch_idx) {
-        auto branch_cols = get_query_output_metas(*query->union_branches[branch_idx]);
+        const auto& branch = *query->union_branches[branch_idx];
+        const auto& branch_cols = branch.output_cols;
         if (branch_cols.size() != query->union_cols.size()) {
             throw RMDBError("UNION branches must return the same number of columns");
         }
         for (size_t col_idx = 0; col_idx < query->union_cols.size(); ++col_idx) {
-            query->union_cols[col_idx] = make_union_col_meta(query->union_cols[col_idx], branch_cols[col_idx]);
+            const bool branch_is_null = is_null_query_expr(branch.select_items[col_idx].expr);
+            if (union_col_is_null[col_idx]) {
+                if (!branch_is_null) {
+                    std::string output_name = query->union_cols[col_idx].name;
+                    query->union_cols[col_idx] = branch_cols[col_idx];
+                    query->union_cols[col_idx].tab_name.clear();
+                    query->union_cols[col_idx].name = std::move(output_name);
+                }
+            } else if (!branch_is_null) {
+                query->union_cols[col_idx] = make_union_col_meta(query->union_cols[col_idx], branch_cols[col_idx]);
+            }
+            union_col_is_null[col_idx] = union_col_is_null[col_idx] && branch_is_null;
         }
     }
 
@@ -842,6 +904,7 @@ std::unique_ptr<Query> Analyze::analyze_union_stmt(
         offset += static_cast<size_t>(col.len);
         query->output_names.push_back(col.name);
     }
+    query->output_cols = query->union_cols;
 
     validate_union_order_by(*query);
     return query;
@@ -893,8 +956,8 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         result.window_func = convert_ast_window_func_type(window->func);
         result.window_args.reserve(window->args.size());
         for (const auto& arg : window->args) {
-            result.window_args.push_back(std::make_shared<QueryExpr>(
-                convert_ast_expr(arg.get(), "WINDOW ARGUMENT", outer_cols, outer_aliases)));
+            result.window_args.push_back(
+                std::make_shared<QueryExpr>(convert_ast_expr(arg.get(), "WINDOW ARGUMENT", outer_cols, outer_aliases)));
         }
         result.window_partition_by.reserve(window->partition_by.size());
         for (const auto& partition_expr : window->partition_by) {
@@ -930,10 +993,10 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
             result.arithmetic_op = QueryArithmeticOp::DIV;
             break;
         }
-        result.lhs = std::make_shared<QueryExpr>(convert_ast_expr(arithmetic->lhs.get(), context_name, outer_cols,
-                                                                   outer_aliases));
-        result.rhs = std::make_shared<QueryExpr>(convert_ast_expr(arithmetic->rhs.get(), context_name, outer_cols,
-                                                                   outer_aliases));
+        result.lhs = std::make_shared<QueryExpr>(
+            convert_ast_expr(arithmetic->lhs.get(), context_name, outer_cols, outer_aliases));
+        result.rhs = std::make_shared<QueryExpr>(
+            convert_ast_expr(arithmetic->rhs.get(), context_name, outer_cols, outer_aliases));
         return result;
     }
     if (auto logical = dynamic_cast<const ast::LogicalExpr*>(expr); logical != nullptr) {
@@ -963,11 +1026,10 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         result.display_name = "CASE";
         result.case_when.reserve(case_expr->when_clauses.size());
         for (const auto& clause : case_expr->when_clauses) {
-            result.case_when.emplace_back(
-                std::make_shared<QueryExpr>(convert_ast_expr(clause.condition.get(), context_name, outer_cols,
-                                                             outer_aliases)),
-                std::make_shared<QueryExpr>(convert_ast_expr(clause.result.get(), context_name, outer_cols,
-                                                             outer_aliases)));
+            result.case_when.emplace_back(std::make_shared<QueryExpr>(convert_ast_expr(
+                                              clause.condition.get(), context_name, outer_cols, outer_aliases)),
+                                          std::make_shared<QueryExpr>(convert_ast_expr(
+                                              clause.result.get(), context_name, outer_cols, outer_aliases)));
         }
         if (case_expr->else_expr != nullptr) {
             result.else_expr = std::make_shared<QueryExpr>(
@@ -999,8 +1061,7 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
             result.rhs = std::make_shared<QueryExpr>(
                 convert_ast_expr(binary->rhs.get(), context_name, outer_cols, outer_aliases));
             if ((result.predicate_op == OP_IN || result.quantifier != QueryQuantifier::NONE) &&
-                result.rhs->type == QueryExprType::SUBQUERY &&
-                get_query_output_metas(*result.rhs->subquery).size() != 1) {
+                result.rhs->type == QueryExprType::SUBQUERY && result.rhs->subquery->output_cols.size() != 1) {
                 throw RMDBError("Subquery predicate must return exactly one column");
             }
         }
@@ -1010,8 +1071,8 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         }
         result.rhs_values.reserve(binary->rhs_list.size());
         for (const auto& rhs_value : binary->rhs_list) {
-            result.rhs_values.push_back(
-                std::make_shared<QueryExpr>(convert_ast_expr(rhs_value.get(), context_name, outer_cols, outer_aliases)));
+            result.rhs_values.push_back(std::make_shared<QueryExpr>(
+                convert_ast_expr(rhs_value.get(), context_name, outer_cols, outer_aliases)));
         }
         return result;
     }
@@ -1027,8 +1088,7 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
     throw InternalError(context_name + " contains an unsupported expression type");
 }
 
-std::unique_ptr<Query> Analyze::analyze_subquery(const ast::TreeNode* root,
-                                                 const std::vector<ColMeta>& outer_cols,
+std::unique_ptr<Query> Analyze::analyze_subquery(const ast::TreeNode* root, const std::vector<ColMeta>& outer_cols,
                                                  const std::unordered_map<std::string, std::string>& outer_aliases) {
     if (root == nullptr) {
         throw InternalError("Unexpected null subquery");
@@ -1085,8 +1145,8 @@ void Analyze::append_clause(const ast::BinaryExpr* expr, std::vector<Condition>&
             dynamic_cast<const ast::Col*>(expr->rhs.get()) == nullptr) {
             return;
         }
-        if (auto rhs_value = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_value != nullptr &&
-            rhs_value->type == ast::AstType::NullLit) {
+        if (auto rhs_value = dynamic_cast<const ast::Value*>(expr->rhs.get());
+            rhs_value != nullptr && rhs_value->type == ast::AstType::NullLit) {
             return;
         }
     }
@@ -1229,7 +1289,7 @@ void Analyze::cast_value(Value& val, ColType to) {
         return;
     }
     if (to == TYPE_INT && val.type == TYPE_FLOAT) {
-        val.set_int(static_cast<int>(val.float_val));
+        val.set_int(checked_int_cast(val.float_val));
         return;
     }
     if (to == TYPE_DATETIME && val.type == TYPE_STRING) {

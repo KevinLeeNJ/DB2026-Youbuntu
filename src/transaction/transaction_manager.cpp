@@ -140,6 +140,9 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         case OP_LIKE:
         case OP_IN:
         case OP_BETWEEN:
+        case OP_IS_NULL:
+        case OP_IS_NOT_NULL:
+        case OP_EXISTS:
             break;
         }
         throw InternalError("Unexpected comparison operator");
@@ -147,17 +150,34 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
 
     const auto& lhs_meta = get_col_meta(cond.lhs_col);
     auto lhs = from_record(rec, lhs_meta);
+    if (cond.op == OP_IS_NULL) {
+        return false;
+    }
+    if (cond.op == OP_IS_NOT_NULL) {
+        return true;
+    }
+    if (cond.op == OP_EXISTS) {
+        return false;
+    }
     if (cond.op == OP_IN) {
         bool matched = false;
+        bool has_null = false;
         for (const auto& value : cond.rhs_vals) {
+            if (value.is_null) {
+                has_null = true;
+                continue;
+            }
             if (compare_simple(lhs, from_value(value), OP_EQ)) {
                 matched = true;
                 break;
             }
         }
-        return cond.negated ? !matched : matched;
+        return matched ? !cond.negated : has_null ? false : cond.negated;
     }
     if (cond.op == OP_BETWEEN) {
+        if (cond.rhs_val.is_null || cond.rhs_upper.is_null) {
+            return false;
+        }
         bool matched = compare_simple(lhs, from_value(cond.rhs_val), OP_GE) &&
                        compare_simple(lhs, from_value(cond.rhs_upper), OP_LE);
         return cond.negated ? !matched : matched;
@@ -165,6 +185,9 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
 
     execution_scalar::CellValue rhs;
     if (cond.is_rhs_val) {
+        if (cond.rhs_val.is_null) {
+            return false;
+        }
         rhs = from_value(cond.rhs_val);
     } else {
         rhs = from_record(rec, get_col_meta(cond.rhs_col));
@@ -566,7 +589,7 @@ TransactionManager::FindVisibleVersion(const TupleMeta& start_meta, timestamp_t 
 // ---- SSI Helper ----
 
 bool TransactionManager::TupleMatches(const std::string& tab_name, const std::vector<Condition>& conds,
-                                       const RmRecord& rec) {
+                                      const RmRecord& rec) {
     if (conds.empty()) {
         return true;
     }

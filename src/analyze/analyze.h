@@ -36,6 +36,7 @@ public:
     std::vector<SelectItem> select_items;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCondition> having_conds;
+    std::shared_ptr<QueryExpr> having_expr;
     std::vector<OrderByItem> order_by_items;
     bool has_limit = false;
     int limit = 0;
@@ -49,6 +50,7 @@ public:
     bool is_union = false;
     std::vector<std::unique_ptr<Query>> union_branches;
     std::vector<ColMeta> union_cols;
+    std::vector<ColMeta> output_cols;
     std::string union_alias;
     std::vector<bool> union_all;
     std::vector<QuerySetOperator> set_operators;
@@ -113,11 +115,10 @@ private:
                                                std::unique_ptr<ast::TreeNode> owner = nullptr,
                                                const std::vector<ColMeta>& outer_cols = {},
                                                const std::unordered_map<std::string, std::string>& outer_aliases = {});
-    std::unique_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
-                                                          std::unique_ptr<ast::TreeNode> owner,
-                                                          const std::vector<ColMeta>& outer_cols = {},
-                                                          const std::unordered_map<std::string, std::string>&
-                                                              outer_aliases = {});
+    std::unique_ptr<Query>
+    analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select, std::unique_ptr<ast::TreeNode> owner,
+                                   const std::vector<ColMeta>& outer_cols = {},
+                                   const std::unordered_map<std::string, std::string>& outer_aliases = {});
     std::unique_ptr<Query> analyze_union_stmt(const ast::UnionStmt* union_stmt, std::string alias,
                                               const std::vector<std::unique_ptr<ast::OrderByItem>>& order_by_items,
                                               bool has_limit, int limit, bool has_offset, int offset,
@@ -129,7 +130,7 @@ private:
                                const std::unordered_map<std::string, std::string>& outer_aliases);
     std::unique_ptr<Query> analyze_subquery(const ast::TreeNode* root, const std::vector<ColMeta>& outer_cols,
                                             const std::unordered_map<std::string, std::string>& outer_aliases);
-    std::vector<ColMeta> get_query_output_metas(const Query& query);
+    std::vector<ColMeta> get_query_output_metas(const Query& query, const std::vector<ColMeta>& scope_cols);
     ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);
     void validate_union_order_by(Query& query);
 };

@@ -379,13 +379,14 @@ private:
         conds.insert(conds.end(), std::make_move_iterator(where_conds.begin()),
                      std::make_move_iterator(where_conds.end()));
         auto group_by = parse_opt_group_clause();
-        auto having = parse_opt_having_clause();
+        auto having_expr = parse_optional_boolean_expr(TokenType::HAVING);
+        auto having = make_having_conditions(having_expr.get());
         auto order = parse_opt_order_clause();
         auto pagination = parse_opt_pagination_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
                                             std::move(having), std::move(order), pagination.has_limit, pagination.limit,
                                             has_star, std::move(from->jointree), has_distinct, pagination.has_offset,
-                                            pagination.offset, std::move(where_expr));
+                                            pagination.offset, std::move(where_expr), std::move(having_expr));
     }
 
     std::unique_ptr<TreeNode> parse_query_chain() {
@@ -822,8 +823,7 @@ private:
         return parse_value();
     }
 
-    std::unique_ptr<Expr> make_arithmetic_expr(TokenType token, std::unique_ptr<Expr> lhs,
-                                                std::unique_ptr<Expr> rhs) {
+    std::unique_ptr<Expr> make_arithmetic_expr(TokenType token, std::unique_ptr<Expr> lhs, std::unique_ptr<Expr> rhs) {
         ArithmeticOp op;
         switch (token) {
         case TokenType::PLUS:
@@ -1024,8 +1024,7 @@ private:
     std::vector<std::unique_ptr<Expr>> parse_window_arguments(WindowFuncType func) {
         std::vector<std::unique_ptr<Expr>> args;
         expect(TokenType::LPAREN, "expected '(' after window function");
-        if (func == WindowFuncType::ROW_NUMBER || func == WindowFuncType::RANK ||
-            func == WindowFuncType::DENSE_RANK) {
+        if (func == WindowFuncType::ROW_NUMBER || func == WindowFuncType::RANK || func == WindowFuncType::DENSE_RANK) {
             expect(TokenType::RPAREN, "ranking functions do not accept arguments");
             return args;
         }
@@ -1107,24 +1106,18 @@ private:
         return parse_col_list();
     }
 
-    std::vector<std::unique_ptr<HavingExpr>> parse_opt_having_clause() {
-        if (!match(TokenType::HAVING)) {
-            return {};
-        }
+    std::vector<std::unique_ptr<HavingExpr>> make_having_conditions(const Expr* expression) {
         std::vector<std::unique_ptr<HavingExpr>> conds;
-        conds.push_back(parse_having_condition());
-        while (match(TokenType::AND)) {
-            conds.push_back(parse_having_condition());
+        auto flattened = flatten_legacy_conditions(expression);
+        conds.reserve(flattened.size());
+        for (auto& cond : flattened) {
+            auto result =
+                std::make_unique<HavingExpr>(std::move(cond->lhs), cond->op, std::move(cond->rhs), cond->negated);
+            result->rhs_upper = std::move(cond->rhs_upper);
+            result->rhs_list = std::move(cond->rhs_list);
+            conds.push_back(std::move(result));
         }
         return conds;
-    }
-
-    std::unique_ptr<HavingExpr> parse_having_condition() {
-        auto cond = parse_general_condition();
-        auto result = std::make_unique<HavingExpr>(std::move(cond->lhs), cond->op, std::move(cond->rhs), cond->negated);
-        result->rhs_upper = std::move(cond->rhs_upper);
-        result->rhs_list = std::move(cond->rhs_list);
-        return result;
     }
 
     std::unique_ptr<Expr> parse_general_expr() {
@@ -1238,17 +1231,27 @@ private:
                 TableRef left = from->tables.back();
                 TableRef right = parse_table_ref();
                 from->tables.push_back(right);
-                auto join_conds = requires_on ? parse_opt_join_on_clause() : std::vector<std::unique_ptr<BinaryExpr>>();
+                std::unique_ptr<Expr> join_condition;
+                if (requires_on && match(TokenType::ON)) {
+                    join_condition = parse_boolean_expr();
+                }
+                auto join_conds = flatten_legacy_conditions(join_condition.get());
                 std::vector<std::unique_ptr<BinaryExpr>> join_tree_conds;
                 join_tree_conds.reserve(join_conds.size());
-                for (auto& cond : join_conds) {
+                for (const auto& cond : join_conds) {
                     if (!contains_subquery(cond.get())) {
                         from->conds.push_back(clone_binary_expr(*cond));
                     }
-                    join_tree_conds.push_back(std::move(cond));
+                    join_tree_conds.push_back(clone_binary_expr(*cond));
+                }
+                if (join_tree_conds.empty()) {
+                    if (dynamic_cast<BinaryExpr*>(join_condition.get()) != nullptr) {
+                        join_tree_conds.emplace_back(static_cast<BinaryExpr*>(join_condition.release()));
+                    }
                 }
                 from->jointree.push_back(std::make_unique<JoinExpr>(std::move(left), std::move(right),
-                                                                    std::move(join_tree_conds), join_type));
+                                                                    std::move(join_tree_conds), join_type,
+                                                                    std::move(join_condition)));
                 continue;
             }
         }
@@ -1297,18 +1300,6 @@ private:
             alias = parse_identifier();
         }
         return TableRef(std::move(table), std::move(alias));
-    }
-
-    std::vector<std::unique_ptr<BinaryExpr>> parse_opt_join_on_clause() {
-        if (!match(TokenType::ON)) {
-            return {};
-        }
-        std::vector<std::unique_ptr<BinaryExpr>> conds;
-        conds.push_back(parse_condition());
-        while (match(TokenType::AND)) {
-            conds.push_back(parse_condition());
-        }
-        return conds;
     }
 
     std::vector<std::unique_ptr<OrderByItem>> parse_opt_order_clause() {

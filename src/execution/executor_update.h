@@ -22,7 +22,8 @@ See the Mulan PSL v2 for more details. */
 /**
  * @brief 更新指定 RID 集合中满足条件的记录。
  *
- * 更新会重新读取可见版本并验证谓词，计算新记录后检查旧/新记录的 SSI 写冲突，
+ * 更新会重新读取可见版本并验证谓词，计算新记录后检查旧/新记录的
+ * SSI 写冲突，
  * 再同步维护 MVCC undo、WAL 和所有受影响的索引键。
  */
 class UpdateExecutor : public AbstractExecutor {
@@ -34,12 +35,14 @@ private:
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager* sm_manager_;
+    std::shared_ptr<QueryExpr> where_expr_;
     QueryExprEvaluator::SubqueryRunner subquery_runner_;
 
     /**
      * @brief 按索引列顺序从记录中拼接复合索引键。
      * @param index 索引元数据。
-     * @param rec_data 记录数据首地址。
+     * @param rec_data
+     * 记录数据首地址。
      * @return 固定长度的索引键字节数组。
      */
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
@@ -57,14 +60,18 @@ public:
      * @brief 创建更新执行器。
      * @param sm_manager 系统管理器。
      * @param tab_name 目标表名。
+     *
      * @param set_clauses SET 子句列表。
      * @param conds 更新前需要满足的条件。
-     * @param rids 待检查的记录 RID 列表。
+     * @param rids 待检查的记录 RID
+     * 列表。
      * @param context 当前执行上下文。
      * @param subquery_runner SET 表达式内部子查询执行回调。
+
      */
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
                    std::vector<Condition> conds, std::vector<Rid> rids, Context* context,
+                   std::shared_ptr<QueryExpr> where_expr = nullptr,
                    QueryExprEvaluator::SubqueryRunner subquery_runner = {}) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
@@ -74,15 +81,28 @@ public:
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        where_expr_ = std::move(where_expr);
         subquery_runner_ = std::move(subquery_runner);
+    }
+
+    bool matches(const RmRecord& rec) {
+        if (where_expr_ != nullptr) {
+            static const std::vector<bool> no_nulls;
+            QueryExprEvaluator evaluator(tab_.cols, no_nulls, &subquery_runner_);
+            return evaluator.matches(*where_expr_, rec);
+        }
+        return std::all_of(conds_.begin(), conds_.end(), [&](const Condition& cond) { return compare(cond, rec); });
     }
     /**
      * @brief 执行更新操作。
      * @return DML 不产生上层数据行，始终返回 nullptr。
-     * @throws TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
+     * @throws
+     * TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
      *
-     * 流程依次为：读取可见版本并过滤、加写锁及刷新 RC 版本、计算新记录、
+     * 流程依次为：读取可见版本并过滤、加写锁及刷新
+     * RC 版本、计算新记录、
      * 原子检查 SSI、预检查新索引键、记录 WAL/undo、替换索引并最终写回记录。
+
      */
     std::unique_ptr<RmRecord> Next() override {
         // 非自引用 SET 需要额外检查 RC 中语句读时间之后是否出现新提交版本。
@@ -96,14 +116,7 @@ public:
                 }
                 continue;
             }
-            bool match = true;
-            for (auto cond : conds_) // 判断是否匹配
-            {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            bool match = matches(*rec);
             if (match) {
                 // 第一阶段：获取写锁；READ COMMITTED 下刷新最新版本并重新验证条件。
                 if (context_ != nullptr && context_->txn_ != nullptr) {
@@ -119,14 +132,7 @@ public:
                             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                         rec = std::move(current_record->record);
-                        bool latest_match = true;
-                        for (const auto& cond : conds_) {
-                            if (!compare(cond, *rec)) {
-                                latest_match = false;
-                                break;
-                            }
-                        }
-                        if (!latest_match) {
+                        if (!matches(*rec)) {
                             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                         const TupleMeta& latest_meta = current_record->meta;
@@ -295,11 +301,15 @@ public:
     /**
      * @brief 按 SET 子句把旧记录更新为新记录。
      * @param rec 待原地修改的新记录缓冲区。
-     * @param old_rec 更新前的旧记录，用于自引用和表达式求值。
+     * @param
+     * old_rec 更新前的旧记录，用于自引用和表达式求值。
      * @throws RMDBError SET 表达式结果为 NULL 时抛出。
+     *
      * @throws IncompatibleTypeError 目标列与赋值类型不可转换时抛出。
      *
-     * SET 支持表达式赋值、列自引用赋值、数值自增/自减/乘除以及字面量赋值；
+     * SET
+     * 支持表达式赋值、列自引用赋值、数值自增/自减/乘除以及字面量赋值；
+     *
      * 所有分支都在写入前完成类型检查，字符串字段按目标列宽清零并截断复制。
      */
     void update_record(RmRecord* rec, const RmRecord& old_rec) {
@@ -319,14 +329,12 @@ public:
                 }
                 switch (col_meta.type) {
                 case TYPE_INT:
-                    *reinterpret_cast<int*>(data) = value.cell.type == TYPE_FLOAT
-                                                        ? static_cast<int>(value.cell.float_val)
-                                                        : value.cell.int_val;
+                    *reinterpret_cast<int*>(data) =
+                        value.cell.type == TYPE_FLOAT ? checked_int_cast(value.cell.float_val) : value.cell.int_val;
                     break;
                 case TYPE_FLOAT:
-                    *reinterpret_cast<double*>(data) = value.cell.type == TYPE_FLOAT
-                                                           ? value.cell.float_val
-                                                           : static_cast<double>(value.cell.int_val);
+                    *reinterpret_cast<double*>(data) =
+                        value.cell.type == TYPE_FLOAT ? value.cell.float_val : static_cast<double>(value.cell.int_val);
                     break;
                 case TYPE_STRING:
                 case TYPE_DATETIME:
@@ -343,7 +351,7 @@ public:
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {
                     if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
                         *reinterpret_cast<int*>(data) =
-                            static_cast<int>(*reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset));
+                            checked_int_cast(*reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset));
                     } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
                         *reinterpret_cast<double*>(data) =
                             static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
@@ -403,7 +411,7 @@ public:
 
                 switch (col_meta.type) {
                 case TYPE_INT:
-                    *reinterpret_cast<int*>(data) = static_cast<int>(result);
+                    *reinterpret_cast<int*>(data) = checked_int_cast(result);
                     break;
                 case TYPE_FLOAT:
                     *reinterpret_cast<double*>(data) = result;
@@ -415,6 +423,9 @@ public:
                 continue;
             }
             // 最后一条路径处理普通字面量赋值。
+            if (set_clause.rhs.is_null) {
+                throw RMDBError("UPDATE cannot store NULL values");
+            }
             if (can_cast(col_meta.type, set_clause.rhs.type) == false) {
                 throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(set_clause.rhs.type));
             }
@@ -423,7 +434,7 @@ public:
                 if (set_clause.rhs.type == TYPE_INT) {
                     *(int*)data = set_clause.rhs.int_val;
                 } else {
-                    *(int*)data = (int)set_clause.rhs.float_val;
+                    *(int*)data = checked_int_cast(set_clause.rhs.float_val);
                 }
                 break;
             }
@@ -449,6 +460,7 @@ public:
      * @brief 查找目标表列的元数据及偏移。
      * @param target 目标列。
      * @return 匹配的列元数据。
+     *
      * @throws ColumnNotFoundError 找不到目标列时抛出。
      */
     ColMeta get_col_offset(const TabCol& target) override {

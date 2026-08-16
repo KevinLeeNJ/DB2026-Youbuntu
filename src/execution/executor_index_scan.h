@@ -30,13 +30,16 @@ See the Mulan PSL v2 for more details. */
 /**
  * @brief 利用 B+ 树索引定位候选 RID，并输出满足 MVCC 与谓词条件的记录。
  *
+ *
  * 索引只负责缩小候选范围，真正返回记录前仍需经过 GetVisibleRecord() 和
- * fed_conds_ 的完整检查；在快照/Serializable 场景下还会补充历史索引候选。
+ * fed_conds_ 的完整检查；在快照/Serializable
+ * 场景下还会补充历史索引候选。
  */
 class IndexScanExecutor : public AbstractExecutor {
 protected:
     /**
      * @brief 将一组已经收集好的 RID 包装成 RecScan 接口。
+     *
      *
      * 用于合并当前索引候选与历史索引候选，保持上层匹配逻辑无需区分来源。
      */
@@ -44,7 +47,8 @@ protected:
     public:
         /**
          * @brief 创建从第一个 RID 开始的向量扫描器。
-         * @param rids 待扫描的 RID 列表，所有权移动到扫描器中。
+         * @param rids 待扫描的 RID
+         * 列表，所有权移动到扫描器中。
          */
         explicit RidVectorScan(std::vector<Rid> rids) : rids_(std::move(rids)) {}
 
@@ -58,6 +62,7 @@ protected:
         /**
          * @brief 判断向量扫描是否已经到达末尾。
          * @return 当前位置超出 RID 列表时返回 true。
+
          */
         bool is_end() const override {
             return position_ >= rids_.size();
@@ -65,7 +70,8 @@ protected:
 
         /**
          * @brief 返回当前向量扫描位置的 RID。
-         * @return 当前 RID；调用者需先确保 is_end() 为 false。
+         * @return 当前 RID；调用者需先确保 is_end() 为
+         * false。
          */
         Rid rid() const override {
             return rids_[position_];
@@ -98,10 +104,13 @@ protected:
 
     /**
      * @brief 在 Serializable 事务中登记索引扫描的谓词范围并检查 SSI 冲突。
-     * @throws TransactionAbortException 已存在危险读写依赖或不可见写入影响谓词时抛出。
+     * @throws
+     * TransactionAbortException 已存在危险读写依赖或不可见写入影响谓词时抛出。
+     *
      *
      * 该登记覆盖整个谓词范围，即使 B+ 树没有返回任何候选 RID，也不能省略，
      * 否则后续插入可能绕过幻读检测。
+
      */
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -121,8 +130,10 @@ protected:
 
     /**
      * @brief 登记当前事务对一个具体 RID 的读取并检查其不可见写入边。
-     * @param rid 已通过可见性和完整谓词检查的记录标识。
+     * @param rid
+     * 已通过可见性和完整谓词检查的记录标识。
      * @param force 是否忽略普通 SSI 读跟踪开关，供上层显式补登记。
+     *
      * @throws TransactionAbortException 形成 SSI 危险结构时抛出。
      */
     void record_tuple_read(const Rid& rid, bool force = false) {
@@ -164,7 +175,8 @@ protected:
     /**
      * @brief 将索引键的一列编码为该类型的最小值。
      * @param dest 目标复合键中该列的起始地址。
-     * @param col 列类型和长度元数据。
+     * @param
+     * col 列类型和长度元数据。
      */
     static void write_min(char* dest, const ColMeta& col) {
         switch (col.type) {
@@ -188,7 +200,8 @@ protected:
     /**
      * @brief 将索引键的一列编码为该类型的最大值。
      * @param dest 目标复合键中该列的起始地址。
-     * @param col 列类型和长度元数据。
+     * @param
+     * col 列类型和长度元数据。
      */
     static void write_max(char* dest, const ColMeta& col) {
         switch (col.type) {
@@ -212,14 +225,16 @@ protected:
     /**
      * @brief 将 SQL 常量转换为索引列使用的定长键片段。
      * @param value 条件中的右值常量。
-     * @param col 对应索引列的类型和长度。
+     * @param col
+     * 对应索引列的类型和长度。
      * @return 按列长度填充并完成数值提升/截断的键片段。
+
      */
     static std::vector<char> value_to_key_part(const Value& value, const ColMeta& col) {
         std::vector<char> data(col.len, 0);
         switch (col.type) {
         case TYPE_INT: {
-            int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
+            int converted = value.type == TYPE_FLOAT ? checked_int_cast(value.float_val) : value.int_val;
             memcpy(data.data(), &converted, col.len);
             break;
         }
@@ -240,8 +255,10 @@ protected:
      * @brief 使用索引比较规则比较两个单列键片段。
      * @param lhs 左键片段。
      * @param rhs 右键片段。
-     * @param col 决定比较类型和长度的列元数据。
-     * @return 三路比较结果，负数/0/正数分别表示 lhs 更小/相等/更大。
+
+     * * @param col 决定比较类型和长度的列元数据。
+     * @return 三路比较结果，负数/0/正数分别表示 lhs
+     * 更小/相等/更大。
      */
     static int compare_key_part(const std::vector<char>& lhs, const std::vector<char>& rhs, const ColMeta& col) {
         return ix_compare(lhs.data(), rhs.data(), col.type, col.len);
@@ -250,9 +267,11 @@ protected:
     /**
      * @brief 从当前生效条件中提取可用于索引边界的列约束。
      * @return 按索引列名组织的等值/上下界约束。
-     *
+
+     * *
      * 这里只提取“本表索引列与常量”的可交换比较；不能直接形成连续索引区间
-     * 的条件仍保留在 fed_conds_ 中，稍后由 advance_to_match() 做精确过滤。
+     * 的条件仍保留在 fed_conds_
+     * 中，稍后由 advance_to_match() 做精确过滤。
      */
     std::map<std::string, ColumnConstraint> build_constraints() const {
         std::map<std::string, ColMeta> col_meta;
@@ -301,6 +320,9 @@ protected:
             case OP_LIKE:
             case OP_IN:
             case OP_BETWEEN:
+            case OP_IS_NULL:
+            case OP_IS_NOT_NULL:
+            case OP_EXISTS:
                 break;
             }
         }
@@ -309,10 +331,13 @@ protected:
 
     /**
      * @brief 判断当前事务是否需要把历史索引键对应的 RID 加入候选集合。
-     * @return 在需要旧快照的隔离级别且系统存在历史索引键时返回 true。
+     * @return
+     * 在需要旧快照的隔离级别且系统存在历史索引键时返回 true。
      *
-     * 当前 B+ 树可能已经删除或替换了旧索引键；历史候选只负责补齐可能漏掉的
-     * RID，最终仍由 MVCC 可见性和完整谓词检查决定是否返回。
+     * 当前 B+
+     * 树可能已经删除或替换了旧索引键；历史候选只负责补齐可能漏掉的
+     * RID，最终仍由 MVCC
+     * 可见性和完整谓词检查决定是否返回。
      */
     bool needs_historical_index_candidates() const {
         if (context_ == nullptr || context_->txn_ == nullptr) {
@@ -333,12 +358,16 @@ protected:
 public:
     /**
      * @brief 创建一个针对指定索引的扫描执行器。
-     * @param sm_manager 系统管理器，用于访问表、索引和缓冲池。
+     * @param sm_manager
+     * 系统管理器，用于访问表、索引和缓冲池。
      * @param tab_name 要扫描的表名。
-     * @param conds 初始扫描条件；构造时会将可交换的跨表条件规范化到本表左侧。
-     * @param index_col_names 参与索引扫描的列名顺序。
+     * @param conds
+     * 初始扫描条件；构造时会将可交换的跨表条件规范化到本表左侧。
+     * @param index_col_names
+     * 参与索引扫描的列名顺序。
      * @param context 当前执行上下文，可携带事务和 SSI 状态。
-     * @throws ColumnNotFoundError 索引列或表列不存在时可能抛出。
+     * @throws
+     * ColumnNotFoundError 索引列或表列不存在时可能抛出。
      */
     IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
                       std::vector<std::string> index_col_names, Context* context) {
@@ -371,10 +400,13 @@ public:
     /**
      * @brief 初始化索引扫描并定位到第一条可见且满足条件的记录。
      *
-     * 流程依次完成 SSI 谓词登记、历史候选判断、索引共享锁获取、复合键上下界
-     * 构造、当前/历史 RID 扫描器创建，最后由 advance_to_match() 预取第一条结果。
+     * 流程依次完成 SSI
+     * 谓词登记、历史候选判断、索引共享锁获取、复合键上下界
+     * 构造、当前/历史 RID 扫描器创建，最后由
+     * advance_to_match() 预取第一条结果。
      * 索引边界只用于缩小候选范围，所有 fed_conds_ 仍会在记录上再次验证。
-     * @throws TransactionAbortException SSI 检测发现危险结构时抛出。
+
+     * * @throws TransactionAbortException SSI 检测发现危险结构时抛出。
      */
     void beginTuple() override {
         // 谓词登记必须先于索引扫描，即使范围为空也要让 SSI 看到本次范围读取。
@@ -504,8 +536,10 @@ public:
     /**
      * @brief 从当前索引候选位置跳过不可见或不匹配记录，缓存下一条有效记录。
      *
+     *
      * 函数先读取当前事务可见版本，再对 fed_conds_ 做完整谓词判断；只有两者都
-     * 成功时才登记记录级 SSI 读取并填充 buffered_record_。
+     * 成功时才登记记录级 SSI 读取并填充
+     * buffered_record_。
      */
     void advance_to_match() {
         buffered_record_.reset();
@@ -536,7 +570,8 @@ public:
 
     /**
      * @brief 返回 advance_to_match() 已缓存的当前索引扫描结果。
-     * @return 当前记录副本；扫描结束或没有缓存记录时返回 nullptr。
+     * @return
+     * 当前记录副本；扫描结束或没有缓存记录时返回 nullptr。
      */
     std::unique_ptr<RmRecord> Next() override {
         if (is_end() || buffered_record_ == nullptr) {
@@ -556,6 +591,7 @@ public:
     /**
      * @brief 判断底层索引或历史 RID 扫描器是否结束。
      * @return 扫描器为空或已耗尽时返回 true。
+
      */
     bool is_end() const override {
         return scan_ == nullptr || scan_->is_end();
@@ -564,7 +600,7 @@ public:
     /**
      * @brief 返回索引扫描输出的完整表列元数据。
      * @return 表列元数据引用。
-     */
+ */
     const std::vector<ColMeta>& cols() const override {
         return cols_;
     }
@@ -581,7 +617,8 @@ public:
      * @brief 查找索引扫描输出中的目标列。
      * @param target 目标表列。
      * @return 目标列元数据副本。
-     * @throws ColumnNotFoundError 找不到目标列时抛出。
+
+     * * @throws ColumnNotFoundError 找不到目标列时抛出。
      */
     ColMeta get_col_offset(const TabCol& target) override {
         return *get_col(cols_, target);
@@ -597,10 +634,13 @@ public:
 
     /**
      * @brief 用新的运行时连接键条件重建当前扫描条件集合。
-     * @param key_conds 上层 Nested Loop Join 注入的键条件，所有权移动到内部条件列表。
+     * @param key_conds 上层 Nested Loop Join
+     * 注入的键条件，所有权移动到内部条件列表。
      *
-     * 每次调用都会从 base_conds_ 恢复原始谓词，避免多次绑定同一内层扫描时
+     * 每次调用都会从 base_conds_
+     * 恢复原始谓词，避免多次绑定同一内层扫描时
      * 累积过期连接键；跨表条件会先规范化为本表列在左侧。
+
      */
     void set_key_conditions(std::vector<Condition> key_conds) override {
         conds_ = base_conds_;
@@ -629,7 +669,7 @@ public:
     /**
      * @brief 返回当前包含运行时键条件的有效扫描条件。
      * @return 条件副本。
-     */
+ */
     std::vector<Condition> scan_conditions() const override {
         return fed_conds_;
     }
@@ -645,7 +685,9 @@ public:
     /**
      * @brief 判断当前索引扫描是否能为指定列提供递增顺序。
      * @param col 要判断的聚合列。
-     * @return 当列属于索引且其前置索引列都被等值条件固定时返回 true。
+     * @return
+     * 当列属于索引且其前置索引列都被等值条件固定时返回 true。
+     *
      *
      * 历史候选会破坏当前索引的严格顺序，因此启用历史候选时主动返回 false。
      */

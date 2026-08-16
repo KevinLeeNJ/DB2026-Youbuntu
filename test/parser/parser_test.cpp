@@ -320,9 +320,8 @@ TEST(ParserTest, ParsesSelectFeaturesUsedByCompetition) {
 
 TEST(ParserTest, ParsesExistsJoinCondition) {
     try {
-        auto parsed = ast::parse_sql(
-            "select l.id, r.id from review_left as l join review_right as r "
-            "on exists (select 1 from review_ids where review_ids.id = l.id) order by l.id;");
+        auto parsed = ast::parse_sql("select l.id, r.id from review_left as l join review_right as r "
+                                     "on exists (select 1 from review_ids where review_ids.id = l.id) order by l.id;");
         ASSERT_NE(parsed, nullptr);
         auto select = as_node<ast::SelectStmt>(parsed);
         ASSERT_NE(select, nullptr);
@@ -513,14 +512,13 @@ TEST(ParserTest, ParsesAdvancedSqlForms) {
 }
 
 TEST(ParserTest, ParsesWindowFunctionExpressions) {
-    auto parsed = parse_ok(
-        "select row_number() over (partition by dept order by score desc), "
-        "rank() over (order by score desc), "
-        "dense_rank() over (order by score desc), "
-        "lag(score, 2, 0) over (order by id), "
-        "lead(score) over (order by id), "
-        "sum(score) over (partition by dept order by id), "
-        "avg(score) over (partition by dept) from grades;");
+    auto parsed = parse_ok("select row_number() over (partition by dept order by score desc), "
+                           "rank() over (order by score desc), "
+                           "dense_rank() over (order by score desc), "
+                           "lag(score, 2, 0) over (order by id), "
+                           "lead(score) over (order by id), "
+                           "sum(score) over (partition by dept order by id), "
+                           "avg(score) over (partition by dept) from grades;");
     auto select = as_node<ast::SelectStmt>(parsed);
     ASSERT_NE(select, nullptr);
     ASSERT_EQ(select->select_items.size(), 7);

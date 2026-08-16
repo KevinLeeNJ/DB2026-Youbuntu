@@ -95,7 +95,6 @@ private:
         ExecutorQueryExpr lhs;
         CompOp op = OP_EQ;
         bool is_rhs_val = false;
-        bool is_rhs_value = false;
         ExecutorQueryExpr rhs_expr;
         Value rhs_val;
         Value rhs_upper;
@@ -219,7 +218,6 @@ private:
             executor_cond.lhs = to_executor_query_expr(cond.lhs);
             executor_cond.op = cond.op;
             executor_cond.is_rhs_val = cond.is_rhs_val;
-            executor_cond.is_rhs_value = cond.is_rhs_val;
             executor_cond.rhs_expr = to_executor_query_expr(cond.rhs_expr);
             executor_cond.rhs_val = cond.rhs_val;
             executor_cond.rhs_upper = cond.rhs_upper;
@@ -247,6 +245,13 @@ private:
         case QueryExprType::AGGREGATE:
             return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                    (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+        case QueryExprType::ARITHMETIC:
+        case QueryExprType::LOGICAL:
+        case QueryExprType::CASE_EXPR:
+        case QueryExprType::PREDICATE:
+        case QueryExprType::SUBQUERY:
+        case QueryExprType::WINDOW:
+            return false;
         }
         return false;
     }
@@ -405,11 +410,20 @@ private:
             return " IN ";
         case OP_BETWEEN:
             return " BETWEEN ";
+        case OP_IS_NULL:
+            return " IS NULL";
+        case OP_IS_NOT_NULL:
+            return " IS NOT NULL";
+        case OP_EXISTS:
+            return " EXISTS ";
         }
         throw InternalError("Unexpected comparison operator");
     }
 
     static std::string value_to_string(const Value& val) {
+        if (val.is_null) {
+            return "NULL";
+        }
         switch (val.type) {
         case TYPE_INT:
             return std::to_string(val.int_val);
@@ -429,12 +443,85 @@ private:
         throw InternalError("Unexpected value type");
     }
 
+    static std::string query_expr_to_string(const Plan& plan, const QueryExpr& expr) {
+        switch (expr.type) {
+        case QueryExprType::COLUMN:
+            return display_col(plan, expr.col);
+        case QueryExprType::VALUE:
+            return value_to_string(expr.value);
+        case QueryExprType::AGGREGATE:
+            return expr.agg.display_name;
+        case QueryExprType::WINDOW:
+            return expr.display_name;
+        case QueryExprType::ARITHMETIC: {
+            static constexpr const char* operators[] = {"+", "-", "*", "/"};
+            return "(" + query_expr_to_string(plan, *expr.lhs) + operators[static_cast<int>(expr.arithmetic_op)] +
+                   query_expr_to_string(plan, *expr.rhs) + ")";
+        }
+        case QueryExprType::LOGICAL: {
+            if (expr.logical_op == QueryLogicalOp::NOT) {
+                return "NOT (" + query_expr_to_string(plan, *expr.operands.front()) + ")";
+            }
+            const char* separator = expr.logical_op == QueryLogicalOp::AND ? " AND " : " OR ";
+            std::string result = "(";
+            for (size_t i = 0; i < expr.operands.size(); ++i) {
+                if (i != 0) {
+                    result += separator;
+                }
+                result += query_expr_to_string(plan, *expr.operands[i]);
+            }
+            return result + ")";
+        }
+        case QueryExprType::CASE_EXPR:
+            return "CASE";
+        case QueryExprType::PREDICATE: {
+            if (expr.predicate_op == OP_EXISTS) {
+                return "EXISTS(SUBQUERY)";
+            }
+            std::string result = query_expr_to_string(plan, *expr.lhs);
+            std::string op = comp_op_to_string(expr.predicate_op);
+            if (expr.negated &&
+                (expr.predicate_op == OP_LIKE || expr.predicate_op == OP_IN || expr.predicate_op == OP_BETWEEN)) {
+                op.insert(0, " NOT");
+            }
+            result += op;
+            if (expr.predicate_op == OP_IS_NULL || expr.predicate_op == OP_IS_NOT_NULL) {
+                return result;
+            }
+            if (expr.quantifier != QueryQuantifier::NONE) {
+                return result + (expr.quantifier == QueryQuantifier::ANY ? " ANY (SUBQUERY)" : " ALL (SUBQUERY)");
+            }
+            if (expr.predicate_op == OP_IN) {
+                result += "(";
+                for (size_t i = 0; i < expr.rhs_values.size(); ++i) {
+                    if (i != 0) {
+                        result += ", ";
+                    }
+                    result += query_expr_to_string(plan, *expr.rhs_values[i]);
+                }
+                return result + ")";
+            }
+            result += query_expr_to_string(plan, *expr.rhs);
+            if (expr.predicate_op == OP_BETWEEN) {
+                result += " AND " + query_expr_to_string(plan, *expr.rhs_upper);
+            }
+            return result;
+        }
+        case QueryExprType::SUBQUERY:
+            return "SUBQUERY";
+        }
+        throw InternalError("Unexpected query expression type");
+    }
+
     static std::string condition_to_string(const Plan& plan, const Condition& cond) {
         std::string op = comp_op_to_string(cond.op);
         if (cond.negated && (cond.op == OP_LIKE || cond.op == OP_IN || cond.op == OP_BETWEEN)) {
             op.insert(0, " NOT");
         }
         std::string result = display_col(plan, cond.lhs_col) + op;
+        if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL) {
+            return result;
+        }
         if (cond.is_rhs_val) {
             if (cond.op == OP_IN) {
                 result += "(";
@@ -579,8 +666,10 @@ private:
         }
         case T_Filter: {
             auto filter = static_cast<FilterPlan*>(plan);
-            out << "Filter(condition=[" << join_strings(condition_strings(*plan, filter->conds_))
-                << "], rows=" << plan->runtime_rows_ << ")\n";
+            const std::string conditions = filter->expr_ == nullptr
+                                               ? join_strings(condition_strings(*plan, filter->conds_))
+                                               : query_expr_to_string(*plan, *filter->expr_);
+            out << "Filter(condition=[" << conditions << "], rows=" << plan->runtime_rows_ << ")\n";
             render_explain_plan(filter->subplan_.get(), depth + 1, out);
             break;
         }
@@ -609,8 +698,14 @@ private:
             std::set<std::string> table_set;
             collect_tables(plan, table_set);
             std::vector<std::string> tables(table_set.begin(), table_set.end());
+            auto conditions = condition_strings(*plan, join->conds_);
+            for (const auto& expr : join->exprs_) {
+                if (expr != nullptr) {
+                    conditions.push_back(query_expr_to_string(*plan, *expr));
+                }
+            }
             out << "Join(tables=[" << join_strings(std::move(tables)) << "], condition=["
-                << join_strings(condition_strings(*plan, join->conds_)) << "], rows=" << plan->runtime_rows_ << ")\n";
+                << join_strings(std::move(conditions)) << "], rows=" << plan->runtime_rows_ << ")\n";
             render_explain_plan(join->left_.get(), depth + 1, out);
             render_explain_plan(join->right_.get(), depth + 1, out);
             break;
@@ -703,9 +798,9 @@ public:
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
-                std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
-                    sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context,
-                    make_subquery_runner(context));
+                std::unique_ptr<AbstractExecutor> root =
+                    std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids,
+                                                     context, x->where_expr_, make_subquery_runner(context));
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
@@ -716,8 +811,8 @@ public:
                     rids.push_back(scan->rid());
                 }
 
-                std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
+                std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
+                    sm_manager_, x->tab_name_, x->conds_, rids, context, x->where_expr_, make_subquery_runner(context));
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
@@ -728,7 +823,7 @@ public:
                 if (x->subplan_ != nullptr) {
                     auto source = convert_plan_executor(x->subplan_.get(), context);
                     root = std::make_unique<InsertSelectExecutor>(sm_manager_, x->tab_name_, x->insert_col_names_,
-                                                                   std::move(source), context);
+                                                                  std::move(source), context);
                 } else {
                     root = std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
                 }
@@ -789,8 +884,7 @@ public:
     void drop() {}
 
     QueryExprEvaluator::SubqueryRunner make_subquery_runner(Context* context) {
-        return [this, context](const Plan& plan, const RmRecord& outer_record,
-                               const std::vector<ColMeta>& outer_cols,
+        return [this, context](const Plan& plan, const RmRecord& outer_record, const std::vector<ColMeta>& outer_cols,
                                const std::vector<bool>& outer_nulls) {
             QueryExprOuterContext outer_context{&outer_record, &outer_cols, &outer_nulls};
             auto executor = convert_plan_executor(const_cast<Plan*>(&plan), context, false, &outer_context);
@@ -819,7 +913,7 @@ public:
     }
 
     std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false,
-                                                             const QueryExprOuterContext* outer_context = nullptr) {
+                                                            const QueryExprOuterContext* outer_context = nullptr) {
         switch (plan->tag) {
         case T_Projection: {
             auto x = static_cast<ProjectionPlan*>(plan);
@@ -835,15 +929,14 @@ public:
                 executor = std::make_unique<ProjectionExecutor>(std::move(subplan), cols);
             } else {
                 executor = std::make_unique<ProjectionExecutor>(std::move(subplan), x->select_items_,
-                                                                 make_subquery_runner(context), outer_context);
+                                                                make_subquery_runner(context), outer_context);
             }
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Distinct: {
             auto x = static_cast<DistinctPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> executor =
-                std::make_unique<DistinctExecutor>(
-                    convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context));
+            std::unique_ptr<AbstractExecutor> executor = std::make_unique<DistinctExecutor>(
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Filter: {
@@ -852,7 +945,7 @@ public:
             auto subplan = convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context);
             if (x->expr_ != nullptr) {
                 executor = std::make_unique<FilterExecutor>(std::move(subplan), x->expr_, make_subquery_runner(context),
-                                                             outer_context);
+                                                            outer_context);
             } else {
                 executor = std::make_unique<FilterExecutor>(std::move(subplan), x->conds_);
             }
@@ -861,11 +954,9 @@ public:
         case T_Aggregate: {
             auto x = static_cast<AggregatePlan*>(plan);
             auto having_conds = to_executor_having_conds(x->having_conds_);
-            std::unique_ptr<AbstractExecutor> executor =
-                std::make_unique<AggregateExecutor>(
-                                                    convert_plan_executor(x->subplan_.get(), context, count_rows,
-                                                                          outer_context),
-                                                    x->group_by_cols_, x->agg_exprs_, having_conds, context);
+            std::unique_ptr<AbstractExecutor> executor = std::make_unique<AggregateExecutor>(
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context), x->group_by_cols_,
+                x->agg_exprs_, having_conds, context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Window: {
@@ -906,8 +997,8 @@ public:
         case T_Sort: {
             auto x = static_cast<SortPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<SortExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context), bind_sort_output_names(*x),
-                x->limit_);
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context),
+                bind_sort_output_names(*x), x->limit_);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Limit: {
@@ -923,9 +1014,9 @@ public:
             for (const auto& branch_plan : x->branches_) {
                 branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows, outer_context));
             }
-            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_, x->union_all_,
-                                                               x->operators_),
-                               plan, count_rows);
+            return maybe_count(
+                std::make_unique<UnionExecutor>(std::move(branches), x->cols_, x->union_all_, x->operators_), plan,
+                count_rows);
         }
         default:
             break;

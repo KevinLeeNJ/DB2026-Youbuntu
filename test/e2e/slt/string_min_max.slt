@@ -45,7 +45,7 @@ SELECT MIN(name) AS mn FROM t_str WHERE grp = 99;
 +------------------+
 |               mn |
 +------------------+
-|                  |
+|             NULL |
 +------------------+
 Total record(s): 1
 

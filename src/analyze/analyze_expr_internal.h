@@ -44,7 +44,9 @@ QueryExpr make_column_expr(TabCol col, std::string display_name = "");
 
 // --- QueryExpr operations ---
 void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols);
+bool is_null_query_expr(const QueryExpr& expr);
 ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_cols);
+bool is_boolean_query_expr(const QueryExpr& expr);
 bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs);
 bool contains_window_expr(const QueryExpr& expr);
 

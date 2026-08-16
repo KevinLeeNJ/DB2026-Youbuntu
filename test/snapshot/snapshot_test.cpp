@@ -563,6 +563,85 @@ TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
     EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
 }
 
+TEST_F(SnapshotTest, RC_ComplexDmlRechecksFullPredicateAfterWaitingForLock) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table rc_complex_recheck (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into rc_complex_recheck values (1, 100);"));
+
+    auto owner = create_session(IsolationLevel::READ_COMMITTED);
+    auto updater = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(owner->exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner->exec_sql_ok("update rc_complex_recheck set val = 200 where id = 1;"));
+
+    ASSERT_TRUE(updater->exec_sql_ok("begin;"));
+    std::atomic<bool> started{false};
+    std::atomic<bool> aborted{false};
+    std::thread waiting_update([&]() {
+        started = true;
+        aborted =
+            updater->exec_sql_expect_abort(
+                "update rc_complex_recheck set val = val + 1 where id = 1 and (val = 100 or id = 99);") == "abort\n";
+    });
+
+    while (!started) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(owner->exec_sql_ok("commit;"));
+    waiting_update.join();
+    EXPECT_TRUE(aborted);
+
+    std::string final_state = verifier->exec_sql("select val from rc_complex_recheck where id = 1;");
+    std::string expected_final = "+------------------+\n"
+                                 "|              val |\n"
+                                 "+------------------+\n"
+                                 "|              200 |\n"
+                                 "+------------------+\n"
+                                 "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
+TEST_F(SnapshotTest, RC_ComplexDeleteRechecksFullPredicateAfterWaitingForLock) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table rc_complex_delete (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into rc_complex_delete values (1, 100);"));
+
+    auto owner = create_session(IsolationLevel::READ_COMMITTED);
+    auto deleter = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(owner->exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner->exec_sql_ok("update rc_complex_delete set val = 200 where id = 1;"));
+
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+    std::atomic<bool> started{false};
+    std::atomic<bool> delete_ok{false};
+    std::thread waiting_delete([&]() {
+        started = true;
+        delete_ok = deleter->exec_sql_ok("delete from rc_complex_delete where id = 1 and (val = 100 or id = 99);");
+    });
+
+    while (!started) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(owner->exec_sql_ok("commit;"));
+    waiting_delete.join();
+    ASSERT_TRUE(delete_ok);
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select val from rc_complex_delete where id = 1;");
+    std::string expected_final = "+------------------+\n"
+                                 "|              val |\n"
+                                 "+------------------+\n"
+                                 "|              200 |\n"
+                                 "+------------------+\n"
+                                 "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
 TEST_F(SnapshotTest, SER_PureAutoCommitInsertsDoNotRetainSsiHistory) {
     auto s = create_session();
     ASSERT_TRUE(s->exec_sql_ok("create table lifecycle_insert (id int, val int);"));

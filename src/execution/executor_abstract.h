@@ -132,8 +132,7 @@ public:
      *
      * 默认实现为空操作；索引扫描器会将这些条件与原始扫描条件合并。
      */
-    virtual void set_key_conditions(std::vector<Condition> /*key_conds*/) {
-    }
+    virtual void set_key_conditions(std::vector<Condition> /*key_conds*/) {}
 
     /**
      * @brief 返回底层扫描所对应的表名。

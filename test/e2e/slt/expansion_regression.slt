@@ -1,0 +1,678 @@
+# Regression coverage for SQL expansion correctness bugs.
+
+statement ok
+CREATE TABLE ex_target (id INT, score INT, label CHAR(10));
+
+statement ok
+INSERT INTO ex_target (label, id, score) VALUES ('first', 1, 10);
+
+query
+SELECT id, score, label FROM ex_target;
+----
++------------------+------------------+------------------+
+|               id |            score |            label |
++------------------+------------------+------------------+
+|                1 |               10 |            first |
++------------------+------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE ex_checked_cast (value INT, amount FLOAT);
+
+statement ok
+INSERT INTO ex_checked_cast VALUES (1, 2147483648.0);
+
+statement error
+INSERT INTO ex_checked_cast VALUES (2147483648.0, 1.0);
+
+statement error
+UPDATE ex_checked_cast SET value = 2147483648.0 WHERE value = 1;
+
+statement error
+UPDATE ex_checked_cast SET value = amount + 0.0 WHERE value = 1;
+
+statement error
+SELECT value FROM ex_checked_cast WHERE value = 2147483648.0;
+
+statement error
+SELECT value FROM ex_checked_cast WHERE value IN (1, 2147483648.0);
+
+statement error
+SELECT value FROM ex_checked_cast WHERE value BETWEEN 0 AND 2147483648.0;
+
+query
+SELECT value, amount FROM ex_checked_cast;
+----
++------------------+------------------+
+|            value |           amount |
++------------------+------------------+
+|                1 | 2147483648.00... |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE ex_sum_overflow (value INT);
+
+statement ok
+INSERT INTO ex_sum_overflow VALUES (2147483647);
+
+statement ok
+INSERT INTO ex_sum_overflow VALUES (1);
+
+statement error
+SELECT SUM(value) FROM ex_sum_overflow;
+
+statement error
+SELECT SUM(value) OVER () FROM ex_sum_overflow;
+
+statement ok
+CREATE TABLE ex_null_type (id INT);
+
+statement ok
+INSERT INTO ex_null_type VALUES (1);
+
+statement ok
+INSERT INTO ex_null_type VALUES (2);
+
+query
+SELECT id, CASE WHEN id = 1 THEN NULL ELSE 'text' END AS value FROM ex_null_type ORDER BY id;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |             NULL |
+|                2 |             text |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, CASE WHEN id = 1 THEN 'text' ELSE NULL END AS value FROM ex_null_type ORDER BY id;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |             text |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, CASE WHEN id = 1 THEN NULL ELSE 2.5 END AS value FROM ex_null_type ORDER BY id;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |             NULL |
+|                2 |         2.500000 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT * FROM (
+    SELECT NULL AS value FROM ex_null_type
+    UNION
+    SELECT 'text' AS value FROM ex_null_type
+) AS typed_union
+ORDER BY value;
+----
++------------------+
+|            value |
++------------------+
+|             NULL |
+|             text |
++------------------+
+Total record(s): 2
+
+query
+SELECT * FROM (
+    SELECT 'text' AS value FROM ex_null_type
+    UNION
+    SELECT NULL AS value FROM ex_null_type
+) AS typed_union
+ORDER BY value;
+----
++------------------+
+|            value |
++------------------+
+|             NULL |
+|             text |
++------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_compound_overflow (value INT);
+
+statement ok
+INSERT INTO ex_compound_overflow VALUES (2147483647);
+
+statement error
+UPDATE ex_compound_overflow SET value += 1;
+
+statement error
+UPDATE ex_compound_overflow SET value = value * 2;
+
+query
+SELECT value FROM ex_compound_overflow;
+----
++------------------+
+|            value |
++------------------+
+|       2147483647 |
++------------------+
+Total record(s): 1
+
+statement ok
+INSERT INTO ex_compound_overflow VALUES (-2147483647);
+
+statement ok
+UPDATE ex_compound_overflow SET value -= 1 WHERE value < 0;
+
+statement error
+UPDATE ex_compound_overflow SET value = value / -1 WHERE value < 0;
+
+query
+SELECT value FROM ex_compound_overflow ORDER BY value;
+----
++------------------+
+|            value |
++------------------+
+|      -2147483648 |
+|       2147483647 |
++------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_index_min (value INT);
+
+statement ok
+CREATE INDEX ex_index_min(value);
+
+query
+SELECT MIN(value) AS minimum FROM ex_index_min WHERE value >= -2147483648;
+----
++------------------+
+|          minimum |
++------------------+
+|             NULL |
++------------------+
+Total record(s): 1
+
+statement ok
+INSERT INTO ex_index_min VALUES (4);
+
+statement ok
+INSERT INTO ex_index_min VALUES (2);
+
+query
+SELECT MIN(value) AS minimum FROM ex_index_min WHERE value >= -2147483648;
+----
++------------------+
+|          minimum |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+statement error
+INSERT INTO ex_target (id, label) VALUES (2, 'missing');
+
+statement error
+INSERT INTO ex_target (id, id, label) VALUES (2, 20, 'duplicate');
+
+statement error
+INSERT INTO ex_target (id, score, missing) VALUES (2, 20, 'unknown');
+
+statement error
+INSERT INTO ex_target VALUES (2, NULL, 'null');
+
+query
+SELECT COUNT(*) AS unchanged FROM ex_target;
+----
++------------------+
+|        unchanged |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE ex_source (id INT, score INT, label CHAR(10));
+
+statement ok
+INSERT INTO ex_source VALUES (2, 20, 'second');
+
+statement ok
+INSERT INTO ex_target (label, score, id) SELECT label, score, id FROM ex_source;
+
+statement error
+INSERT INTO ex_target (id, label) SELECT id, label FROM ex_source;
+
+statement error
+INSERT INTO ex_target (id, id, label) SELECT id, score, label FROM ex_source;
+
+statement error
+INSERT INTO ex_target (id, score, label) SELECT id, NULL, label FROM ex_source;
+
+query
+SELECT id, score, label FROM ex_target ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |            score |            label |
++------------------+------------------+------------------+
+|                1 |               10 |            first |
+|                2 |               20 |           second |
++------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT COUNT(*) AS null_eq FROM ex_target WHERE id = NULL;
+----
++------------------+
+|          null_eq |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS null_not_in FROM ex_target WHERE id NOT IN (1, NULL);
+----
++------------------+
+|      null_not_in |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id, id + score * 2 AS total FROM ex_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            total |
++------------------+------------------+
+|                1 |               21 |
+|                2 |               42 |
++------------------+------------------+
+Total record(s): 2
+
+statement error
+SELECT label - 1 FROM ex_target;
+
+query
+SELECT id + score AS total FROM ex_target ORDER BY id + score DESC;
+----
++------------------+
+|            total |
++------------------+
+|               22 |
+|               11 |
++------------------+
+Total record(s): 2
+
+statement ok
+UPDATE ex_target SET score = CASE WHEN id = 1 THEN score + 5 ELSE score END WHERE id <= 2;
+
+query
+SELECT id, score FROM ex_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               15 |
+|                2 |               20 |
++------------------+------------------+
+Total record(s): 2
+
+statement error
+UPDATE ex_target SET score = NULL WHERE id = 1;
+
+statement error
+UPDATE ex_target SET score = CASE WHEN id = 1 THEN NULL ELSE score END WHERE id = 1;
+
+statement ok
+CREATE TABLE ex_scalar (id INT, amount FLOAT, label CHAR(10));
+
+statement ok
+INSERT INTO ex_scalar VALUES (1, 1.5, 'scalar');
+
+statement ok
+UPDATE ex_target SET score = (SELECT id FROM ex_scalar) WHERE id = 2;
+
+query
+SELECT id, score FROM ex_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               15 |
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT (SELECT label FROM ex_scalar) AS scalar_label, (SELECT amount FROM ex_scalar) AS scalar_amount FROM ex_source;
+----
++------------------+------------------+
+|     scalar_label |    scalar_amount |
++------------------+------------------+
+|           scalar |         1.500000 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT (SELECT label FROM ex_scalar WHERE id = 99) AS empty_scalar FROM ex_source;
+----
++------------------+
+|     empty_scalar |
++------------------+
+|             NULL |
++------------------+
+Total record(s): 1
+
+statement ok
+INSERT INTO ex_scalar VALUES (2, 2.5, 'second');
+
+statement error
+SELECT (SELECT id FROM ex_scalar) AS too_many FROM ex_source;
+
+statement ok
+CREATE TABLE ex_join_left (id INT, kind INT);
+
+statement ok
+INSERT INTO ex_join_left VALUES (1, 10);
+
+statement ok
+INSERT INTO ex_join_left VALUES (2, 20);
+
+statement ok
+CREATE TABLE ex_join_right (id INT, kind INT);
+
+statement ok
+INSERT INTO ex_join_right VALUES (1, 99);
+
+statement ok
+INSERT INTO ex_join_right VALUES (3, 20);
+
+query
+SELECT l.id AS left_id, r.id AS right_id FROM ex_join_left l JOIN ex_join_right r ON l.id = r.id OR l.kind = r.kind ORDER BY left_id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                1 |
+|                2 |                3 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT l.id AS left_id, r.id AS right_id FROM ex_join_left l JOIN ex_join_right r ON NOT (l.id <> r.id AND l.kind <> r.kind) ORDER BY left_id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                1 |
+|                2 |                3 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_having (grp INT, val INT);
+
+statement ok
+INSERT INTO ex_having VALUES (1, 5);
+
+statement ok
+INSERT INTO ex_having VALUES (1, 6);
+
+statement ok
+INSERT INTO ex_having VALUES (2, 30);
+
+statement ok
+INSERT INTO ex_having VALUES (3, 1);
+
+statement ok
+INSERT INTO ex_having VALUES (3, 2);
+
+query
+SELECT COUNT(*) AS n FROM ex_having HAVING COUNT(*) IS NOT NULL;
+----
++------------------+
+|                n |
++------------------+
+|                5 |
++------------------+
+Total record(s): 1
+
+query
+SELECT grp, COUNT(*) AS n FROM ex_having GROUP BY grp HAVING COUNT(*) = 1 OR SUM(val) > 10 ORDER BY grp;
+----
++------------------+------------------+
+|              grp |                n |
++------------------+------------------+
+|                1 |                2 |
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT grp, COUNT(*) AS n FROM ex_having GROUP BY grp HAVING NOT (COUNT(*) <> 1 AND SUM(val) <= 10) ORDER BY grp;
+----
++------------------+------------------+
+|              grp |                n |
++------------------+------------------+
+|                1 |                2 |
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_update_expr (a INT, b INT, c INT);
+
+statement ok
+INSERT INTO ex_update_expr VALUES (0, 2, 3);
+
+statement ok
+UPDATE ex_update_expr SET a = b + c * 2;
+
+query
+SELECT a FROM ex_update_expr;
+----
++------------------+
+|                a |
++------------------+
+|                8 |
++------------------+
+Total record(s): 1
+
+query
+SELECT l.id AS left_id, r.id AS right_id FROM ex_join_left l JOIN ex_join_right r ON l.id = 1 AND (l.id = r.id OR l.kind = r.kind) ORDER BY right_id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                1 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT l.id AS left_id, r.id AS right_id FROM ex_join_left l LEFT JOIN ex_join_right r ON l.id = 1 AND (l.id = r.id OR l.kind = r.kind) ORDER BY left_id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                1 |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT CASE WHEN id = 1 THEN (SELECT id FROM ex_scalar) ELSE 0 END AS lazy_case FROM ex_source;
+----
++------------------+
+|        lazy_case |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT SUM(r.kind) AS total, AVG(r.kind) AS average, MIN(r.kind) AS minimum, MAX(r.kind) AS maximum FROM ex_join_left l LEFT JOIN ex_join_right r ON l.id = r.id WHERE l.id = 2;
+----
++------------------+------------------+------------------+------------------+
+|            total |          average |          minimum |          maximum |
++------------------+------------------+------------------+------------------+
+|             NULL |             NULL |             NULL |             NULL |
++------------------+------------------+------------------+------------------+
+Total record(s): 1
+
+query
+SELECT l.id AS left_id FROM ex_join_left l LEFT JOIN ex_join_right r ON l.id = r.id GROUP BY l.id HAVING SUM(r.kind) IS NULL;
+----
++------------------+
+|          left_id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE ex_overflow (value INT);
+
+statement ok
+INSERT INTO ex_overflow VALUES (2147483647);
+
+statement error
+SELECT value + 1 FROM ex_overflow;
+
+query
+SELECT id FROM ex_join_left WHERE id = 1 UNION SELECT id FROM ex_join_left WHERE id = 2 INTERSECT SELECT id FROM ex_join_left WHERE id = 2;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+query
+SELECT l.id AS left_id, (SELECT r.kind FROM ex_join_right r WHERE r.id = l.id) AS matched_kind FROM ex_join_left l ORDER BY left_id;
+----
++------------------+------------------+
+|          left_id |     matched_kind |
++------------------+------------------+
+|                1 |               99 |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+statement error
+SELECT (SELECT r.id FROM ex_join_right r WHERE r.kind >= l.kind) FROM ex_join_left l;
+
+query
+SELECT COUNT(*) AS any_null FROM ex_join_left WHERE id = ANY (SELECT CASE WHEN id = 3 THEN NULL ELSE id END FROM ex_join_right);
+----
++------------------+
+|         any_null |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS all_null FROM ex_join_left WHERE id <> ALL (SELECT CASE WHEN id = 3 THEN NULL ELSE id END FROM ex_join_right);
+----
++------------------+
+|         all_null |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS any_empty FROM ex_join_left WHERE id = ANY (SELECT id FROM ex_join_right WHERE id < 0);
+----
++------------------+
+|        any_empty |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS all_empty FROM ex_join_left WHERE id >= ALL (SELECT id FROM ex_join_right WHERE id < 0);
+----
++------------------+
+|        all_empty |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+EXPLAIN ANALYZE SELECT l.id FROM ex_join_left l JOIN ex_join_right r ON l.id = r.id OR l.kind = r.kind;
+----
+Project(columns=[l.id], rows=2)
+	Join(tables=[ex_join_left, ex_join_right], condition=[(l.id=r.id OR l.kind=r.kind)], rows=2)
+		Scan(table=ex_join_left, type=SeqScan, rows=2)
+		Scan(table=ex_join_right, type=SeqScan, rows=4)
+
+statement error
+SELECT CASE WHEN id THEN 1 ELSE 0 END FROM ex_join_left;
+
+query
+SELECT CASE WHEN id = 1 THEN 1 ELSE 2.5 END AS mixed_case FROM ex_join_left ORDER BY mixed_case;
+----
++------------------+
+|       mixed_case |
++------------------+
+|         1.000000 |
+|         2.500000 |
++------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_boolean_dml (id INT, value INT);
+
+statement ok
+INSERT INTO ex_boolean_dml VALUES (1, 10);
+
+statement error
+UPDATE ex_boolean_dml SET value = 20 WHERE id + 1;
+
+statement error
+DELETE FROM ex_boolean_dml WHERE id + 1;
+
+query
+SELECT id, value FROM ex_boolean_dml;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |               10 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT l.id AS outer_id, (SELECT l.id FROM ex_join_right r WHERE r.id = l.id) AS projected_outer FROM ex_join_left l ORDER BY outer_id;
+----
++------------------+------------------+
+|         outer_id |  projected_outer |
++------------------+------------------+
+|                1 |                1 |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE ex_empty_aggregate (value INT);
+
+query
+SELECT COUNT(value) AS count_value, SUM(value) AS total, AVG(value) AS average, MIN(value) AS minimum, MAX(value) AS maximum FROM ex_empty_aggregate;
+----
++------------------+------------------+------------------+------------------+------------------+
+|      count_value |            total |          average |          minimum |          maximum |
++------------------+------------------+------------------+------------------+------------------+
+|                0 |             NULL |             NULL |             NULL |             NULL |
++------------------+------------------+------------------+------------------+------------------+
+Total record(s): 1

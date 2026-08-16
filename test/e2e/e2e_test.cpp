@@ -502,6 +502,10 @@ TEST_F(SltFileTest, AdvancedSqlExpansion) {
     run_slt_file("advanced_sql_expansion.slt");
 }
 
+TEST_F(SltFileTest, ExpansionRegression) {
+    run_slt_file("expansion_regression.slt");
+}
+
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
 }

@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_aggregate.h"
 #undef private
 
+#include <limits>
+
 #include "gtest/gtest.h"
 
 namespace {
@@ -93,4 +95,17 @@ TEST(ExecutionScalarTest, HashesTreatEquivalentMixedNumericValuesConsistently) {
     GroupKey int_key{{as_int}, {}};
     GroupKey float_key{{as_float}, {}};
     EXPECT_EQ(GroupKeyHash{}(int_key), GroupKeyHash{}(float_key));
+}
+
+TEST(ExecutionScalarTest, CheckedIntCastAcceptsRepresentableValues) {
+    EXPECT_EQ(checked_int_cast(std::numeric_limits<int>::min()), std::numeric_limits<int>::min());
+    EXPECT_EQ(checked_int_cast(std::numeric_limits<int>::max()), std::numeric_limits<int>::max());
+    EXPECT_EQ(checked_int_cast(1.9), 1);
+}
+
+TEST(ExecutionScalarTest, CheckedIntCastRejectsOverflowAndNonFiniteValues) {
+    EXPECT_THROW(checked_int_cast(static_cast<double>(std::numeric_limits<int>::max()) + 1.0), RMDBError);
+    EXPECT_THROW(checked_int_cast(static_cast<double>(std::numeric_limits<int>::min()) - 1.0), RMDBError);
+    EXPECT_THROW(checked_int_cast(std::numeric_limits<double>::infinity()), RMDBError);
+    EXPECT_THROW(checked_int_cast(std::numeric_limits<double>::quiet_NaN()), RMDBError);
 }

@@ -120,7 +120,7 @@ public:
                 if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
                     val.set_float(static_cast<double>(val.int_val));
                 } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
-                    val.set_int(static_cast<int>(val.float_val));
+                    val.set_int(checked_int_cast(val.float_val));
                 } else if ((col.type == TYPE_STRING || col.type == TYPE_DATETIME) &&
                            (val.type == TYPE_STRING || val.type == TYPE_DATETIME)) {
                     val.type = col.type;
@@ -311,9 +311,8 @@ public:
                         throw RMDBError("Duplicate INSERT target column: " + target_col_names_[i]);
                     }
                 }
-                auto target = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
-                    return col.name == target_col_names_[i];
-                });
+                auto target = std::find_if(table.cols.begin(), table.cols.end(),
+                                           [&](const ColMeta& col) { return col.name == target_col_names_[i]; });
                 if (target == table.cols.end()) {
                     throw ColumnNotFoundError(target_col_names_[i]);
                 }
@@ -328,11 +327,10 @@ public:
             }
             std::vector<Value> values(table.cols.size());
             for (size_t source_idx = 0; source_idx < source_->cols().size(); ++source_idx) {
-                std::string target_name = target_col_names_.empty() ? table.cols[source_idx].name
-                                                                     : target_col_names_[source_idx];
-                auto target = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
-                    return col.name == target_name;
-                });
+                std::string target_name =
+                    target_col_names_.empty() ? table.cols[source_idx].name : target_col_names_[source_idx];
+                auto target = std::find_if(table.cols.begin(), table.cols.end(),
+                                           [&](const ColMeta& col) { return col.name == target_name; });
                 if (target == table.cols.end()) {
                     throw ColumnNotFoundError(target_name);
                 }

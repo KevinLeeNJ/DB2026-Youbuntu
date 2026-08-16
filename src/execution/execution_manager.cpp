@@ -80,7 +80,8 @@ void QlManager::run_mutli_query(Plan* plan, Context* context) {
 /**
  * @brief 分派帮助、元数据展示、事务控制、配置和检查点命令。
  * @param plan 工具命令计划。
- * @param txn_id 当前会话事务 ID 指针。
+ * @param txn_id
+ * 当前会话事务 ID 指针。
  * @param context 当前执行上下文。
  */
 void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) {
@@ -219,12 +220,15 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
 
 /**
  * @brief 遍历 SELECT 结果并写入客户端缓冲区及可选的 output.txt。
- * @param executorTreeRoot SELECT 执行器树根节点所有权。
+ * @param executorTreeRoot SELECT
+ * 执行器树根节点所有权。
  * @param output_names 输出列标题。
  * @param context 当前执行上下文。
  *
+ *
  * 函数使用局部输出缓冲区和 SSI 读追踪保护器：执行期间发生事务中止时，
- * 局部结果不会提交到外部缓冲区，也不会修改 output.txt。
+ * 局部结果不会提交到外部缓冲区，也不会修改
+ * output.txt。
  */
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                             Context* context) {
@@ -256,6 +260,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         /**
          * @brief 保存旧开关并启用 SSI 读追踪。
          * @param context 当前执行上下文。
+
          */
         explicit SsiReadTrackingGuard(Context* context) : context_(context), old_value_(false) {
             if (context_ != nullptr) {
@@ -344,9 +349,11 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
 /**
  * @brief 根据 TabCol 选择项生成标题并委托到字符串标题重载。
- * @param executorTreeRoot SELECT 执行器树根节点所有权。
+ * @param executorTreeRoot SELECT
+ * 执行器树根节点所有权。
  * @param sel_cols 选择列列表。
  * @param context 当前执行上下文。
+
  */
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                             Context* context) {

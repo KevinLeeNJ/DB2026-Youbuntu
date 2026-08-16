@@ -319,9 +319,8 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_like_on_numeric_column) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_builds_recursive_expression_tree) {
-    auto parse = ast::parse_sql(
-        "select case when score >= 90 then 'A' else 'F' end as band from grade "
-        "where score is not null and (id = 1 or id = 2);");
+    auto parse = ast::parse_sql("select case when score >= 90 then 'A' else 'F' end as band from grade "
+                                "where score is not null and (id = 1 or id = 2);");
 
     EXPECT_NO_THROW({
         auto query = analyze_.do_analyze(std::move(parse));
@@ -332,8 +331,8 @@ TEST_F(AnalyzeAggregateTest, do_analyze_builds_recursive_expression_tree) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_converts_window_expression) {
-    auto parse = ast::parse_sql(
-        "select row_number() over (partition by course order by score desc) as row_num from grade;");
+    auto parse =
+        ast::parse_sql("select row_number() over (partition by course order by score desc) as row_num from grade;");
 
     EXPECT_NO_THROW({
         auto query = analyze_.do_analyze(std::move(parse));

@@ -10,10 +10,13 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <algorithm>
+
 #include "execution_defs.h"
 #include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_expr.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -31,6 +34,8 @@ private:
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
     SmManager* sm_manager_;
+    std::shared_ptr<QueryExpr> where_expr_;
+    QueryExprEvaluator::SubqueryRunner subquery_runner_;
 
 public:
     /**
@@ -42,7 +47,8 @@ public:
      * @param context 当前执行上下文。
      */
     DeleteExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Condition> conds,
-                   std::vector<Rid> rids, Context* context) {
+                   std::vector<Rid> rids, Context* context, std::shared_ptr<QueryExpr> where_expr = nullptr,
+                   QueryExprEvaluator::SubqueryRunner subquery_runner = {}) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         tab_ = sm_manager_->db_.get_table(tab_name);
@@ -50,6 +56,17 @@ public:
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        where_expr_ = std::move(where_expr);
+        subquery_runner_ = std::move(subquery_runner);
+    }
+
+    bool matches(const RmRecord& rec) {
+        if (where_expr_ != nullptr) {
+            static const std::vector<bool> no_nulls;
+            QueryExprEvaluator evaluator(tab_.cols, no_nulls, &subquery_runner_);
+            return evaluator.matches(*where_expr_, rec);
+        }
+        return std::all_of(conds_.begin(), conds_.end(), [&](const Condition& cond) { return compare(cond, rec); });
     }
 
     /**
@@ -71,13 +88,7 @@ public:
                 continue;
             }
             char* rec_data = rec->data;
-            bool match = true;
-            for (const auto& cond : conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            bool match = matches(*rec);
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
             }
@@ -95,14 +106,7 @@ public:
                     }
                     rec = std::move(current_record->record);
                     rec_data = rec->data;
-                    bool latest_match = true;
-                    for (const auto& cond : conds_) {
-                        if (!compare(cond, *rec)) {
-                            latest_match = false;
-                            break;
-                        }
-                    }
-                    if (!latest_match) {
+                    if (!matches(*rec)) {
                         continue;
                     }
                 }

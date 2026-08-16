@@ -340,7 +340,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
 
     Value new_v;
     new_v.set_int(20);
-    SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
+    SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT, nullptr};
     UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {}, {rid}, &context);
     update_executor.Next();
 
