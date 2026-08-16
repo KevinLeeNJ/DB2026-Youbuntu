@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -29,6 +30,8 @@ constexpr size_t kMaxJoinMaterializedBytes = 64U << 20;
 constexpr size_t kMaxJoinMaterializedRows = 1U << 20;
 constexpr uint64_t kSidecarMagic = 0x58444941544c4544ULL; // DELTAIDX
 constexpr uint64_t kMaxSidecarBytes = 1ULL << 34;
+constexpr size_t kCommitBatchSize = 32;
+constexpr size_t kCommitQueueLimit = 128;
 
 struct SidecarHeader {
     uint64_t magic;
@@ -130,6 +133,14 @@ bool CompareResult(int comparison, ast::SvCompOp op) {
     default:
         return false;
     }
+}
+
+void AppendOverlay(DeltaOverlay& overlay, DeltaOverlayKey key, uint64_t local_id) {
+    overlay[std::move(key)].push_back(local_id);
+}
+
+void AppendOverlay(CommittedOverlay& overlay, DeltaOverlayKey key, uint64_t local_id) {
+    overlay.emplace(std::move(key), std::vector<uint64_t>{local_id});
 }
 
 } // namespace
@@ -364,22 +375,139 @@ epoch_si_poc::EpochSiEngine::Txn& DeltaDatabase::Txn(DeltaSession& session) {
     return *session.txn;
 }
 
-void DeltaDatabase::Commit(DeltaSession& session) {
+CommittedOverlay DeltaDatabase::PrepareCommittedOverlay(const DeltaOverlay& overlay) {
+    CommittedOverlay prepared;
+    for (const auto& [key, ids] : overlay)
+        prepared.emplace(key, ids);
+    return prepared;
+}
+
+void DeltaDatabase::RunCommitInstallHookForTest() noexcept {
+    try {
+        if (commit_install_hook_for_test_)
+            commit_install_hook_for_test_();
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void DeltaDatabase::InstallCommittedOverlay(CommittedOverlay& overlay) noexcept {
+    try {
+        overlay_.merge(overlay);
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void DeltaDatabase::Commit(DeltaSession& session, std::unique_lock<std::mutex>& interpreter_lock) {
     if (!session.txn)
         return;
-    const auto result = db_.engine().CommitBatch({&*session.txn})[0];
+    auto ticket = std::make_shared<CommitTicket>();
+    ticket->overlay = PrepareCommittedOverlay(session.overlay);
+    ticket->txn.emplace(std::move(*session.txn));
+    interpreter_lock.unlock();
+    bool leader = false;
+    try {
+        std::unique_lock<std::mutex> queue_lock(commit_mutex_);
+        commit_slot_available_.wait(queue_lock, [&] { return commit_queue_.size() < kCommitQueueLimit; });
+        commit_queue_.push_back(ticket);
+        if (!commit_leader_) {
+            commit_leader_ = true;
+            leader = true;
+        }
+    } catch (...) {
+        interpreter_lock.lock();
+        session.txn.emplace(std::move(*ticket->txn));
+        ticket->txn.reset();
+        throw;
+    }
     session.txn.reset();
-    session.explicit_txn = false;
-    if (result.status != epoch_si_poc::CommitStatus::kCommitted) {
-        session.overlay.clear();
-        throw DeltaTransactionAbort(
-            result.status == epoch_si_poc::CommitStatus::kWriteConflict ? "SI write conflict" : "unique key conflict");
-    }
-    for (auto& [key, ids] : session.overlay) {
-        auto& committed = overlay_[key];
-        committed.insert(committed.end(), ids.begin(), ids.end());
-    }
     session.overlay.clear();
+    session.explicit_txn = false;
+    if (leader)
+        DrainCommitQueue();
+    {
+        std::unique_lock<std::mutex> queue_lock(commit_mutex_);
+        ticket->ready.wait(queue_lock, [&] { return ticket->done; });
+    }
+    interpreter_lock.lock();
+    session.admission.reset();
+    if (ticket->error)
+        std::rethrow_exception(ticket->error);
+    if (ticket->result.status != epoch_si_poc::CommitStatus::kCommitted) {
+        throw DeltaTransactionAbort(ticket->result.status == epoch_si_poc::CommitStatus::kWriteConflict
+                                        ? "SI write conflict"
+                                        : "unique key conflict");
+    }
+}
+
+void DeltaDatabase::DrainCommitQueue() {
+    for (;;) {
+        std::array<std::shared_ptr<CommitTicket>, kCommitBatchSize> batch;
+        size_t batch_count = 0;
+        std::exception_ptr error;
+        bool engine_called = false;
+        {
+            try {
+                if (commit_batch_hook_for_test_)
+                    commit_batch_hook_for_test_();
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                std::lock_guard<std::mutex> queue_lock(commit_mutex_);
+                const size_t count = std::min(kCommitBatchSize, commit_queue_.size());
+                for (size_t n = 0; n < count; ++n) {
+                    batch[batch_count++] = std::move(commit_queue_.front());
+                    commit_queue_.pop_front();
+                }
+                commit_slot_available_.notify_all();
+            } catch (...) {
+                error = std::current_exception();
+                std::lock_guard<std::mutex> queue_lock(commit_mutex_);
+                while (batch_count < batch.size() && !commit_queue_.empty()) {
+                    batch[batch_count++] = std::move(commit_queue_.front());
+                    commit_queue_.pop_front();
+                }
+                commit_slot_available_.notify_all();
+            }
+        }
+        std::vector<epoch_si_poc::CommitResult> results;
+        if (!error && batch_count != 0) {
+            try {
+                std::vector<epoch_si_poc::EpochSiEngine::Txn*> txns;
+                txns.reserve(batch_count);
+                for (size_t n = 0; n < batch_count; ++n)
+                    txns.push_back(&*batch[n]->txn);
+                std::lock_guard<std::mutex> interpreter_lock(mutex_);
+                engine_called = true;
+                results = db_.engine().CommitBatch(txns);
+                if (results.size() != batch_count)
+                    std::terminate();
+                RunCommitInstallHookForTest();
+                for (size_t n = 0; n < batch_count; ++n)
+                    if (results[n].status == epoch_si_poc::CommitStatus::kCommitted)
+                        InstallCommittedOverlay(batch[n]->overlay);
+            } catch (...) {
+                error = std::current_exception();
+                if (engine_called) {
+                    std::lock_guard<std::mutex> interpreter_lock(mutex_);
+                    poisoned_ = true;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> queue_lock(commit_mutex_);
+            for (size_t n = 0; n < batch_count; ++n) {
+                batch[n]->result = error ? epoch_si_poc::CommitResult{} : results[n];
+                batch[n]->error = error;
+                batch[n]->done = true;
+                batch[n]->ready.notify_one();
+            }
+            commit_slot_available_.notify_all();
+            if (commit_queue_.empty()) {
+                commit_leader_ = false;
+                return;
+            }
+        }
+    }
 }
 
 void DeltaDatabase::Abort(DeltaSession& session) noexcept {
@@ -397,9 +525,11 @@ void DeltaDatabase::AbortLocked(DeltaSession& session) noexcept {
     session.txn.reset();
     session.explicit_txn = false;
     session.overlay.clear();
+    session.admission.reset();
 }
 
 void DeltaDatabase::Checkpoint() {
+    std::unique_lock<std::shared_mutex> admission(execution_gate_);
     std::lock_guard<std::mutex> lock(mutex_);
     RequireUsable();
     CheckpointSidecars();
@@ -409,6 +539,16 @@ uint64_t DeltaDatabase::CatalogGeneration() const {
     std::lock_guard<std::mutex> lock(mutex_);
     RequireUsable();
     return catalog_generation_;
+}
+
+size_t DeltaDatabase::WalFrameCountForTest() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return db_.engine().wal_frame_count();
+}
+
+size_t DeltaDatabase::CommitQueueDepthForTest() const {
+    std::lock_guard<std::mutex> lock(commit_mutex_);
+    return commit_queue_.size();
 }
 
 DeltaDatabase::Cell DeltaDatabase::Literal(const Column& column, const ast::Value& value) const {
@@ -827,7 +967,8 @@ DeltaDatabase::IndexedCandidates(const DeltaSession& session, const TableSchema&
     return result;
 }
 
-void DeltaDatabase::AddOverlay(DeltaOverlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
+template <typename Overlay>
+void DeltaDatabase::AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
                                epoch_si_poc::RowId id, const std::vector<Cell>* previous) {
     for (const Index& index : schema.indexes) {
         if (previous && SameKey(schema, index, *previous, cells))
@@ -836,7 +977,7 @@ void DeltaDatabase::AddOverlay(DeltaOverlay& overlay, const TableSchema& schema,
         for (uint32_t column : index.columns)
             has_null = has_null || cells[column].is_null;
         if (!has_null)
-            overlay[{schema.id, index.constraint_id, HashKey(schema, index, cells)}].push_back(id.local_id);
+            AppendOverlay(overlay, {schema.id, index.constraint_id, HashKey(schema, index, cells)}, id.local_id);
     }
 }
 
@@ -1578,12 +1719,26 @@ PreparedDescription DeltaDatabase::DescribePrepared(const ast::TreeNode& tree,
 }
 
 bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& session, QueryResultSink* sink) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tree)
+        return false;
+    const bool exclusive = tree->type == ast::AstType::StaticCheckpoint || tree->type == ast::AstType::CreateTable ||
+                           tree->type == ast::AstType::CreateIndex || tree->type == ast::AstType::LoadStmt;
+    if (exclusive && session.admission)
+        throw std::runtime_error("Delta schema/checkpoint operation inside transaction");
+    std::unique_lock<std::shared_mutex> exclusive_admission;
+    std::shared_lock<std::shared_mutex> statement_admission;
+    if (exclusive)
+        exclusive_admission = std::unique_lock<std::shared_mutex>(execution_gate_);
+    else if (!session.admission)
+        statement_admission = std::shared_lock<std::shared_mutex>(execution_gate_);
+    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+    if (execute_blocked_hook_for_test_ && !lock.try_lock())
+        execute_blocked_hook_for_test_();
+    if (!lock.owns_lock())
+        lock.lock();
     RequireUsable();
     if (execute_lock_hook_for_test_)
         execute_lock_hook_for_test_();
-    if (!tree)
-        return false;
     if (tree->type == ast::AstType::ShowTables) {
         EmitTables(sink);
         return true;
@@ -1599,10 +1754,11 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
             throw std::runtime_error("transaction already active");
         session.txn.emplace(db_.engine().Begin());
         session.explicit_txn = true;
+        session.admission.emplace(std::move(statement_admission));
         return false;
     }
     if (tree->type == ast::AstType::TxnCommit) {
-        Commit(session);
+        Commit(session, lock);
         return false;
     }
     if (tree->type == ast::AstType::TxnAbort || tree->type == ast::AstType::TxnRollback) {
@@ -1960,7 +2116,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                     EmitRows(left_schema, select, {{value}}, sink, true);
                 }
                 if (implicit)
-                    Commit(session);
+                    Commit(session, lock);
                 return true;
             }
             const TableSchema& schema = Table(select.tabs[0].table_name);
@@ -2124,7 +2280,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 }
                 EmitCells(columns, rows, sink);
                 if (implicit)
-                    Commit(session);
+                    Commit(session, lock);
                 return true;
             }
             const bool aggregate =
@@ -2231,7 +2387,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
                 }
                 EmitRows(schema, select, {std::move(values)}, sink, true);
                 if (implicit)
-                    Commit(session);
+                    Commit(session, lock);
                 return true;
             }
             std::vector<std::vector<Cell>> rows;
@@ -2288,7 +2444,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
             else if (!query_started)
                 EmitRows(schema, select, rows, sink);
             if (implicit)
-                Commit(session);
+                Commit(session, lock);
             return true;
         } else if (tree->type == ast::AstType::DeleteStmt || tree->type == ast::AstType::UpdateStmt) {
             const bool deleting = tree->type == ast::AstType::DeleteStmt;
@@ -2377,7 +2533,7 @@ bool DeltaDatabase::Execute(std::unique_ptr<ast::TreeNode> tree, DeltaSession& s
         } else
             throw std::runtime_error("unsupported SQL for DeltaKernel");
         if (implicit)
-            Commit(session);
+            Commit(session, lock);
         return false;
     } catch (...) {
         if (implicit && session.txn)

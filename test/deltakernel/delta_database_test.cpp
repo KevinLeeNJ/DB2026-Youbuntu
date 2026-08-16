@@ -7,6 +7,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <limits>
@@ -99,6 +100,16 @@ CapturingSink Query(deltakernel::DeltaDatabase& db, deltakernel::DeltaSession& s
     return sink;
 }
 
+bool WaitForCommitQueueDepth(deltakernel::DeltaDatabase& db, size_t depth) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (db.CommitQueueDepthForTest() == depth)
+            return true;
+        std::this_thread::yield();
+    }
+    return db.CommitQueueDepthForTest() == depth;
+}
+
 uint32_t CatalogCrc32(const std::string& bytes) {
     uint32_t crc = 0xffffffffU;
     for (unsigned char byte : bytes) {
@@ -143,6 +154,234 @@ TEST(DeltaDatabaseTest, StaleSameKeyCommitAborts) {
     RunSql(*db, stale, "update t set v = 3 where k = 1;");
     RunSql(*db, first, "commit;");
     EXPECT_THROW(RunSql(*db, stale, "commit;"), deltakernel::DeltaTransactionAbort);
+}
+
+TEST(DeltaDatabaseTest, ConcurrentCommitsShareOneWalFrame) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    deltakernel::DeltaSession first;
+    deltakernel::DeltaSession second;
+    RunSql(*db, first, "begin;");
+    RunSql(*db, first, "insert into t values(1, 10);");
+    RunSql(*db, second, "begin;");
+    RunSql(*db, second, "insert into t values(1, 20);");
+    std::mutex barrier_mutex;
+    std::condition_variable barrier;
+    bool leader_waiting = false;
+    bool release = false;
+    db->SetCommitBatchHookForTest([&] {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        leader_waiting = true;
+        barrier.notify_all();
+        barrier.wait(lock, [&] { return release; });
+    });
+    const size_t frames_before = db->WalFrameCountForTest();
+    std::thread first_committer([&] { RunSql(*db, first, "commit;"); });
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        barrier.wait(lock, [&] { return leader_waiting; });
+    }
+    std::thread second_committer([&] { RunSql(*db, second, "commit;"); });
+    const bool both_queued = WaitForCommitQueueDepth(*db, 2);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        release = true;
+    }
+    barrier.notify_all();
+    first_committer.join();
+    second_committer.join();
+    db->SetCommitBatchHookForTest({});
+    ASSERT_TRUE(both_queued);
+    EXPECT_EQ(db->WalFrameCountForTest(), frames_before + 1);
+    EXPECT_EQ(Query(*db, setup, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}, {"20"}}));
+}
+
+TEST(DeltaDatabaseTest, ConcurrentConflictCommitsSharePublication) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, first, stale, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, setup, "insert into t values(1, 1);");
+    RunSql(*db, first, "begin;");
+    RunSql(*db, stale, "begin;");
+    RunSql(*db, first, "update t set v = 2 where k = 1;");
+    RunSql(*db, stale, "update t set v = 3 where k = 1;");
+    std::mutex barrier_mutex;
+    std::condition_variable barrier;
+    bool leader_waiting = false;
+    bool release = false;
+    db->SetCommitBatchHookForTest([&] {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        leader_waiting = true;
+        barrier.notify_all();
+        barrier.wait(lock, [&] { return release; });
+    });
+    const size_t frames_before = db->WalFrameCountForTest();
+    std::exception_ptr first_error;
+    std::exception_ptr stale_error;
+    std::thread first_committer([&] {
+        try {
+            RunSql(*db, first, "commit;");
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        barrier.wait(lock, [&] { return leader_waiting; });
+    }
+    std::thread stale_committer([&] {
+        try {
+            RunSql(*db, stale, "commit;");
+        } catch (...) {
+            stale_error = std::current_exception();
+        }
+    });
+    const bool both_queued = WaitForCommitQueueDepth(*db, 2);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        release = true;
+    }
+    barrier.notify_all();
+    first_committer.join();
+    stale_committer.join();
+    db->SetCommitBatchHookForTest({});
+    ASSERT_TRUE(both_queued);
+    EXPECT_FALSE(first_error);
+    EXPECT_TRUE(stale_error);
+    EXPECT_EQ(db->WalFrameCountForTest(), frames_before + 1);
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"2"}}));
+}
+
+TEST(DeltaDatabaseTest, IndexedCommitPublishesRowsAndOverlayTogether) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, writer, reader;
+    RunSql(*db, setup, "create table t(k int, v int);");
+    RunSql(*db, setup, "create index t_k on t(k);");
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "insert into t values(7, 9);");
+    std::mutex barrier_mutex;
+    std::condition_variable barrier;
+    bool installing = false;
+    bool release = false;
+    std::atomic<bool> reader_done{false};
+    CapturingSink result;
+    db->SetCommitInstallHookForTest([&] {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        installing = true;
+        barrier.notify_all();
+        barrier.wait(lock, [&] { return release; });
+    });
+    bool reader_blocked = false;
+    db->SetExecuteBlockedHookForTest([&] {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        reader_blocked = true;
+        barrier.notify_all();
+    });
+    std::thread committer([&] { RunSql(*db, writer, "commit;"); });
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        barrier.wait(lock, [&] { return installing; });
+    }
+    std::thread reader_thread([&] {
+        result = Query(*db, reader, "select v from t where k = 7;");
+        reader_done = true;
+    });
+    bool observed_blocked;
+    bool completed_before_release;
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        observed_blocked = barrier.wait_for(lock, std::chrono::seconds(2), [&] { return reader_blocked; });
+        completed_before_release = reader_done;
+        release = true;
+    }
+    barrier.notify_all();
+    committer.join();
+    reader_thread.join();
+    db->SetCommitInstallHookForTest({});
+    db->SetExecuteBlockedHookForTest({});
+    EXPECT_TRUE(observed_blocked);
+    EXPECT_FALSE(completed_before_release);
+    EXPECT_EQ(result.rows, (std::vector<std::vector<std::string>>{{"9"}}));
+}
+
+TEST(DeltaDatabaseTest, CommitLeaderFailureWakesQueuedWaiters) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession setup, first, second;
+    RunSql(*db, setup, "create table t(k int);");
+    RunSql(*db, first, "begin;");
+    RunSql(*db, first, "insert into t values(1);");
+    RunSql(*db, second, "begin;");
+    RunSql(*db, second, "insert into t values(2);");
+    std::mutex barrier_mutex;
+    std::condition_variable barrier;
+    bool leader_waiting = false;
+    bool release = false;
+    db->SetCommitBatchHookForTest([&] {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        leader_waiting = true;
+        barrier.notify_all();
+        barrier.wait(lock, [&] { return release; });
+        throw std::runtime_error("test leader failure");
+    });
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::thread first_committer([&] {
+        try {
+            RunSql(*db, first, "commit;");
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        barrier.wait(lock, [&] { return leader_waiting; });
+    }
+    std::thread second_committer([&] {
+        try {
+            RunSql(*db, second, "commit;");
+        } catch (...) {
+            second_error = std::current_exception();
+        }
+    });
+    const bool both_queued = WaitForCommitQueueDepth(*db, 2);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        release = true;
+    }
+    barrier.notify_all();
+    first_committer.join();
+    second_committer.join();
+    db->SetCommitBatchHookForTest({});
+    ASSERT_TRUE(both_queued);
+    EXPECT_TRUE(first_error);
+    EXPECT_TRUE(second_error);
+    EXPECT_EQ(db->CommitQueueDepthForTest(), 0U);
+    EXPECT_TRUE(Query(*db, setup, "select k from t;").rows.empty());
+}
+
+TEST(DeltaDatabaseTest, DurableInstallFailureTerminates) {
+    TempDelta temp;
+    EXPECT_DEATH(
+        {
+            auto db = deltakernel::DeltaDatabase::Create(temp.path());
+            deltakernel::DeltaSession session;
+            RunSql(*db, session, "create table t(k int);");
+            RunSql(*db, session, "create index t_k on t(k);");
+            RunSql(*db, session, "begin;");
+            RunSql(*db, session, "insert into t values(1);");
+            db->SetCommitInstallHookForTest([] { throw std::runtime_error("test install failure"); });
+            RunSql(*db, session, "commit;");
+        },
+        "");
 }
 
 TEST(DeltaDatabaseTest, StreamingAggregateAndBoundedOrder) {

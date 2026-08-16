@@ -257,6 +257,59 @@ TEST(EpochSiEngineTest, UniqueKeyHistoryCoversChangeDeleteAndReinsert) {
     EXPECT_EQ(engine.CommitBatch({&swap})[0].status, CommitStatus::kCommitted);
 }
 
+TEST(EpochSiEngineTest, PublicationStagesOnlyTouchedState) {
+    const auto commit_one_update = [](size_t rows) {
+        BaseImage base;
+        for (size_t i = 0; i < rows; ++i) {
+            base.emplace(RowId{kAccounts, i}, ImmutableRow("row" + std::to_string(i), static_cast<int64_t>(i)));
+        }
+        EpochSiEngine engine(std::move(base));
+        auto txn = engine.Begin();
+        engine.PutImage(txn, {kAccounts, 0}, ImmutableRow("updated", 1));
+        EXPECT_EQ(engine.CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+        return engine.last_publication_staged_entries_for_test();
+    };
+
+    const size_t one_row_work = commit_one_update(1);
+    EXPECT_GT(one_row_work, 0U);
+    EXPECT_EQ(one_row_work, commit_one_update(4096));
+}
+
+TEST(EpochSiEngineTest, HotRowPublicationStagesAndInstallsOneVersion) {
+    EpochSiEngine engine(Base());
+    auto old_snapshot = engine.Begin();
+    constexpr int64_t kUpdates = 4096;
+    for (int64_t value = 1; value <= kUpdates; ++value) {
+        auto update = engine.Begin();
+        engine.PutImage(update, {kAccounts, 1}, test_row::Make(kAccounts, "a", value));
+        ASSERT_EQ(engine.CommitBatch({&update})[0].status, CommitStatus::kCommitted);
+        EXPECT_EQ(engine.last_publication_staged_versions_for_test(), 1U);
+        EXPECT_EQ(engine.last_install_version_nodes_for_test(), 1U);
+    }
+
+    EXPECT_EQ(test_row::Value(*engine.Read(old_snapshot, {kAccounts, 1})), 10);
+    engine.Abort(old_snapshot);
+    auto latest = engine.Begin();
+    EXPECT_EQ(test_row::Value(*engine.Read(latest, {kAccounts, 1})), kUpdates);
+    engine.Abort(latest);
+}
+
+TEST(EpochSiEngineTest, PublicationPreservesClaimReleaseAndAcquireRules) {
+    EpochSiEngine engine(Base());
+    auto swap = engine.Begin();
+    engine.PutImage(swap, {kAccounts, 1}, test_row::Make(kAccounts, "b", 11));
+    engine.PutImage(swap, {kAccounts, 2}, test_row::Make(kAccounts, "a", 22));
+    EXPECT_EQ(engine.CommitBatch({&swap})[0].status, CommitStatus::kCommitted);
+
+    auto release = engine.Begin();
+    auto acquire = engine.Begin();
+    engine.Erase(release, {kAccounts, 1});
+    engine.InsertImage(acquire, kAccounts, test_row::Make(kAccounts, "b", 33));
+    const auto result = engine.CommitBatch({&release, &acquire});
+    EXPECT_EQ(result[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(result[1].status, CommitStatus::kUniqueConflict);
+}
+
 TEST(EpochSiEngineTest, PreflightOwnershipEmptyWritesAndMutationValidation) {
     static_assert(!std::is_copy_constructible_v<EpochSiEngine::Txn>);
     EpochSiEngine engine(Base());
@@ -379,12 +432,20 @@ TEST(EpochSiEngineTest, CrashMediaAndInstallPoisoningRecoverTheDurableBatch) {
     engine.PutImage(txn, {kAccounts, 2}, test_row::Make(kAccounts, "b", 222));
     engine.SetCrashPointForTest(CrashPoint::kDuringInstall, 1);
     EXPECT_THROW(engine.CommitBatch({&txn}), SimulatedCrash);
+    EXPECT_EQ(engine.last_install_version_nodes_for_test(), 1U);
     EXPECT_THROW(engine.Begin(), std::logic_error);
     auto recovered = EpochSiEngine::Recover(Base(), engine.recovery_wal_image_for_test());
     auto view = recovered.Begin();
     EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 1})), 111);
     EXPECT_EQ(test_row::Value(*recovered.Read(view, {kAccounts, 2})), 222);
     recovered.Abort(view);
+
+    EpochSiEngine clean(Base());
+    auto clean_txn = clean.Begin();
+    clean.PutImage(clean_txn, {kAccounts, 1}, test_row::Make(kAccounts, "a", 111));
+    clean.PutImage(clean_txn, {kAccounts, 2}, test_row::Make(kAccounts, "b", 222));
+    ASSERT_EQ(clean.CommitBatch({&clean_txn})[0].status, CommitStatus::kCommitted);
+    EXPECT_EQ(recovered.MaterializePublished(), clean.MaterializePublished());
 }
 
 TEST(EpochSiEngineTest, FramingDistinguishesTornTailFromCorruption) {

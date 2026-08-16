@@ -231,7 +231,10 @@ EpochSiEngine::EpochSiEngine(EpochSiEngine&& other) noexcept
       version_count_(other.version_count_), volatile_wal_(std::move(other.volatile_wal_)),
       recovery_wal_image_(std::move(other.recovery_wal_image_)), file_wal_(std::move(other.file_wal_)),
       wal_frame_count_(other.wal_frame_count_), wal_transaction_count_(other.wal_transaction_count_),
-      dirty_tables_(std::move(other.dirty_tables_)), crash_point_(other.crash_point_),
+      dirty_tables_(std::move(other.dirty_tables_)),
+      last_publication_staged_entries_(other.last_publication_staged_entries_),
+      last_publication_staged_versions_(other.last_publication_staged_versions_),
+      last_install_version_nodes_(other.last_install_version_nodes_), crash_point_(other.crash_point_),
       crash_position_(other.crash_position_), poisoned_(other.poisoned_) {
     other.poisoned_ = true;
     other.identity_.reset();
@@ -261,6 +264,9 @@ EpochSiEngine& EpochSiEngine::operator=(EpochSiEngine&& other) noexcept {
     wal_frame_count_ = other.wal_frame_count_;
     wal_transaction_count_ = other.wal_transaction_count_;
     dirty_tables_ = std::move(other.dirty_tables_);
+    last_publication_staged_entries_ = other.last_publication_staged_entries_;
+    last_publication_staged_versions_ = other.last_publication_staged_versions_;
+    last_install_version_nodes_ = other.last_install_version_nodes_;
     crash_point_ = other.crash_point_;
     crash_position_ = other.crash_position_;
     poisoned_ = other.poisoned_;
@@ -479,9 +485,9 @@ void EpochSiEngine::RequireActive(const Txn& txn) const {
 std::optional<Row> EpochSiEngine::ReadCommitted(RowId row_id, Epoch snapshot) const {
     const auto versions = versions_.find(row_id);
     if (versions != versions_.end()) {
-        for (auto it = versions->second.rbegin(); it != versions->second.rend(); ++it) {
-            if (it->epoch <= snapshot) {
-                return it->row.deleted ? std::nullopt : std::optional<Row>(it->row);
+        for (const Version* version = versions->second.get(); version != nullptr; version = version->older.get()) {
+            if (version->epoch <= snapshot) {
+                return version->row.deleted ? std::nullopt : std::optional<Row>(version->row);
             }
         }
     }
@@ -534,7 +540,8 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
             }
             const auto versions = versions_.find(id);
             if (versions != versions_.end()) {
-                for (auto version = versions->second.rbegin(); version != versions->second.rend(); ++version) {
+                for (const Version* version = versions->second.get(); version != nullptr;
+                     version = version->older.get()) {
                     if (version->epoch <= txn.start_epoch_) {
                         if (!version->row.deleted)
                             visitor(id, version->row);
@@ -571,8 +578,8 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
 
 void EpochSiEngine::VisitLatestVersions(const std::function<void(RowId, const Row&)>& visitor) const {
     for (const auto& [id, versions] : versions_)
-        if (!versions.empty() && !versions.back().row.deleted)
-            visitor(id, versions.back().row);
+        if (versions && !versions->row.deleted)
+            visitor(id, versions->row);
 }
 
 bool EpochSiEngine::CanInstallPristineTable(TableId table_id) const {
@@ -668,24 +675,43 @@ CommitStatus EpochSiEngine::Certify(const Txn& txn, std::set<RowId>& batch_rows,
             claim_conflict = true;
         }
     }
-    auto projected_owners = claim_owner_;
+    // Keep only the claims this transaction changes.  Copying claim_owner_ here
+    // made certification linear in all resident unique keys for every writer.
+    std::map<ConstraintClaim, std::optional<RowId>> projected_owners;
     for (const auto& [id, row] : txn.writes_) {
         const auto old = ReadCommitted(id, published_epoch_);
         if (old) {
             for (const auto& claim : old->claims) {
                 const auto owner = projected_owners.find(claim);
-                if (owner != projected_owners.end() && owner->second == id) {
-                    projected_owners.erase(owner);
+                if (owner != projected_owners.end()) {
+                    if (owner->second && *owner->second == id) {
+                        owner->second.reset();
+                    }
+                } else {
+                    const auto committed_owner = claim_owner_.find(claim);
+                    if (committed_owner != claim_owner_.end() && committed_owner->second == id) {
+                        projected_owners.emplace(claim, std::nullopt);
+                    }
                 }
             }
         }
     }
     for (const auto& [id, row] : txn.writes_) {
         for (const auto& claim : row.claims) {
-            const auto [owner, inserted] = projected_owners.emplace(claim, id);
-            if (!inserted && owner->second != id) {
+            const auto owner = projected_owners.find(claim);
+            if (owner != projected_owners.end()) {
+                if (owner->second && *owner->second != id) {
+                    claim_conflict = true;
+                } else {
+                    owner->second = id;
+                }
+                continue;
+            }
+            const auto committed_owner = claim_owner_.find(claim);
+            if (committed_owner != claim_owner_.end() && committed_owner->second != id) {
                 claim_conflict = true;
             }
+            projected_owners.emplace(claim, id);
         }
     }
     if (row_conflict) {
@@ -729,7 +755,8 @@ void EpochSiEngine::Install(const std::vector<Txn*>& accepted, Epoch epoch) {
                 claim_owner_[claim] = id;
                 last_claim_epoch_[claim] = epoch;
             }
-            versions_[id].push_back(Version{epoch, row});
+            auto version = std::make_unique<Version>(epoch, row, std::move(versions_[id]));
+            versions_[id] = std::move(version);
             last_row_epoch_[id] = epoch;
             next_row_id_[id.table_id] = std::max(next_row_id_[id.table_id], id.local_id + 1);
             dirty_tables_.insert(id.table_id);
@@ -743,46 +770,109 @@ void EpochSiEngine::Install(const std::vector<Txn*>& accepted, Epoch epoch) {
 }
 
 EpochSiEngine::PreparedState EpochSiEngine::PreparePublication(const std::vector<Txn*>& accepted, Epoch epoch) const {
-    PreparedState prepared{versions_,    last_row_epoch_, last_claim_epoch_, claim_owner_,
-                           next_row_id_, dirty_tables_,   version_count_};
+    PreparedState prepared{{}, {}, {}, {}, {}, {}, {}, version_count_, 0, 0};
     for (Txn* txn : accepted) {
         for (const auto& [id, row] : txn->writes_) {
             if (id.local_id == std::numeric_limits<uint64_t>::max() ||
                 prepared.version_count == std::numeric_limits<size_t>::max()) {
                 throw std::overflow_error("publication state exhausted");
             }
+            const bool inserted = prepared.versions.emplace(id, std::make_unique<Version>(epoch, row, nullptr)).second;
+            if (!inserted) {
+                throw std::logic_error("accepted batch writes one row more than once");
+            }
+            ++prepared.staged_versions;
+            prepared.last_row_epoch.emplace(id, epoch);
             const auto old = ReadCommitted(id, published_epoch_);
             if (old) {
                 for (const auto& claim : old->claims) {
-                    const auto owner = prepared.claim_owner.find(claim);
-                    if (owner != prepared.claim_owner.end() && owner->second == id) {
-                        prepared.claim_owner.erase(owner);
+                    const auto owner = claim_owner_.find(claim);
+                    if (owner != claim_owner_.end() && owner->second == id) {
+                        prepared.claim_owner_erases.emplace(claim, id);
                     }
-                    prepared.last_claim_epoch[claim] = epoch;
+                    prepared.last_claim_epoch.emplace(claim, epoch);
                 }
             }
             for (const auto& claim : row.claims) {
-                prepared.claim_owner[claim] = id;
-                prepared.last_claim_epoch[claim] = epoch;
+                const auto [owner, owner_inserted] = prepared.claim_owner.emplace(claim, id);
+                if (!owner_inserted && owner->second != id) {
+                    throw std::logic_error("accepted batch has duplicate unique claim");
+                }
+                prepared.last_claim_epoch.emplace(claim, epoch);
             }
-            prepared.versions[id].push_back(Version{epoch, row});
-            prepared.last_row_epoch[id] = epoch;
-            prepared.next_row_id[id.table_id] = std::max(prepared.next_row_id[id.table_id], id.local_id + 1);
+            const auto current_next = next_row_id_.find(id.table_id);
+            const auto next = prepared.next_row_id.emplace(
+                id.table_id, current_next == next_row_id_.end() ? 0 : current_next->second);
+            next.first->second = std::max(next.first->second, id.local_id + 1);
             prepared.dirty_tables.insert(id.table_id);
             ++prepared.version_count;
         }
     }
+    prepared.staged_entries = prepared.versions.size() + prepared.last_row_epoch.size() +
+                              prepared.last_claim_epoch.size() + prepared.claim_owner.size() +
+                              prepared.next_row_id.size() + prepared.dirty_tables.size() +
+                              prepared.claim_owner_erases.size();
     return prepared;
 }
 
-void EpochSiEngine::InstallPrepared(PreparedState&& prepared) noexcept {
-    versions_.swap(prepared.versions);
-    last_row_epoch_.swap(prepared.last_row_epoch);
-    last_claim_epoch_.swap(prepared.last_claim_epoch);
-    claim_owner_.swap(prepared.claim_owner);
-    next_row_id_.swap(prepared.next_row_id);
-    dirty_tables_.swap(prepared.dirty_tables);
+bool EpochSiEngine::InstallPrepared(PreparedState&& prepared) noexcept {
+    last_install_version_nodes_ = 0;
+    for (const auto& [claim, id] : prepared.claim_owner_erases) {
+        const auto owner = claim_owner_.find(claim);
+        if (owner != claim_owner_.end() && owner->second == id) {
+            claim_owner_.erase(owner);
+        }
+    }
+    while (!prepared.claim_owner.empty()) {
+        claim_owner_.insert(prepared.claim_owner.extract(prepared.claim_owner.begin()));
+    }
+    while (!prepared.versions.empty()) {
+        auto node = prepared.versions.extract(prepared.versions.begin());
+        const auto current = versions_.find(node.key());
+        if (current == versions_.end()) {
+            versions_.insert(std::move(node));
+        } else {
+            node.mapped()->older = std::move(current->second);
+            current->second = std::move(node.mapped());
+        }
+        ++last_install_version_nodes_;
+        if (crash_point_ == CrashPoint::kDuringInstall && crash_position_ == last_install_version_nodes_)
+            return false;
+    }
+    while (!prepared.last_row_epoch.empty()) {
+        auto node = prepared.last_row_epoch.extract(prepared.last_row_epoch.begin());
+        const auto current = last_row_epoch_.find(node.key());
+        if (current == last_row_epoch_.end()) {
+            last_row_epoch_.insert(std::move(node));
+        } else {
+            current->second = node.mapped();
+        }
+    }
+    while (!prepared.last_claim_epoch.empty()) {
+        auto node = prepared.last_claim_epoch.extract(prepared.last_claim_epoch.begin());
+        const auto current = last_claim_epoch_.find(node.key());
+        if (current == last_claim_epoch_.end()) {
+            last_claim_epoch_.insert(std::move(node));
+        } else {
+            current->second = node.mapped();
+        }
+    }
+    while (!prepared.next_row_id.empty()) {
+        auto node = prepared.next_row_id.extract(prepared.next_row_id.begin());
+        const auto current = next_row_id_.find(node.key());
+        if (current == next_row_id_.end()) {
+            next_row_id_.insert(std::move(node));
+        } else {
+            current->second = node.mapped();
+        }
+    }
+    while (!prepared.dirty_tables.empty()) {
+        dirty_tables_.insert(prepared.dirty_tables.extract(prepared.dirty_tables.begin()));
+    }
     version_count_ = prepared.version_count;
+    last_publication_staged_entries_ = prepared.staged_entries;
+    last_publication_staged_versions_ = prepared.staged_versions;
+    return true;
 }
 
 EpochSiEngine::PreparedTableInstall
@@ -918,14 +1008,13 @@ std::vector<CommitResult> EpochSiEngine::CommitBatch(const std::vector<Txn*>& tx
         throw;
     }
     try {
-        size_t operation_count = 0;
-        for (Txn* txn : accepted) {
-            operation_count += txn->writes_.size();
-        }
-        if (crash_point_ == CrashPoint::kDuringInstall && crash_position_ <= operation_count) {
+        // kDuringInstall position 0 is before publication; N is after N row heads
+        // have actually been linked into the poisoned in-memory state.
+        if (crash_point_ == CrashPoint::kDuringInstall && crash_position_ == 0) {
             PoisonAndCrash();
         }
-        InstallPrepared(std::move(prepared));
+        if (!InstallPrepared(std::move(prepared)))
+            PoisonAndCrash();
     } catch (...) {
         poisoned_ = true;
         throw;

@@ -200,6 +200,15 @@ public:
     size_t explicit_row_metadata_count() const {
         return last_row_epoch_.size();
     }
+    size_t last_publication_staged_entries_for_test() const {
+        return last_publication_staged_entries_;
+    }
+    size_t last_publication_staged_versions_for_test() const {
+        return last_publication_staged_versions_;
+    }
+    size_t last_install_version_nodes_for_test() const {
+        return last_install_version_nodes_;
+    }
     const std::vector<uint8_t>& recovery_wal_image_for_test() const {
         return recovery_wal_image_;
     }
@@ -228,18 +237,32 @@ public:
 
 private:
     struct Version {
+        Version(Epoch epoch, const Row& row, std::unique_ptr<Version> older)
+            : epoch(epoch), row(row), older(std::move(older)) {}
+        ~Version() {
+            while (older) {
+                auto next = std::move(older->older);
+                older.reset();
+                older = std::move(next);
+            }
+        }
+
         Epoch epoch;
         Row row;
+        std::unique_ptr<Version> older;
     };
 
     struct PreparedState {
-        std::map<RowId, std::vector<Version>> versions;
+        std::map<RowId, std::unique_ptr<Version>> versions;
         std::map<RowId, Epoch> last_row_epoch;
         std::map<ConstraintClaim, Epoch> last_claim_epoch;
         std::map<ConstraintClaim, RowId> claim_owner;
         std::map<TableId, uint64_t> next_row_id;
         std::set<TableId> dirty_tables;
+        std::map<ConstraintClaim, RowId> claim_owner_erases;
         size_t version_count;
+        size_t staged_entries;
+        size_t staged_versions;
     };
     struct PreparedTableInstall {
         ImmutableTables tables;
@@ -257,7 +280,7 @@ private:
     void RequireActive(const Txn& txn) const;
     void Install(const std::vector<Txn*>& accepted, Epoch epoch);
     PreparedState PreparePublication(const std::vector<Txn*>& accepted, Epoch epoch) const;
-    void InstallPrepared(PreparedState&& prepared) noexcept;
+    bool InstallPrepared(PreparedState&& prepared) noexcept;
     PreparedTableInstall PrepareTableInstall(std::shared_ptr<const ImmutableTable> table) const;
     void InstallTablePrepared(PreparedTableInstall&& prepared) noexcept;
     void VisitPublished(TableId table_id, const std::function<void(RowId, const Row&)>& visitor);
@@ -270,7 +293,7 @@ private:
 
     BaseImage base_;
     ImmutableTables immutable_tables_;
-    std::map<RowId, std::vector<Version>> versions_;
+    std::map<RowId, std::unique_ptr<Version>> versions_;
     std::map<RowId, Epoch> last_row_epoch_;
     std::map<ConstraintClaim, Epoch> last_claim_epoch_;
     std::map<ConstraintClaim, RowId> claim_owner_;
@@ -285,6 +308,9 @@ private:
     size_t wal_frame_count_ = 0;
     size_t wal_transaction_count_ = 0;
     std::set<TableId> dirty_tables_;
+    size_t last_publication_staged_entries_ = 0;
+    size_t last_publication_staged_versions_ = 0;
+    size_t last_install_version_nodes_ = 0;
     CrashPoint crash_point_ = CrashPoint::kNone;
     size_t crash_position_ = 0;
     bool poisoned_ = false;

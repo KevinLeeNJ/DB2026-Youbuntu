@@ -1,12 +1,17 @@
 #pragma once
 
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <shared_mutex>
 #include <tuple>
 #include <vector>
 
@@ -29,13 +34,17 @@ public:
     explicit DeltaTransactionAbort(const std::string& message) : std::runtime_error(message) {}
 };
 
-using DeltaOverlay =
-    std::map<std::tuple<epoch_si_poc::TableId, epoch_si_poc::ConstraintId, uint64_t>, std::vector<uint64_t>>;
+using DeltaOverlayKey = std::tuple<epoch_si_poc::TableId, epoch_si_poc::ConstraintId, uint64_t>;
+using DeltaOverlay = std::map<DeltaOverlayKey, std::vector<uint64_t>>;
+using CommittedOverlay = std::multimap<DeltaOverlayKey, std::vector<uint64_t>>;
 
 struct DeltaSession {
     std::optional<epoch_si_poc::EpochSiEngine::Txn> txn;
     bool explicit_txn = false;
     DeltaOverlay overlay;
+    // Held for the lifetime of an explicit transaction so DDL/checkpoint/LOAD
+    // cannot pass between its writes and durable commit.
+    std::optional<std::shared_lock<std::shared_mutex>> admission;
 };
 
 class DeltaDatabase {
@@ -62,6 +71,17 @@ public:
     void SetExecuteLockHookForTest(std::function<void()> hook) {
         execute_lock_hook_for_test_ = std::move(hook);
     }
+    void SetExecuteBlockedHookForTest(std::function<void()> hook) {
+        execute_blocked_hook_for_test_ = std::move(hook);
+    }
+    void SetCommitBatchHookForTest(std::function<void()> hook) {
+        commit_batch_hook_for_test_ = std::move(hook);
+    }
+    void SetCommitInstallHookForTest(std::function<void()> hook) {
+        commit_install_hook_for_test_ = std::move(hook);
+    }
+    size_t WalFrameCountForTest() const;
+    size_t CommitQueueDepthForTest() const;
     size_t SidecarValidationCountForTest() const {
         return sidecar_validation_count_;
     }
@@ -115,7 +135,19 @@ private:
     const TableSchema& Table(const std::string& name) const;
     const TableSchema* TableById(epoch_si_poc::TableId id) const;
     epoch_si_poc::EpochSiEngine::Txn& Txn(DeltaSession& session);
-    void Commit(DeltaSession& session);
+    struct CommitTicket {
+        std::optional<epoch_si_poc::EpochSiEngine::Txn> txn;
+        CommittedOverlay overlay;
+        epoch_si_poc::CommitResult result{};
+        std::exception_ptr error;
+        bool done = false;
+        std::condition_variable ready;
+    };
+    void Commit(DeltaSession& session, std::unique_lock<std::mutex>& interpreter_lock);
+    void DrainCommitQueue();
+    static CommittedOverlay PrepareCommittedOverlay(const DeltaOverlay& overlay);
+    void RunCommitInstallHookForTest() noexcept;
+    void InstallCommittedOverlay(CommittedOverlay& overlay) noexcept;
     epoch_si_poc::RowImage EncodeRow(const TableSchema& schema, const std::vector<Cell>& cells) const;
     std::vector<Cell> DecodeRow(const TableSchema& schema, const epoch_si_poc::RowImage& image) const;
     std::vector<uint8_t> EncodeKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells,
@@ -140,8 +172,9 @@ private:
     std::vector<epoch_si_poc::RowId> IndexedCandidates(const DeltaSession& session, const TableSchema& schema,
                                                        const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                                                        bool* usable) const;
-    void AddOverlay(DeltaOverlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
-                    epoch_si_poc::RowId id, const std::vector<Cell>* previous = nullptr);
+    template <typename Overlay>
+    void AddOverlay(Overlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells, epoch_si_poc::RowId id,
+                    const std::vector<Cell>* previous = nullptr);
     void VisitRows(DeltaSession& session, const TableSchema& schema,
                    const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
                    const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor);
@@ -158,9 +191,17 @@ private:
     bool poisoned_ = false;
     std::function<void()> load_before_publish_hook_for_test_;
     std::function<void()> execute_lock_hook_for_test_;
+    std::function<void()> execute_blocked_hook_for_test_;
+    std::function<void()> commit_batch_hook_for_test_;
+    std::function<void()> commit_install_hook_for_test_;
     mutable std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> sidecars_;
-    DeltaOverlay overlay_;
+    CommittedOverlay overlay_;
     size_t sidecar_validation_count_ = 0;
+    std::shared_mutex execution_gate_;
+    mutable std::mutex commit_mutex_;
+    std::deque<std::shared_ptr<CommitTicket>> commit_queue_;
+    std::condition_variable commit_slot_available_;
+    bool commit_leader_ = false;
     mutable std::mutex mutex_; // ponytail: one interpreter lock; split only when measured contention requires it.
 };
 
