@@ -794,6 +794,12 @@ private:
             auto zero = std::make_unique<IntLit>(0);
             return make_arithmetic_expr(TokenType::MINUS, std::move(zero), parse_arithmetic_atom());
         }
+        if (is_window_function_start(current_.type)) {
+            return parse_window_function_expr();
+        }
+        if (current_.type == TokenType::SUM || current_.type == TokenType::AVG) {
+            return parse_sum_avg_expr();
+        }
         if (is_aggregate_start(current_.type)) {
             return parse_aggregate_expr();
         }
@@ -991,6 +997,106 @@ private:
         auto column = parse_col();
         expect(TokenType::RPAREN, "expected ')' after aggregate argument");
         return std::make_unique<AggExpr>(func, false, std::move(column), is_distinct);
+    }
+
+    bool is_window_function_start(TokenType type) const {
+        return type == TokenType::ROW_NUMBER || type == TokenType::RANK || type == TokenType::DENSE_RANK ||
+               type == TokenType::LAG || type == TokenType::LEAD;
+    }
+
+    WindowFuncType parse_window_func_type() {
+        if (match(TokenType::ROW_NUMBER)) {
+            return WindowFuncType::ROW_NUMBER;
+        }
+        if (match(TokenType::RANK)) {
+            return WindowFuncType::RANK;
+        }
+        if (match(TokenType::DENSE_RANK)) {
+            return WindowFuncType::DENSE_RANK;
+        }
+        if (match(TokenType::LAG)) {
+            return WindowFuncType::LAG;
+        }
+        expect(TokenType::LEAD, "expected window function");
+        return WindowFuncType::LEAD;
+    }
+
+    std::vector<std::unique_ptr<Expr>> parse_window_arguments(WindowFuncType func) {
+        std::vector<std::unique_ptr<Expr>> args;
+        expect(TokenType::LPAREN, "expected '(' after window function");
+        if (func == WindowFuncType::ROW_NUMBER || func == WindowFuncType::RANK ||
+            func == WindowFuncType::DENSE_RANK) {
+            expect(TokenType::RPAREN, "ranking functions do not accept arguments");
+            return args;
+        }
+        args.push_back(parse_value_expr());
+        while (match(TokenType::COMMA)) {
+            if ((func == WindowFuncType::LAG || func == WindowFuncType::LEAD) && args.size() >= 3) {
+                error("LAG and LEAD accept at most three arguments");
+            }
+            args.push_back(parse_value_expr());
+        }
+        expect(TokenType::RPAREN, "expected ')' after window function arguments");
+        return args;
+    }
+
+    std::unique_ptr<WindowExpr> parse_window_function_expr() {
+        auto func = parse_window_func_type();
+        auto args = parse_window_arguments(func);
+        expect(TokenType::OVER, "expected OVER after window function");
+        auto window_spec = parse_window_spec();
+        return std::make_unique<WindowExpr>(func, std::move(args), std::move(window_spec.first),
+                                            std::move(window_spec.second));
+    }
+
+    std::unique_ptr<Expr> parse_sum_avg_expr() {
+        const bool is_sum = match(TokenType::SUM);
+        if (!is_sum) {
+            expect(TokenType::AVG, "expected SUM or AVG");
+        }
+        const auto func = is_sum ? WindowFuncType::SUM : WindowFuncType::AVG;
+        expect(TokenType::LPAREN, "expected '(' after aggregate function");
+        const bool is_distinct = match(TokenType::DISTINCT);
+        auto argument = parse_value_expr();
+        expect(TokenType::RPAREN, "expected ')' after aggregate argument");
+        if (!match(TokenType::OVER)) {
+            auto column = dynamic_cast<Col*>(argument.get());
+            if (column == nullptr) {
+                error("aggregate argument must be a column");
+            }
+            const auto aggregate_func = is_sum ? AGG_SUM : AGG_AVG;
+            return std::make_unique<AggExpr>(aggregate_func, false, clone_col(*column), is_distinct);
+        }
+        if (is_distinct) {
+            error("window aggregate does not support DISTINCT");
+        }
+        auto window_spec = parse_window_spec();
+        std::vector<std::unique_ptr<Expr>> args;
+        args.push_back(std::move(argument));
+        return std::make_unique<WindowExpr>(func, std::move(args), std::move(window_spec.first),
+                                            std::move(window_spec.second));
+    }
+
+    std::pair<std::vector<std::unique_ptr<Expr>>, std::vector<std::unique_ptr<OrderByItem>>> parse_window_spec() {
+        std::vector<std::unique_ptr<Expr>> partition_by;
+        std::vector<std::unique_ptr<OrderByItem>> order_by;
+        expect(TokenType::LPAREN, "expected '(' after OVER");
+        if (match(TokenType::PARTITION)) {
+            expect(TokenType::BY, "expected BY after PARTITION");
+            partition_by.push_back(parse_value_expr());
+            while (match(TokenType::COMMA)) {
+                partition_by.push_back(parse_value_expr());
+            }
+        }
+        if (match(TokenType::ORDER)) {
+            expect(TokenType::BY, "expected BY after ORDER");
+            order_by.push_back(parse_order_item());
+            while (match(TokenType::COMMA)) {
+                order_by.push_back(parse_order_item());
+            }
+        }
+        expect(TokenType::RPAREN, "expected ')' after window specification");
+        return {std::move(partition_by), std::move(order_by)};
     }
 
     std::vector<std::unique_ptr<Col>> parse_opt_group_clause() {

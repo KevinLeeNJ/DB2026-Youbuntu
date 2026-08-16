@@ -45,6 +45,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_union.h"
 #include "execution/executor_update.h"
+#include "execution/executor_window.h"
 #include "execution/execution_sort.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
@@ -334,6 +335,8 @@ private:
             return get_plan_output_names(static_cast<LimitPlan*>(plan)->subplan_.get());
         case T_Aggregate:
             return build_aggregate_output_names(*static_cast<AggregatePlan*>(plan));
+        case T_Window:
+            return get_plan_output_names(static_cast<WindowPlan*>(plan)->subplan_.get());
         case T_Union: {
             auto union_plan = static_cast<UnionPlan*>(plan);
             if (!union_plan->output_names_.empty()) {
@@ -489,6 +492,9 @@ private:
         case T_Projection:
             collect_tables(static_cast<ProjectionPlan*>(plan)->subplan_.get(), tables);
             break;
+        case T_Window:
+            collect_tables(static_cast<WindowPlan*>(plan)->subplan_.get(), tables);
+            break;
         case T_Distinct:
             collect_tables(static_cast<DistinctPlan*>(plan)->subplan_.get(), tables);
             break;
@@ -516,6 +522,9 @@ private:
         case T_Projection:
             reset_runtime_rows(static_cast<ProjectionPlan*>(plan)->subplan_.get());
             break;
+        case T_Window:
+            reset_runtime_rows(static_cast<WindowPlan*>(plan)->subplan_.get());
+            break;
         case T_Distinct:
             reset_runtime_rows(static_cast<DistinctPlan*>(plan)->subplan_.get());
             break;
@@ -540,6 +549,8 @@ private:
         for (const auto& item : plan.select_items_) {
             if (item.expr.type == QueryExprType::COLUMN) {
                 cols.push_back(display_col(plan, item.expr.col));
+            } else if (item.expr.type == QueryExprType::WINDOW) {
+                cols.push_back(item.expr.display_name);
             }
         }
         std::sort(cols.begin(), cols.end());
@@ -578,6 +589,12 @@ private:
             out << "Project(columns=[" << join_strings(projection_columns(*projection))
                 << "], rows=" << plan->runtime_rows_ << ")\n";
             render_explain_plan(projection->subplan_.get(), depth + 1, out);
+            break;
+        }
+        case T_Window: {
+            auto window = static_cast<WindowPlan*>(plan);
+            out << "Window(functions=[" << window->window_exprs_.size() << "], rows=" << plan->runtime_rows_ << ")\n";
+            render_explain_plan(window->subplan_.get(), depth + 1, out);
             break;
         }
         case T_Distinct: {
@@ -849,6 +866,13 @@ public:
                                                     convert_plan_executor(x->subplan_.get(), context, count_rows,
                                                                           outer_context),
                                                     x->group_by_cols_, x->agg_exprs_, having_conds, context);
+            return maybe_count(std::move(executor), plan, count_rows);
+        }
+        case T_Window: {
+            auto x = static_cast<WindowPlan*>(plan);
+            std::unique_ptr<AbstractExecutor> executor = std::make_unique<WindowExecutor>(
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context), x->window_exprs_,
+                make_subquery_runner(context), outer_context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_SeqScan:

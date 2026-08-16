@@ -478,6 +478,10 @@ TEST_F(SltFileTest, Aggregate) {
     run_slt_file("aggregate.slt");
 }
 
+TEST_F(SltFileTest, WindowFunctions) {
+    run_slt_file("window_functions.slt");
+}
+
 TEST_F(SltFileTest, StringMinMax) {
     run_slt_file("string_min_max.slt");
 }

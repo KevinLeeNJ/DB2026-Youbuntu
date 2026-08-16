@@ -64,6 +64,12 @@ private:
             });
             return pos == source_cols.end() ? static_cast<int>(sizeof(int)) : pos->len;
         }
+        case QueryExprType::WINDOW: {
+            auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
+                return col.name == expr.window_result_name;
+            });
+            return pos == source_cols.end() ? static_cast<int>(sizeof(int)) : pos->len;
+        }
         case QueryExprType::VALUE:
             if (expr.value.type == TYPE_STRING || expr.value.type == TYPE_DATETIME) {
                 return std::max<int>(1, expr.value.is_null ? 1 : expr.value.str_val.size());
@@ -107,6 +113,12 @@ private:
         case QueryExprType::AGGREGATE: {
             auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
                 return col.name == expr.agg.display_name || col.name == expr.display_name;
+            });
+            return pos == source_cols.end() ? TYPE_INT : pos->type;
+        }
+        case QueryExprType::WINDOW: {
+            auto pos = std::find_if(source_cols.begin(), source_cols.end(), [&](const ColMeta& col) {
+                return col.name == expr.window_result_name;
             });
             return pos == source_cols.end() ? TYPE_INT : pos->type;
         }

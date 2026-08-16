@@ -37,6 +37,26 @@ UpdateOp convert_update_op(ast::SetOp op) {
     throw InternalError("Unexpected UPDATE operator");
 }
 
+WindowFuncType convert_ast_window_func_type(ast::WindowFuncType type) {
+    switch (type) {
+    case ast::WindowFuncType::ROW_NUMBER:
+        return WindowFuncType::ROW_NUMBER;
+    case ast::WindowFuncType::RANK:
+        return WindowFuncType::RANK;
+    case ast::WindowFuncType::DENSE_RANK:
+        return WindowFuncType::DENSE_RANK;
+    case ast::WindowFuncType::LAG:
+        return WindowFuncType::LAG;
+    case ast::WindowFuncType::LEAD:
+        return WindowFuncType::LEAD;
+    case ast::WindowFuncType::SUM:
+        return WindowFuncType::SUM;
+    case ast::WindowFuncType::AVG:
+        return WindowFuncType::AVG;
+    }
+    throw InternalError("Unexpected AST window function type");
+}
+
 void resolve_alias(TabCol& col, const Query& query) {
     if (col.tab_name.empty()) {
         return;
@@ -52,6 +72,21 @@ void resolve_alias(QueryExpr& expr, const Query& query) {
         resolve_alias(expr.col, query);
     } else if (expr.type == QueryExprType::AGGREGATE && !expr.agg.is_star) {
         resolve_alias(expr.agg.col, query);
+    }
+    for (auto& window_arg : expr.window_args) {
+        if (window_arg != nullptr) {
+            resolve_alias(*window_arg, query);
+        }
+    }
+    for (auto& partition_expr : expr.window_partition_by) {
+        if (partition_expr != nullptr) {
+            resolve_alias(*partition_expr, query);
+        }
+    }
+    for (auto& order_expr : expr.window_order_by) {
+        if (order_expr != nullptr) {
+            resolve_alias(*order_expr, query);
+        }
     }
     if (expr.lhs != nullptr) {
         resolve_alias(*expr.lhs, query);
@@ -139,6 +174,21 @@ void resolve_local_unqualified_columns(QueryExpr& expr, const std::vector<ColMet
             resolve_column_meta(local_cols, expr.agg.col);
         } catch (const ColumnNotFoundError&) {
             // An unresolved unqualified name may belong to a correlated outer scope.
+        }
+    }
+    for (auto& window_arg : expr.window_args) {
+        if (window_arg != nullptr) {
+            resolve_local_unqualified_columns(*window_arg, local_cols);
+        }
+    }
+    for (auto& partition_expr : expr.window_partition_by) {
+        if (partition_expr != nullptr) {
+            resolve_local_unqualified_columns(*partition_expr, local_cols);
+        }
+    }
+    for (auto& order_expr : expr.window_order_by) {
+        if (order_expr != nullptr) {
+            resolve_local_unqualified_columns(*order_expr, local_cols);
         }
     }
     if (expr.lhs != nullptr) {
@@ -827,6 +877,40 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         }
         result.agg.display_name = build_agg_display_name(result.agg);
         result.display_name = result.agg.display_name;
+        return result;
+    }
+    if (auto window = dynamic_cast<const ast::WindowExpr*>(expr); window != nullptr) {
+        if (context_name != "SELECT" && context_name != "ORDER BY") {
+            if (context_name == "WINDOW ARGUMENT" || context_name == "WINDOW PARTITION BY" ||
+                context_name == "WINDOW ORDER BY") {
+                throw RMDBError("nested window functions are not supported");
+            }
+            throw RMDBError("Window functions are not allowed in " + context_name);
+        }
+
+        QueryExpr result;
+        result.type = QueryExprType::WINDOW;
+        result.window_func = convert_ast_window_func_type(window->func);
+        result.window_args.reserve(window->args.size());
+        for (const auto& arg : window->args) {
+            result.window_args.push_back(std::make_shared<QueryExpr>(
+                convert_ast_expr(arg.get(), "WINDOW ARGUMENT", outer_cols, outer_aliases)));
+        }
+        result.window_partition_by.reserve(window->partition_by.size());
+        for (const auto& partition_expr : window->partition_by) {
+            result.window_partition_by.push_back(std::make_shared<QueryExpr>(
+                convert_ast_expr(partition_expr.get(), "WINDOW PARTITION BY", outer_cols, outer_aliases)));
+        }
+        result.window_order_by.reserve(window->order_by.size());
+        result.window_order_desc.reserve(window->order_by.size());
+        result.window_nulls_order.reserve(window->order_by.size());
+        for (const auto& order_item : window->order_by) {
+            result.window_order_by.push_back(std::make_shared<QueryExpr>(
+                convert_ast_expr(order_item->expr.get(), "WINDOW ORDER BY", outer_cols, outer_aliases)));
+            result.window_order_desc.push_back(order_item->orderby_dir == ast::OrderBy_DESC);
+            result.window_nulls_order.push_back(static_cast<int>(order_item->nulls_order));
+        }
+        result.display_name = window_func_to_string(result.window_func) + "(...) OVER";
         return result;
     }
     if (auto arithmetic = dynamic_cast<const ast::ArithmeticExpr*>(expr); arithmetic != nullptr) {

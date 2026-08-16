@@ -197,6 +197,103 @@ void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols) {
     agg.display_name = build_agg_display_name(agg);
 }
 
+std::string window_func_to_string(WindowFuncType type) {
+    switch (type) {
+    case WindowFuncType::ROW_NUMBER:
+        return "ROW_NUMBER";
+    case WindowFuncType::RANK:
+        return "RANK";
+    case WindowFuncType::DENSE_RANK:
+        return "DENSE_RANK";
+    case WindowFuncType::LAG:
+        return "LAG";
+    case WindowFuncType::LEAD:
+        return "LEAD";
+    case WindowFuncType::SUM:
+        return "SUM";
+    case WindowFuncType::AVG:
+        return "AVG";
+    }
+    throw InternalError("Unexpected window function type");
+}
+
+void validate_window_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols) {
+    const auto function_name = window_func_to_string(expr.window_func);
+    for (const auto& arg : expr.window_args) {
+        if (arg == nullptr) {
+            throw InternalError("Window function is missing an argument");
+        }
+        if (arg->type == QueryExprType::WINDOW) {
+            throw RMDBError("nested window functions are not supported");
+        }
+    }
+    for (const auto& partition_expr : expr.window_partition_by) {
+        if (partition_expr == nullptr) {
+            throw InternalError("Window PARTITION BY is missing an expression");
+        }
+        if (partition_expr->type == QueryExprType::WINDOW) {
+            throw RMDBError("nested window functions are not supported");
+        }
+        (void)infer_expr_type(*partition_expr, all_cols);
+    }
+    if (expr.window_order_by.size() != expr.window_order_desc.size() ||
+        expr.window_order_by.size() != expr.window_nulls_order.size()) {
+        throw InternalError("Window ORDER BY metadata is inconsistent");
+    }
+    for (const auto& order_expr : expr.window_order_by) {
+        if (order_expr == nullptr) {
+            throw InternalError("Window ORDER BY is missing an expression");
+        }
+        if (order_expr->type == QueryExprType::WINDOW) {
+            throw RMDBError("nested window functions are not supported");
+        }
+        (void)infer_expr_type(*order_expr, all_cols);
+    }
+
+    switch (expr.window_func) {
+    case WindowFuncType::ROW_NUMBER:
+    case WindowFuncType::RANK:
+    case WindowFuncType::DENSE_RANK:
+        if (!expr.window_args.empty()) {
+            throw RMDBError(function_name + " does not accept arguments");
+        }
+        break;
+    case WindowFuncType::LAG:
+    case WindowFuncType::LEAD: {
+        if (expr.window_args.empty() || expr.window_args.size() > 3) {
+            throw RMDBError(function_name + " requires one to three arguments");
+        }
+        const ColType value_type = infer_expr_type(*expr.window_args.front(), all_cols);
+        if (expr.window_args.size() >= 2) {
+            const auto& offset = *expr.window_args[1];
+            if (offset.type != QueryExprType::VALUE || offset.value.is_null || offset.value.type != TYPE_INT) {
+                throw RMDBError("window offset must be a non-negative integer literal");
+            }
+            if (offset.value.int_val < 0) {
+                throw RMDBError("window offset must be non-negative");
+            }
+        }
+        if (expr.window_args.size() == 3) {
+            const ColType default_type = infer_expr_type(*expr.window_args[2], all_cols);
+            if (expr.window_args[2]->type != QueryExprType::VALUE ||
+                (!expr.window_args[2]->value.is_null && !can_cast_types(value_type, default_type))) {
+                throw IncompatibleTypeError(coltype2str(value_type), coltype2str(default_type));
+            }
+        }
+        break;
+    }
+    case WindowFuncType::SUM:
+    case WindowFuncType::AVG:
+        if (expr.window_args.size() != 1) {
+            throw RMDBError(function_name + " window function requires one argument");
+        }
+        if (!is_numeric_type(infer_expr_type(*expr.window_args.front(), all_cols))) {
+            throw RMDBError(function_name + " window function requires a numeric expression");
+        }
+        break;
+    }
+}
+
 void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols) {
     switch (expr.type) {
     case QueryExprType::COLUMN: {
@@ -211,6 +308,27 @@ void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols)
     case QueryExprType::AGGREGATE:
         validate_agg_expr(expr.agg, all_cols);
         expr.display_name = expr.agg.display_name;
+        break;
+    case QueryExprType::WINDOW:
+        for (auto& arg : expr.window_args) {
+            if (arg == nullptr) {
+                throw InternalError("Window function is missing an argument");
+            }
+            normalize_query_expr(*arg, all_cols);
+        }
+        for (auto& partition_expr : expr.window_partition_by) {
+            if (partition_expr == nullptr) {
+                throw InternalError("Window PARTITION BY is missing an expression");
+            }
+            normalize_query_expr(*partition_expr, all_cols);
+        }
+        for (auto& order_expr : expr.window_order_by) {
+            if (order_expr == nullptr) {
+                throw InternalError("Window ORDER BY is missing an expression");
+            }
+            normalize_query_expr(*order_expr, all_cols);
+        }
+        validate_window_expr(expr, all_cols);
         break;
     case QueryExprType::VALUE:
         break;
@@ -289,6 +407,22 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
             return col_meta->type;
         }
         }
+    case QueryExprType::WINDOW:
+        switch (expr.window_func) {
+        case WindowFuncType::ROW_NUMBER:
+        case WindowFuncType::RANK:
+        case WindowFuncType::DENSE_RANK:
+            return TYPE_INT;
+        case WindowFuncType::LAG:
+        case WindowFuncType::LEAD:
+        case WindowFuncType::SUM:
+            if (expr.window_args.empty()) {
+                throw InternalError("Window function is missing its value expression");
+            }
+            return infer_expr_type(*expr.window_args.front(), all_cols);
+        case WindowFuncType::AVG:
+            return TYPE_FLOAT;
+        }
     case QueryExprType::ARITHMETIC: {
         if (expr.lhs == nullptr || expr.rhs == nullptr) {
             throw InternalError("Arithmetic expression is missing an operand");
@@ -359,11 +493,52 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
     case QueryExprType::COLUMN:
         return same_tab_col(lhs.col, rhs.col);
     case QueryExprType::VALUE:
+        if (lhs.value.type != rhs.value.type || lhs.value.is_null != rhs.value.is_null) {
+            return false;
+        }
+        if (lhs.value.is_null) {
+            return true;
+        }
+        switch (lhs.value.type) {
+        case TYPE_INT:
+            return lhs.value.int_val == rhs.value.int_val;
+        case TYPE_FLOAT:
+            return lhs.value.float_val == rhs.value.float_val;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            return lhs.value.str_val == rhs.value.str_val;
+        }
         return false;
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    case QueryExprType::WINDOW:
+        if (lhs.window_func != rhs.window_func || lhs.window_args.size() != rhs.window_args.size() ||
+            lhs.window_partition_by.size() != rhs.window_partition_by.size() ||
+            lhs.window_order_by.size() != rhs.window_order_by.size() ||
+            lhs.window_order_desc != rhs.window_order_desc || lhs.window_nulls_order != rhs.window_nulls_order) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.window_args.size(); ++i) {
+            if (lhs.window_args[i] == nullptr || rhs.window_args[i] == nullptr ||
+                !same_query_expr(*lhs.window_args[i], *rhs.window_args[i])) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < lhs.window_partition_by.size(); ++i) {
+            if (lhs.window_partition_by[i] == nullptr || rhs.window_partition_by[i] == nullptr ||
+                !same_query_expr(*lhs.window_partition_by[i], *rhs.window_partition_by[i])) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < lhs.window_order_by.size(); ++i) {
+            if (lhs.window_order_by[i] == nullptr || rhs.window_order_by[i] == nullptr ||
+                !same_query_expr(*lhs.window_order_by[i], *rhs.window_order_by[i])) {
+                return false;
+            }
+        }
+        return true;
     case QueryExprType::ARITHMETIC:
         return lhs.arithmetic_op == rhs.arithmetic_op && lhs.lhs != nullptr && lhs.rhs != nullptr &&
                rhs.lhs != nullptr && rhs.rhs != nullptr && same_query_expr(*lhs.lhs, *rhs.lhs) &&
@@ -383,6 +558,41 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
     case QueryExprType::PREDICATE:
     case QueryExprType::SUBQUERY:
         return lhs.display_name == rhs.display_name;
+    }
+    return false;
+}
+
+bool contains_window_expr(const QueryExpr& expr) {
+    if (expr.type == QueryExprType::WINDOW) {
+        return true;
+    }
+    if (expr.lhs != nullptr && contains_window_expr(*expr.lhs)) {
+        return true;
+    }
+    if (expr.rhs != nullptr && contains_window_expr(*expr.rhs)) {
+        return true;
+    }
+    if (expr.rhs_upper != nullptr && contains_window_expr(*expr.rhs_upper)) {
+        return true;
+    }
+    for (const auto& operand : expr.operands) {
+        if (operand != nullptr && contains_window_expr(*operand)) {
+            return true;
+        }
+    }
+    for (const auto& clause : expr.case_when) {
+        if ((clause.first != nullptr && contains_window_expr(*clause.first)) ||
+            (clause.second != nullptr && contains_window_expr(*clause.second))) {
+            return true;
+        }
+    }
+    if (expr.else_expr != nullptr && contains_window_expr(*expr.else_expr)) {
+        return true;
+    }
+    for (const auto& value : expr.rhs_values) {
+        if (value != nullptr && contains_window_expr(*value)) {
+            return true;
+        }
     }
     return false;
 }

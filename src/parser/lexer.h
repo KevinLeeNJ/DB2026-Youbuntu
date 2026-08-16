@@ -131,6 +131,13 @@ enum class TokenType {
     MIN,
     SUM,
     AVG,
+    ROW_NUMBER,
+    RANK,
+    DENSE_RANK,
+    LAG,
+    LEAD,
+    OVER,
+    PARTITION,
     EXIT,
     HELP,
 

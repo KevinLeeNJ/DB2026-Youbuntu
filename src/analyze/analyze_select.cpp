@@ -24,6 +24,7 @@ void rebuild_select_outputs(Query& query, const std::vector<ColMeta>& all_cols) 
     query.cols.clear();
     query.output_names.clear();
     query.has_aggregate = false;
+    query.has_window = false;
 
     for (auto& item : query.select_items) {
         normalize_query_expr(item.expr, all_cols);
@@ -33,6 +34,7 @@ void rebuild_select_outputs(Query& query, const std::vector<ColMeta>& all_cols) 
         if (item.expr.type == QueryExprType::AGGREGATE) {
             query.has_aggregate = true;
         }
+        query.has_window = query.has_window || contains_window_expr(item.expr);
         if (item.output_name.empty()) {
             item.output_name = item.alias.empty() ? item.expr.display_name : item.alias;
         }
@@ -101,6 +103,7 @@ void validate_order_by(Query& query, const std::vector<ColMeta>& all_cols) {
 
         normalize_query_expr(item.expr, all_cols);
         query.has_aggregate = query.has_aggregate || item.expr.type == QueryExprType::AGGREGATE;
+        query.has_window = query.has_window || contains_window_expr(item.expr);
 
         if (item.expr.type == QueryExprType::VALUE) {
             throw RMDBError("ORDER BY does not support literal expressions");

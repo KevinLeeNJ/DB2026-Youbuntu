@@ -330,3 +330,48 @@ TEST_F(AnalyzeAggregateTest, do_analyze_builds_recursive_expression_tree) {
         EXPECT_EQ(query->select_items[0].alias, "band");
     });
 }
+
+TEST_F(AnalyzeAggregateTest, do_analyze_converts_window_expression) {
+    auto parse = ast::parse_sql(
+        "select row_number() over (partition by course order by score desc) as row_num from grade;");
+
+    EXPECT_NO_THROW({
+        auto query = analyze_.do_analyze(std::move(parse));
+        ASSERT_NE(query, nullptr);
+        ASSERT_EQ(query->select_items.size(), 1);
+        EXPECT_EQ(query->select_items[0].alias, "row_num");
+        EXPECT_TRUE(query->has_window);
+        EXPECT_EQ(query->select_items[0].expr.type, QueryExprType::WINDOW);
+        EXPECT_EQ(query->select_items[0].expr.window_partition_by.size(), 1);
+        EXPECT_EQ(query->select_items[0].expr.window_order_by.size(), 1);
+    });
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_window_expression_in_where) {
+    auto parse = ast::parse_sql("select id from grade where row_number() over () > 1;");
+
+    try {
+        (void)analyze_.do_analyze(std::move(parse));
+        FAIL() << "expected window expression context validation failure";
+    } catch (const RMDBError& err) {
+        EXPECT_NE(std::string(err.what()).find("Window functions are not allowed in WHERE"), std::string::npos);
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_invalid_window_arguments) {
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"select sum(course) over () from grade;", "SUM window function requires a numeric expression"},
+        {"select lag(score, -1) over () from grade;", "window offset must be non-negative"},
+        {"select sum(row_number() over ()) over () from grade;", "nested window functions are not supported"},
+    };
+
+    for (const auto& [sql, message] : cases) {
+        auto parse = ast::parse_sql(sql);
+        try {
+            (void)analyze_.do_analyze(std::move(parse));
+            FAIL() << "expected window argument validation failure for: " << sql;
+        } catch (const RMDBError& err) {
+            EXPECT_NE(std::string(err.what()).find(message), std::string::npos) << sql;
+        }
+    }
+}

@@ -49,10 +49,45 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
     case QueryExprType::COLUMN:
         return same_tab_col(lhs.col, rhs.col);
     case QueryExprType::VALUE:
-        return false;
+        return lhs.value.type == rhs.value.type && lhs.value.is_null == rhs.value.is_null &&
+               (lhs.value.is_null ||
+                (lhs.value.type == TYPE_INT && lhs.value.int_val == rhs.value.int_val) ||
+                (lhs.value.type == TYPE_FLOAT && lhs.value.float_val == rhs.value.float_val) ||
+                ((lhs.value.type == TYPE_STRING || lhs.value.type == TYPE_DATETIME) &&
+                 lhs.value.str_val == rhs.value.str_val));
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    case QueryExprType::WINDOW:
+        if (lhs.window_func != rhs.window_func || lhs.window_args.size() != rhs.window_args.size() ||
+            lhs.window_partition_by.size() != rhs.window_partition_by.size() ||
+            lhs.window_order_by.size() != rhs.window_order_by.size() ||
+            lhs.window_order_desc != rhs.window_order_desc || lhs.window_nulls_order != rhs.window_nulls_order) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.window_args.size(); ++i) {
+            if (lhs.window_args[i] == nullptr || rhs.window_args[i] == nullptr ||
+                !same_query_expr(*lhs.window_args[i], *rhs.window_args[i])) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < lhs.window_partition_by.size(); ++i) {
+            if (lhs.window_partition_by[i] == nullptr || rhs.window_partition_by[i] == nullptr ||
+                !same_query_expr(*lhs.window_partition_by[i], *rhs.window_partition_by[i])) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < lhs.window_order_by.size(); ++i) {
+            if (lhs.window_order_by[i] == nullptr || rhs.window_order_by[i] == nullptr ||
+                !same_query_expr(*lhs.window_order_by[i], *rhs.window_order_by[i])) {
+                return false;
+            }
+        }
+        return true;
+    case QueryExprType::ARITHMETIC:
+        return lhs.arithmetic_op == rhs.arithmetic_op && lhs.lhs != nullptr && lhs.rhs != nullptr &&
+               rhs.lhs != nullptr && rhs.rhs != nullptr && same_query_expr(*lhs.lhs, *rhs.lhs) &&
+               same_query_expr(*lhs.rhs, *rhs.rhs);
     }
     return false;
 }
@@ -150,6 +185,9 @@ void attach_display_names(Plan* plan, const std::unordered_map<std::string, std:
         break;
     case T_Projection:
         attach_display_names(static_cast<ProjectionPlan*>(plan)->subplan_.get(), table_name_to_display);
+        break;
+    case T_Window:
+        attach_display_names(static_cast<WindowPlan*>(plan)->subplan_.get(), table_name_to_display);
         break;
     case T_Distinct:
         attach_display_names(static_cast<DistinctPlan*>(plan)->subplan_.get(), table_name_to_display);
@@ -325,6 +363,52 @@ std::vector<OrderByItem> bind_order_by_output_names(const Query& query) {
     return order_by_items;
 }
 
+void collect_window_exprs(QueryExpr& expr, std::vector<QueryExpr>& window_exprs) {
+    if (expr.type == QueryExprType::WINDOW) {
+        auto existing = std::find_if(window_exprs.begin(), window_exprs.end(),
+                                     [&](const QueryExpr& candidate) { return same_query_expr(candidate, expr); });
+        if (existing != window_exprs.end()) {
+            expr.window_result_name = existing->window_result_name;
+            return;
+        }
+        if (expr.window_result_name.empty()) {
+            expr.window_result_name = "__rmdb_window_" + std::to_string(window_exprs.size());
+        }
+        window_exprs.push_back(expr);
+        return;
+    }
+    if (expr.lhs != nullptr) {
+        collect_window_exprs(*expr.lhs, window_exprs);
+    }
+    if (expr.rhs != nullptr) {
+        collect_window_exprs(*expr.rhs, window_exprs);
+    }
+    if (expr.rhs_upper != nullptr) {
+        collect_window_exprs(*expr.rhs_upper, window_exprs);
+    }
+    for (auto& operand : expr.operands) {
+        if (operand != nullptr) {
+            collect_window_exprs(*operand, window_exprs);
+        }
+    }
+    for (auto& clause : expr.case_when) {
+        if (clause.first != nullptr) {
+            collect_window_exprs(*clause.first, window_exprs);
+        }
+        if (clause.second != nullptr) {
+            collect_window_exprs(*clause.second, window_exprs);
+        }
+    }
+    if (expr.else_expr != nullptr) {
+        collect_window_exprs(*expr.else_expr, window_exprs);
+    }
+    for (auto& value : expr.rhs_values) {
+        if (value != nullptr) {
+            collect_window_exprs(*value, window_exprs);
+        }
+    }
+}
+
 QueryExpr clone_query_expr(const QueryExpr& source);
 
 std::unique_ptr<Query> clone_query(const Query& source) {
@@ -338,6 +422,7 @@ std::unique_ptr<Query> clone_query(const Query& source) {
     result->offset = source.offset;
     result->has_distinct = source.has_distinct;
     result->has_aggregate = source.has_aggregate;
+    result->has_window = source.has_window;
     result->has_select_star = source.has_select_star;
     result->output_names = source.output_names;
     result->is_union = source.is_union;
@@ -433,6 +518,18 @@ QueryExpr clone_query_expr(const QueryExpr& source) {
     for (const auto& value : source.rhs_values) {
         result.rhs_values.push_back(std::make_shared<QueryExpr>(clone_query_expr(*value)));
     }
+    result.window_args.clear();
+    for (const auto& arg : source.window_args) {
+        result.window_args.push_back(std::make_shared<QueryExpr>(clone_query_expr(*arg)));
+    }
+    result.window_partition_by.clear();
+    for (const auto& partition_expr : source.window_partition_by) {
+        result.window_partition_by.push_back(std::make_shared<QueryExpr>(clone_query_expr(*partition_expr)));
+    }
+    result.window_order_by.clear();
+    for (const auto& order_expr : source.window_order_by) {
+        result.window_order_by.push_back(std::make_shared<QueryExpr>(clone_query_expr(*order_expr)));
+    }
     if (source.subquery != nullptr) {
         result.subquery = std::shared_ptr<Query>(clone_query(*source.subquery));
     }
@@ -470,6 +567,21 @@ void Planner::prepare_subquery_plans(QueryExpr& expr, Context* context) {
     for (auto& value : expr.rhs_values) {
         if (value != nullptr) {
             prepare_subquery_plans(*value, context);
+        }
+    }
+    for (auto& arg : expr.window_args) {
+        if (arg != nullptr) {
+            prepare_subquery_plans(*arg, context);
+        }
+    }
+    for (auto& partition_expr : expr.window_partition_by) {
+        if (partition_expr != nullptr) {
+            prepare_subquery_plans(*partition_expr, context);
+        }
+    }
+    for (auto& order_expr : expr.window_order_by) {
+        if (order_expr != nullptr) {
+            prepare_subquery_plans(*order_expr, context);
         }
     }
     if (expr.subquery == nullptr || expr.subquery_plan != nullptr) {
@@ -813,7 +925,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     }
 
     std::map<std::string, std::set<TabCol>> needed_cols;
-    if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query) &&
+    if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query) && !query->has_window &&
         !has_expression_join) {
         for (const auto& item : query->select_items) {
             if (item.expr.type == QueryExprType::COLUMN) {
@@ -1225,6 +1337,14 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
     if (needs_aggregate_plan(*query)) {
         plannerRoot = std::make_unique<AggregatePlan>(T_Aggregate, std::move(plannerRoot), query->group_by_cols,
                                                       collect_aggregate_exprs(*query), query->having_conds);
+    }
+
+    std::vector<QueryExpr> window_exprs;
+    for (auto& item : query->select_items) {
+        collect_window_exprs(item.expr, window_exprs);
+    }
+    if (!window_exprs.empty()) {
+        plannerRoot = std::make_unique<WindowPlan>(T_Window, std::move(plannerRoot), std::move(window_exprs));
     }
 
     // final select projection

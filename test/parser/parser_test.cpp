@@ -512,6 +512,27 @@ TEST(ParserTest, ParsesAdvancedSqlForms) {
     }
 }
 
+TEST(ParserTest, ParsesWindowFunctionExpressions) {
+    auto parsed = parse_ok(
+        "select row_number() over (partition by dept order by score desc), "
+        "rank() over (order by score desc), "
+        "dense_rank() over (order by score desc), "
+        "lag(score, 2, 0) over (order by id), "
+        "lead(score) over (order by id), "
+        "sum(score) over (partition by dept order by id), "
+        "avg(score) over (partition by dept) from grades;");
+    auto select = as_node<ast::SelectStmt>(parsed);
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->select_items.size(), 7);
+}
+
+TEST(ParserTest, RejectsMalformedWindowFunctionSyntax) {
+    expect_parse_error("select row_number() from grades;");
+    expect_parse_error("select rank(score) over () from grades;");
+    expect_parse_error("select row_number() over (order by) from grades;");
+    expect_parse_error("select lag(score, 1, 0, 2) over () from grades;");
+}
+
 TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     auto no_where = parse_ok("delete from tb;");
     auto delete_stmt = as_node<ast::DeleteStmt>(no_where);

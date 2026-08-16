@@ -43,6 +43,7 @@ public:
     int offset = 0;
     bool has_distinct = false;
     bool has_aggregate = false;
+    bool has_window = false;
     bool has_select_star = false;
     std::vector<std::string> output_names;
     bool is_union = false;

@@ -56,7 +56,8 @@ typedef enum PlanTag {
     T_SetTransaction,
     T_StaticCheckpoint,
     T_SetOutputFile,
-    T_LoadData
+    T_LoadData,
+    T_Window
 } PlanTag;
 
 // 查询执行计划
@@ -181,6 +182,18 @@ public:
     std::vector<TabCol> group_by_cols_;
     std::vector<AggExpr> agg_exprs_;
     std::vector<HavingCondition> having_conds_;
+};
+
+class WindowPlan : public Plan {
+public:
+    WindowPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<QueryExpr> window_exprs) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+        window_exprs_ = std::move(window_exprs);
+    }
+    ~WindowPlan() {}
+    std::unique_ptr<Plan> subplan_;
+    std::vector<QueryExpr> window_exprs_;
 };
 
 class SortPlan : public Plan {

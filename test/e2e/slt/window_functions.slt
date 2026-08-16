@@ -1,0 +1,164 @@
+# window_functions.slt — ranking, offset, and window aggregate functions
+
+statement ok
+CREATE TABLE window_scores (grp CHAR(8), id INT, score INT);
+
+statement ok
+INSERT INTO window_scores VALUES ('A', 1, 10);
+
+statement ok
+INSERT INTO window_scores VALUES ('A', 2, 20);
+
+statement ok
+INSERT INTO window_scores VALUES ('A', 3, 20);
+
+statement ok
+INSERT INTO window_scores VALUES ('B', 4, 5);
+
+statement ok
+INSERT INTO window_scores VALUES ('B', 5, 15);
+
+query
+SELECT id, row_number() OVER (PARTITION BY grp ORDER BY score DESC, id) AS row_num
+FROM window_scores ORDER BY id;
+----
++------------------+------------------+
+|               id |          row_num |
++------------------+------------------+
+|                1 |                3 |
+|                2 |                1 |
+|                3 |                2 |
+|                4 |                2 |
+|                5 |                1 |
++------------------+------------------+
+Total record(s): 5
+
+query
+SELECT id, rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rank_num,
+       dense_rank() OVER (PARTITION BY grp ORDER BY score DESC) AS dense_num
+FROM window_scores ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |         rank_num |        dense_num |
++------------------+------------------+------------------+
+|                1 |                3 |                2 |
+|                2 |                1 |                1 |
+|                3 |                1 |                1 |
+|                4 |                2 |                2 |
+|                5 |                1 |                1 |
++------------------+------------------+------------------+
+Total record(s): 5
+
+query
+SELECT id, lag(score) OVER (PARTITION BY grp ORDER BY id) AS prev_score,
+       lead(score, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS next_score
+FROM window_scores ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |       prev_score |       next_score |
++------------------+------------------+------------------+
+|                1 |             NULL |               20 |
+|                2 |               10 |               20 |
+|                3 |               20 |                0 |
+|                4 |             NULL |               15 |
+|                5 |                5 |                0 |
++------------------+------------------+------------------+
+Total record(s): 5
+
+query
+SELECT id, sum(score) OVER (PARTITION BY grp ORDER BY score) AS cumulative,
+       avg(score) OVER (PARTITION BY grp) AS total_avg
+FROM window_scores ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |       cumulative |        total_avg |
++------------------+------------------+------------------+
+|                1 |               10 |        16.666667 |
+|                2 |               50 |        16.666667 |
+|                3 |               50 |        16.666667 |
+|                4 |                5 |        10.000000 |
+|                5 |               20 |        10.000000 |
++------------------+------------------+------------------+
+Total record(s): 5
+
+query
+SELECT id, sum(score) AS total_score, row_number() OVER (ORDER BY id) AS group_num
+FROM window_scores GROUP BY id ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |      total_score |        group_num |
++------------------+------------------+------------------+
+|                1 |               10 |                1 |
+|                2 |               20 |                2 |
+|                3 |               20 |                3 |
+|                4 |                5 |                4 |
+|                5 |               15 |                5 |
++------------------+------------------+------------------+
+Total record(s): 5
+
+query
+SELECT id, row_number() OVER (ORDER BY id) + 10 AS shifted
+FROM window_scores ORDER BY shifted DESC LIMIT 2;
+----
++------------------+------------------+
+|               id |          shifted |
++------------------+------------------+
+|                5 |               15 |
+|                4 |               14 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, row_number() OVER (ORDER BY id) AS rn_one,
+       row_number() OVER (ORDER BY id) AS rn_two
+FROM window_scores ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |           rn_one |           rn_two |
++------------------+------------------+------------------+
+|                1 |                1 |                1 |
+|                2 |                2 |                2 |
+|                3 |                3 |                3 |
+|                4 |                4 |                4 |
+|                5 |                5 |                5 |
++------------------+------------------+------------------+
+Total record(s): 5
+
+statement ok
+CREATE TABLE window_labels (id INT, label CHAR(8));
+
+statement ok
+INSERT INTO window_labels VALUES (1, 'A');
+
+statement ok
+INSERT INTO window_labels VALUES (2, 'A');
+
+statement ok
+INSERT INTO window_labels VALUES (3, 'B');
+
+statement ok
+INSERT INTO window_labels VALUES (4, 'B');
+
+statement ok
+INSERT INTO window_labels VALUES (5, 'B');
+
+query
+SELECT ws.id, row_number() OVER (PARTITION BY wl.label ORDER BY ws.score) AS rn
+FROM window_scores AS ws JOIN window_labels AS wl ON ws.id = wl.id ORDER BY ws.id;
+----
++------------------+------------------+
+|               id |               rn |
++------------------+------------------+
+|                1 |                1 |
+|                2 |                2 |
+|                3 |                3 |
+|                4 |                1 |
+|                5 |                2 |
++------------------+------------------+
+Total record(s): 5
+
+statement ok
+DROP TABLE window_labels;
+
+statement ok
+DROP TABLE window_scores;

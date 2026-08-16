@@ -300,3 +300,37 @@ TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) 
     auto* scan = static_cast<ScanPlan*>(aggregate->subplan_.get());
     EXPECT_EQ(scan->index_col_names_, (std::vector<std::string>{"ol_w_id", "ol_d_id", "ol_o_id", "ol_number"}));
 }
+
+TEST_F(PlannerAggregateTest, generate_select_plan_inserts_window_stage_before_projection) {
+    Analyze analyze(&sm_manager_);
+    auto parse = ast::parse_sql("select id, row_number() over (order by score desc) as row_num from grade;");
+    auto query = analyze.do_analyze(std::move(parse));
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Projection);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    ASSERT_NE(projection->subplan_, nullptr);
+    EXPECT_NE(projection->subplan_->tag, T_SeqScan);
+}
+
+TEST_F(PlannerAggregateTest, generate_select_plan_deduplicates_window_expressions) {
+    Analyze analyze(&sm_manager_);
+    auto parse = ast::parse_sql(
+        "select row_number() over (order by score) as first_num, "
+        "row_number() over (order by score) as second_num from grade;");
+    auto query = analyze.do_analyze(std::move(parse));
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Projection);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    ASSERT_NE(projection->subplan_, nullptr);
+    ASSERT_EQ(projection->subplan_->tag, T_Window);
+    auto* window = static_cast<WindowPlan*>(projection->subplan_.get());
+    ASSERT_EQ(window->window_exprs_.size(), 1U);
+    EXPECT_EQ(projection->select_items_[0].expr.window_result_name,
+              projection->select_items_[1].expr.window_result_name);
+}

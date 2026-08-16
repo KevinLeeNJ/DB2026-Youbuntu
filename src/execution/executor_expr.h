@@ -556,6 +556,15 @@ public:
             return evaluate_column(expr, rec);
         case QueryExprType::AGGREGATE:
             throw InternalError("Aggregate expressions must be evaluated by AggregateExecutor");
+        case QueryExprType::WINDOW: {
+            if (expr.window_result_name.empty()) {
+                throw InternalError("Window expression has not been materialized");
+            }
+            QueryExpr hidden_column;
+            hidden_column.type = QueryExprType::COLUMN;
+            hidden_column.col = {.tab_name = "", .col_name = expr.window_result_name};
+            return evaluate_column(hidden_column, rec);
+        }
         case QueryExprType::VALUE:
             return literal_value(expr.value);
         case QueryExprType::ARITHMETIC:

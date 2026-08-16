@@ -34,6 +34,8 @@ std::string agg_type_to_string(AggType type);
 AggType convert_ast_agg_type(ast::AggFuncType type);
 std::string build_agg_display_name(const AggExpr& agg);
 void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols);
+std::string window_func_to_string(WindowFuncType type);
+void validate_window_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols);
 
 // --- TabCol utilities ---
 bool same_tab_col(const TabCol& lhs, const TabCol& rhs);
@@ -44,6 +46,7 @@ QueryExpr make_column_expr(TabCol col, std::string display_name = "");
 void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols);
 ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_cols);
 bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs);
+bool contains_window_expr(const QueryExpr& expr);
 
 // --- Query-level expression utilities ---
 bool contains_select_expr(const Query& query, const QueryExpr& expr);

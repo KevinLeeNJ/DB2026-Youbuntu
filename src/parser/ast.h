@@ -50,6 +50,8 @@ enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
 enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
+enum class WindowFuncType { ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, AVG };
+
 enum SetKnobType { EnableNestLoop, EnableSortMerge };
 
 enum class SetOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
@@ -78,6 +80,7 @@ enum class AstType {
     NullLit,
     Col,
     AggExpr,
+    WindowExpr,
     ArithmeticExpr,
     LogicalExpr,
     CaseExpr,
@@ -392,6 +395,19 @@ struct OrderByItem : public TreeNode {
         : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_), nulls_order(nulls_order_) {}
 };
 
+struct WindowExpr : public Expr {
+    WindowFuncType func;
+    std::vector<std::unique_ptr<Expr>> args;
+    std::vector<std::unique_ptr<Expr>> partition_by;
+    std::vector<std::unique_ptr<OrderByItem>> order_by;
+
+    WindowExpr(WindowFuncType func_, std::vector<std::unique_ptr<Expr>> args_,
+               std::vector<std::unique_ptr<Expr>> partition_by_,
+               std::vector<std::unique_ptr<OrderByItem>> order_by_)
+        : Expr(AstType::WindowExpr), func(func_), args(std::move(args_)), partition_by(std::move(partition_by_)),
+          order_by(std::move(order_by_)) {}
+};
+
 inline std::unique_ptr<OrderByItem> clone_order_by_item(const OrderByItem& item) {
     return std::make_unique<OrderByItem>(clone_expr(*item.expr), item.orderby_dir, item.nulls_order);
 }
@@ -413,6 +429,25 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
         auto& agg = static_cast<const AggExpr&>(expr);
         return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col),
                                          agg.is_distinct);
+    }
+    case AstType::WindowExpr: {
+        auto& window = static_cast<const WindowExpr&>(expr);
+        std::vector<std::unique_ptr<Expr>> args;
+        args.reserve(window.args.size());
+        for (const auto& arg : window.args) {
+            args.push_back(clone_expr(*arg));
+        }
+        std::vector<std::unique_ptr<Expr>> partition_by;
+        partition_by.reserve(window.partition_by.size());
+        for (const auto& expr : window.partition_by) {
+            partition_by.push_back(clone_expr(*expr));
+        }
+        std::vector<std::unique_ptr<OrderByItem>> order_by;
+        order_by.reserve(window.order_by.size());
+        for (const auto& item : window.order_by) {
+            order_by.push_back(clone_order_by_item(*item));
+        }
+        return std::make_unique<WindowExpr>(window.func, std::move(args), std::move(partition_by), std::move(order_by));
     }
     case AstType::IntLit: {
         auto& lit = static_cast<const IntLit&>(expr);

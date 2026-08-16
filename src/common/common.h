@@ -102,7 +102,9 @@ enum CompOp {
 
 enum class AggType { COUNT, MAX, MIN, SUM, AVG };
 
-enum class QueryExprType { COLUMN, AGGREGATE, VALUE, ARITHMETIC, LOGICAL, CASE_EXPR, PREDICATE, SUBQUERY };
+enum class WindowFuncType { ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, AVG };
+
+enum class QueryExprType { COLUMN, AGGREGATE, VALUE, ARITHMETIC, LOGICAL, CASE_EXPR, PREDICATE, SUBQUERY, WINDOW };
 
 enum class QueryArithmeticOp { ADD, SUB, MUL, DIV };
 enum class QueryLogicalOp { AND, OR, NOT };
@@ -151,6 +153,13 @@ struct QueryExpr {
     AggExpr agg;
     Value value;
     std::string display_name;
+    WindowFuncType window_func = WindowFuncType::ROW_NUMBER;
+    std::vector<std::shared_ptr<QueryExpr>> window_args;
+    std::vector<std::shared_ptr<QueryExpr>> window_partition_by;
+    std::vector<std::shared_ptr<QueryExpr>> window_order_by;
+    std::vector<bool> window_order_desc;
+    std::vector<int> window_nulls_order;
+    std::string window_result_name;
     QueryArithmeticOp arithmetic_op = QueryArithmeticOp::ADD;
     QueryLogicalOp logical_op = QueryLogicalOp::AND;
     CompOp predicate_op = OP_EQ;
